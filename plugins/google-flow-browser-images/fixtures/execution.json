@@ -1,0 +1,84 @@
+{
+  "executionId": "google-flow-fixture-execution",
+  "traceId": "google-flow-fixture-trace",
+  "blockId": "google-flow-fixture-block",
+  "capabilityId": "generate-images-in-browser",
+  "attempt": 1,
+  "invocation": {
+    "mode": "configure",
+    "action": "status"
+  },
+  "configuration": {
+    "accountProfile": "default",
+    "imageModel": "flow_auto",
+    "fallbackOnModelLimit": true,
+    "aspectRatio": "flow_current",
+    "delayBetweenPromptsMs": 5000,
+    "maxConcurrentGenerations": 1,
+    "retryAttempts": 1,
+    "maxReferenceImages": 10,
+    "maxImagesPerPrompt": 1
+  },
+  "settings": {},
+  "inputs": {
+    "prompts": [
+      "Primeira imagem de teste.",
+      "Segunda imagem de teste.",
+      "Terceira imagem de teste."
+    ]
+  },
+  "inputContract": [
+    {
+      "id": "google-flow-fixture-input",
+      "portKey": "prompts",
+      "label": "Prompts",
+      "shape": {
+        "kind": "content",
+        "family": "text",
+        "cardinality": "many",
+        "representation": "inline"
+      }
+    }
+  ],
+  "outputContract": [
+    {
+      "portKey": "images",
+      "label": "Imagens geradas",
+      "key": "images",
+      "required": true,
+      "shape": {
+        "kind": "content",
+        "family": "image",
+        "cardinality": "many",
+        "representation": "artifact",
+        "formats": {
+          "mimeTypes": [
+            "image/*"
+          ]
+        }
+      }
+    }
+  ],
+  "context": {
+    "locale": "pt-BR",
+    "timeZone": "America/Sao_Paulo",
+    "channel": {
+      "id": "fixture-channel",
+      "name": "Canal fictício",
+      "language": "pt-BR",
+      "niche": "Testes"
+    },
+    "project": {
+      "id": "fixture-project",
+      "title": "Projeto fictício"
+    },
+    "processType": "assets",
+    "block": {
+      "type": "CRIAR",
+      "name": "Gerar imagens de teste",
+      "instructions": "Valide o contrato da capability sem publicar resultados."
+    },
+    "previousProcessOutputs": [],
+    "previousBlockOutputs": []
+  }
+}

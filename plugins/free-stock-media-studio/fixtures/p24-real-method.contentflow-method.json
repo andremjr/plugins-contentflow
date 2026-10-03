@@ -1,0 +1,454 @@
+{
+  "format": "contentflow-method",
+  "version": 3,
+  "name": "P24 — Free Stock ponta a ponta",
+  "exportedAt": "2026-09-24T12:00:00.000Z",
+  "method": {
+    "name": "P24 — BUSCAR → VALIDAR → CRIAR",
+    "processType": "assets",
+    "blocks": [
+      {
+        "id": "p24-search",
+        "type": "BUSCAR",
+        "operator": "Código",
+        "name": "Buscar imagem stock",
+        "instructions": "Localize candidatos com proveniência e licença declaradas.",
+        "inputs": [
+          {
+            "id": "p24-query",
+            "label": "Consulta",
+            "shape": {
+              "kind": "content",
+              "family": "text",
+              "cardinality": "one",
+              "representation": "inline"
+            },
+            "binding": {
+              "kind": "runtime"
+            },
+            "portKey": "query"
+          }
+        ],
+        "outputs": [
+          {
+            "id": "p24-candidates",
+            "label": "Candidatos",
+            "key": "candidates",
+            "shape": {
+              "kind": "record",
+              "cardinality": "many",
+              "fields": [
+                {
+                  "id": "asset-id",
+                  "label": "ID",
+                  "key": "asset_id",
+                  "shape": {
+                    "kind": "content",
+                    "family": "text",
+                    "cardinality": "one",
+                    "representation": "inline"
+                  },
+                  "required": true
+                },
+                {
+                  "id": "external-id",
+                  "label": "ID externo",
+                  "key": "external_id",
+                  "shape": {
+                    "kind": "content",
+                    "family": "text",
+                    "cardinality": "one",
+                    "representation": "inline"
+                  },
+                  "required": true
+                },
+                {
+                  "id": "provider",
+                  "label": "Fonte",
+                  "key": "provider",
+                  "shape": {
+                    "kind": "content",
+                    "family": "text",
+                    "cardinality": "one",
+                    "representation": "inline"
+                  },
+                  "required": true
+                },
+                {
+                  "id": "media-type",
+                  "label": "Tipo",
+                  "key": "media_type",
+                  "shape": {
+                    "kind": "content",
+                    "family": "text",
+                    "cardinality": "one",
+                    "representation": "inline"
+                  },
+                  "required": true
+                },
+                {
+                  "id": "source-url",
+                  "label": "Página original",
+                  "key": "source_url",
+                  "shape": {
+                    "kind": "control",
+                    "control": "url",
+                    "cardinality": "one"
+                  },
+                  "required": true
+                },
+                {
+                  "id": "attribution",
+                  "label": "Atribuição",
+                  "key": "attribution",
+                  "shape": {
+                    "kind": "content",
+                    "family": "text",
+                    "cardinality": "one",
+                    "representation": "inline"
+                  },
+                  "required": true
+                },
+                {
+                  "id": "license-name",
+                  "label": "Licença",
+                  "key": "license_name",
+                  "shape": {
+                    "kind": "content",
+                    "family": "text",
+                    "cardinality": "one",
+                    "representation": "inline"
+                  },
+                  "required": true
+                },
+                {
+                  "id": "license-url",
+                  "label": "URL da licença",
+                  "key": "license_url",
+                  "shape": {
+                    "kind": "control",
+                    "control": "url",
+                    "cardinality": "one"
+                  },
+                  "required": true
+                }
+              ]
+            },
+            "required": true,
+            "presentation": {
+              "renderer": "cards"
+            },
+            "portKey": "results"
+          }
+        ],
+        "parameters": [],
+        "order": 0,
+        "plugin": {
+          "pluginId": "local.contentflow.free-stock-media-studio",
+          "pluginVersion": "1.0.0",
+          "capabilityId": "search-stock-images",
+          "configuration": {
+            "provider": "openverse",
+            "resultsPerProvider": 3,
+            "orientation": "landscape",
+            "safeSearch": true
+          },
+          "connectionRequired": false
+        }
+      },
+      {
+        "id": "p24-validate",
+        "type": "VALIDAR",
+        "operator": "Humano",
+        "name": "Validar candidato",
+        "instructions": "Escolha um candidato somente depois de conferir licença, atribuição e adequação editorial.",
+        "inputs": [],
+        "outputs": [
+          {
+            "id": "p24-selected",
+            "label": "Candidato escolhido",
+            "key": "selected_value",
+            "shape": {
+              "kind": "record",
+              "cardinality": "one",
+              "fields": [
+                {
+                  "id": "asset-id",
+                  "label": "ID",
+                  "key": "asset_id",
+                  "shape": {
+                    "kind": "content",
+                    "family": "text",
+                    "cardinality": "one",
+                    "representation": "inline"
+                  },
+                  "required": true
+                },
+                {
+                  "id": "external-id",
+                  "label": "ID externo",
+                  "key": "external_id",
+                  "shape": {
+                    "kind": "content",
+                    "family": "text",
+                    "cardinality": "one",
+                    "representation": "inline"
+                  },
+                  "required": true
+                },
+                {
+                  "id": "provider",
+                  "label": "Fonte",
+                  "key": "provider",
+                  "shape": {
+                    "kind": "content",
+                    "family": "text",
+                    "cardinality": "one",
+                    "representation": "inline"
+                  },
+                  "required": true
+                },
+                {
+                  "id": "media-type",
+                  "label": "Tipo",
+                  "key": "media_type",
+                  "shape": {
+                    "kind": "content",
+                    "family": "text",
+                    "cardinality": "one",
+                    "representation": "inline"
+                  },
+                  "required": true
+                },
+                {
+                  "id": "source-url",
+                  "label": "Página original",
+                  "key": "source_url",
+                  "shape": {
+                    "kind": "control",
+                    "control": "url",
+                    "cardinality": "one"
+                  },
+                  "required": true
+                },
+                {
+                  "id": "attribution",
+                  "label": "Atribuição",
+                  "key": "attribution",
+                  "shape": {
+                    "kind": "content",
+                    "family": "text",
+                    "cardinality": "one",
+                    "representation": "inline"
+                  },
+                  "required": true
+                },
+                {
+                  "id": "license-name",
+                  "label": "Licença",
+                  "key": "license_name",
+                  "shape": {
+                    "kind": "content",
+                    "family": "text",
+                    "cardinality": "one",
+                    "representation": "inline"
+                  },
+                  "required": true
+                },
+                {
+                  "id": "license-url",
+                  "label": "URL da licença",
+                  "key": "license_url",
+                  "shape": {
+                    "kind": "control",
+                    "control": "url",
+                    "cardinality": "one"
+                  },
+                  "required": true
+                }
+              ]
+            },
+            "required": true,
+            "optionsSourceBlockId": "p24-search",
+            "optionsSourceKey": "candidates"
+          },
+          {
+            "id": "p24-feedback",
+            "label": "Observações",
+            "key": "feedback",
+            "shape": {
+              "kind": "record",
+              "cardinality": "one",
+              "fields": [
+                {
+                  "id": "asset-id",
+                  "label": "ID",
+                  "key": "asset_id",
+                  "shape": {
+                    "kind": "content",
+                    "family": "text",
+                    "cardinality": "one",
+                    "representation": "inline"
+                  },
+                  "required": true
+                },
+                {
+                  "id": "external-id",
+                  "label": "ID externo",
+                  "key": "external_id",
+                  "shape": {
+                    "kind": "content",
+                    "family": "text",
+                    "cardinality": "one",
+                    "representation": "inline"
+                  },
+                  "required": true
+                },
+                {
+                  "id": "provider",
+                  "label": "Fonte",
+                  "key": "provider",
+                  "shape": {
+                    "kind": "content",
+                    "family": "text",
+                    "cardinality": "one",
+                    "representation": "inline"
+                  },
+                  "required": true
+                },
+                {
+                  "id": "media-type",
+                  "label": "Tipo",
+                  "key": "media_type",
+                  "shape": {
+                    "kind": "content",
+                    "family": "text",
+                    "cardinality": "one",
+                    "representation": "inline"
+                  },
+                  "required": true
+                },
+                {
+                  "id": "source-url",
+                  "label": "Página original",
+                  "key": "source_url",
+                  "shape": {
+                    "kind": "control",
+                    "control": "url",
+                    "cardinality": "one"
+                  },
+                  "required": true
+                },
+                {
+                  "id": "attribution",
+                  "label": "Atribuição",
+                  "key": "attribution",
+                  "shape": {
+                    "kind": "content",
+                    "family": "text",
+                    "cardinality": "one",
+                    "representation": "inline"
+                  },
+                  "required": true
+                },
+                {
+                  "id": "license-name",
+                  "label": "Licença",
+                  "key": "license_name",
+                  "shape": {
+                    "kind": "content",
+                    "family": "text",
+                    "cardinality": "one",
+                    "representation": "inline"
+                  },
+                  "required": true
+                },
+                {
+                  "id": "license-url",
+                  "label": "URL da licença",
+                  "key": "license_url",
+                  "shape": {
+                    "kind": "control",
+                    "control": "url",
+                    "cardinality": "one"
+                  },
+                  "required": true
+                }
+              ]
+            },
+            "required": false
+          }
+        ],
+        "validation": {
+          "targetBlockId": "p24-search",
+          "targetOutputKey": "candidates",
+          "mode": "select_one",
+          "onReject": "pause",
+          "maxAttempts": 1
+        },
+        "parameters": [],
+        "order": 1
+      },
+      {
+        "id": "p24-download",
+        "type": "CRIAR",
+        "operator": "Código",
+        "name": "Materializar asset aprovado",
+        "instructions": "Baixe somente o candidato aprovado e preserve sua proveniência.",
+        "inputs": [
+          {
+            "id": "p24-approved-assets",
+            "label": "Assets aprovados",
+            "shape": {
+              "kind": "record",
+              "cardinality": "many",
+              "fields": []
+            },
+            "binding": {
+              "kind": "previous_block",
+              "blockId": "p24-validate",
+              "outputKey": "selected_value"
+            },
+            "portKey": "selected_assets"
+          }
+        ],
+        "outputs": [
+          {
+            "id": "p24-assets",
+            "label": "Assets visuais locais",
+            "key": "assets",
+            "shape": {
+              "kind": "record",
+              "cardinality": "many",
+              "fields": []
+            },
+            "required": true,
+            "presentation": {
+              "renderer": "file-list"
+            },
+            "portKey": "assets"
+          }
+        ],
+        "parameters": [],
+        "order": 2,
+        "plugin": {
+          "pluginId": "local.contentflow.free-stock-media-studio",
+          "pluginVersion": "1.0.0",
+          "capabilityId": "download-selected-stock-assets",
+          "configuration": {},
+          "connectionRequired": false
+        }
+      }
+    ],
+    "contractVersion": 3
+  },
+  "p24": {
+    "locales": [
+      "pt-BR",
+      "en",
+      "es"
+    ],
+    "query": "planet earth from space",
+    "provider": "openverse"
+  }
+}

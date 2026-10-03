@@ -1,0 +1,1050 @@
+{
+  "$schema": "https://raw.githubusercontent.com/andremjr/contentflow/main/docs/ecosystem/schemas/contentflow-plugin-v2.schema.json",
+  "apiVersion": "2",
+  "id": "local.contentflow.claude-browser-text",
+  "name": "Claude Browser Studio",
+  "version": "2.0.1",
+  "description": "Super plugin do Claude web para criar em uma ou várias etapas, pesquisar, escolher, validar e analisar imagens ou documentos em conversas persistentes.",
+  "author": "André Marinho Jr.",
+  "license": "MIT",
+  "branding": {
+    "iconPath": "assets/icon.png"
+  },
+  "runtime": {
+    "kind": "node",
+    "version": ">=26 <27",
+    "module": "esm"
+  },
+  "minCoreVersion": "1.3.3",
+  "entrypoint": "handler.mjs",
+  "browserRuntime": {
+    "lifecycle": "core"
+  },
+  "permissions": [
+    "network",
+    "filesystem:read",
+    "filesystem:write",
+    "process"
+  ],
+  "networkHosts": [
+    "claude.ai"
+  ],
+  "profileSetup": {
+    "configurationKey": "accountProfile",
+    "fallbackConfigurationKey": "fallbackAccountProfiles",
+    "label": "Salvar perfil",
+    "description": "Abre o Claude para login e fecha o Chrome após validar a área do chat."
+  },
+  "settingsSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "chromeExecutable": {
+        "type": "string",
+        "default": "",
+        "description": "Caminho opcional do Google Chrome. Vazio detecta automaticamente."
+      },
+      "profilesBasePath": {
+        "type": "string",
+        "default": "",
+        "description": "Pasta-base opcional dos perfis Claude. Vazio usa o workspace autorizado do plugin."
+      },
+      "profilePath": {
+        "type": "string",
+        "default": "",
+        "description": "Compatibilidade com a v0.1: caminho do perfil default."
+      },
+      "allowExistingChromeProfile": {
+        "type": "boolean",
+        "default": false,
+        "description": "Permite usar uma pasta de perfil Chrome existente escolhida explicitamente. Feche outras instâncias que estejam usando o mesmo perfil."
+      },
+      "remoteDebuggingPort": {
+        "type": "integer",
+        "minimum": 1024,
+        "maximum": 64000,
+        "default": 9444
+      },
+      "keepBrowserOpen": {
+        "type": "boolean",
+        "default": true
+      },
+      "startMinimized": {
+        "type": "boolean",
+        "default": true,
+        "description": "A execução automática permanece minimizada; a preparação do perfil continua visível para login manual."
+      },
+      "interactiveWaitSeconds": {
+        "type": "integer",
+        "minimum": 30,
+        "maximum": 900,
+        "default": 600
+      },
+      "responseTimeoutSeconds": {
+        "type": "integer",
+        "minimum": 30,
+        "maximum": 900,
+        "default": 600
+      },
+      "typingChunkSize": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 40,
+        "default": 8
+      },
+      "typingDelayMs": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 200,
+        "default": 15
+      },
+      "diagnosticTrace": {
+        "type": "boolean",
+        "default": false,
+        "description": "Registra somente etapas e tamanhos redigidos; nunca prompts, respostas, cookies ou tokens."
+      },
+      "diagnosticMockResponse": {
+        "type": "string",
+        "default": "",
+        "description": "Somente para testes locais; quando preenchido, não abre o navegador."
+      }
+    }
+  },
+  "capabilities": [
+    {
+      "id": "generate-text-in-browser",
+      "operator": "IA",
+      "instructionUsage": "required",
+      "promptPreview": {
+        "template": "INSTRUÇÕES DO BLOCO:\n{{BLOCK_INSTRUCTIONS}}\n\nCONTEXTO DAS ENTRADAS:\n{{CONTEXT_INPUTS}}"
+      },
+      "blockTypes": [
+        "CRIAR"
+      ],
+      "processTypes": [
+        "theme",
+        "title",
+        "thumbnail",
+        "script",
+        "narration",
+        "assets",
+        "editing",
+        "publishing"
+      ],
+      "inputPorts": [
+        {
+          "key": "content",
+          "label": "Contexto para geração",
+          "description": "Informações de apoio que acompanham a instrução principal; não cria uma etapa separada.",
+          "required": false,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        },
+        {
+          "key": "history",
+          "label": "Histórico do canal",
+          "description": "Registros históricos explicitamente vinculados pelo núcleo para orientar a geração.",
+          "required": false,
+          "shape": {
+            "kind": "record",
+            "cardinality": "many",
+            "fields": []
+          }
+        },
+        {
+          "key": "context_1",
+          "label": "Contexto adicional 1",
+          "description": "Entrada textual adicional explicitamente vinculada pelo Método e enviada no contexto da instrução.",
+          "required": false,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        },
+        {
+          "key": "context_2",
+          "label": "Contexto adicional 2",
+          "description": "Entrada textual adicional explicitamente vinculada pelo Método e enviada no contexto da instrução.",
+          "required": false,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        },
+        {
+          "key": "context_3",
+          "label": "Contexto adicional 3",
+          "description": "Entrada textual adicional explicitamente vinculada pelo Método e enviada no contexto da instrução.",
+          "required": false,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        },
+        {
+          "key": "context_4",
+          "label": "Contexto adicional 4",
+          "description": "Entrada textual adicional explicitamente vinculada pelo Método e enviada no contexto da instrução.",
+          "required": false,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        },
+        {
+          "key": "context_5",
+          "label": "Contexto adicional 5",
+          "description": "Entrada textual adicional explicitamente vinculada pelo Método e enviada no contexto da instrução.",
+          "required": false,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        },
+        {
+          "key": "context_6",
+          "label": "Contexto adicional 6",
+          "description": "Entrada textual adicional explicitamente vinculada pelo Método e enviada no contexto da instrução.",
+          "required": false,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        },
+        {
+          "key": "outline",
+          "label": "Outline / estrutura",
+          "description": "Cada item gera uma mensagem e uma resposta na mesma conversa.",
+          "required": false,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "many",
+            "representation": "inline"
+          }
+        },
+        {
+          "key": "sections",
+          "label": "Quantidade de blocos",
+          "description": "Quando não há outline, cria esta quantidade de etapas consecutivas.",
+          "required": false,
+          "shape": {
+            "kind": "control",
+            "control": "number",
+            "cardinality": "one"
+          }
+        },
+        {
+          "key": "target",
+          "label": "Meta de caracteres",
+          "description": "Meta total validada depois da concatenação de todas as respostas.",
+          "required": false,
+          "shape": {
+            "kind": "control",
+            "control": "number",
+            "cardinality": "one"
+          }
+        },
+        {
+          "key": "attachments",
+          "label": "Referências anexas",
+          "description": "Imagens ou documentos enviados somente na primeira mensagem da conversa.",
+          "required": false,
+          "shape": {
+            "kind": "content",
+            "family": "image",
+            "cardinality": "many",
+            "representation": "artifact"
+          }
+        }
+      ],
+      "outputPorts": [
+        {
+          "key": "result",
+          "label": "Texto gerado",
+          "required": true,
+          "presentation": {
+            "renderer": "text-long"
+          },
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        },
+        {
+          "key": "parts",
+          "label": "Respostas por etapa",
+          "description": "Lista opcional que preserva cada resposta capturada na conversa.",
+          "required": false,
+          "presentation": {
+            "renderer": "list"
+          },
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "many",
+            "representation": "inline"
+          }
+        },
+        {
+          "key": "document",
+          "label": "Documento Markdown",
+          "description": "Arquivo .md opcional criado a partir do texto final validado.",
+          "required": false,
+          "presentation": {
+            "renderer": "file-list"
+          },
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "artifact",
+            "formats": {
+              "mimeTypes": [
+                "text/markdown"
+              ]
+            }
+          }
+        }
+      ],
+      "execution": {
+        "mode": "immediate",
+        "defaultTimeoutMs": 900000,
+        "supportsCancellation": true,
+        "maxConcurrency": 1,
+        "itemOrchestration": {
+          "inputPort": "content",
+          "outputPort": "parts",
+          "combinedOutputPort": "result",
+          "separator": "\n\n",
+          "mode": "sequential"
+        }
+      },
+      "sideEffects": [
+        "external_write",
+        "subprocess"
+      ],
+      "cost": {
+        "model": "unknown",
+        "estimateSupported": false
+      },
+      "dataPolicy": {
+        "sendsDataToThirdParties": true,
+        "providers": [
+          "Anthropic / Claude web"
+        ]
+      },
+      "blockConfigSchema": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "fallbackAccountProfiles": {
+            "type": "string",
+            "title": "Perfis de fallback",
+            "format": "textarea",
+            "default": "",
+            "maxLength": 512,
+            "description": "Aliases adicionais, um por linha, em ordem. O sistema avança automaticamente para o próximo perfil cadastrado sempre que houver qualquer erro na execução."
+          },
+          "accountProfile": {
+            "type": "string",
+            "title": "Perfil da conta Claude",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$",
+            "default": "default",
+            "description": "Alias como canal-a. Cada alias mantém login e histórico separados."
+          },
+          "generationMode": {
+            "type": "string",
+            "title": "Modo de geração",
+            "enum": [
+              "auto",
+              "single",
+              "sequence"
+            ],
+            "default": "auto",
+            "description": "Auto usa sequência quando recebe outline ou quantidade maior que 1; single força um envio; sequence força várias etapas."
+          },
+          "characterTolerancePercent": {
+            "type": "integer",
+            "title": "Tolerância da meta (%)",
+            "minimum": 0,
+            "maximum": 25,
+            "default": 5
+          },
+          "maxLengthRepairPrompts": {
+            "type": "integer",
+            "title": "Complementos para atingir a meta",
+            "minimum": 0,
+            "maximum": 5,
+            "default": 2,
+            "description": "Quantidade máxima de mensagens adicionais quando o roteiro termina abaixo da faixa aceita."
+          },
+          "startMinimized": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "result": {
+            "type": "string",
+            "minLength": 1
+          },
+          "parts": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "document": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "name": {
+                "type": "string",
+                "pattern": "\\.md$"
+              },
+              "mimeType": {
+                "const": "text/markdown"
+              },
+              "size": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "url": {
+                "type": "string",
+                "pattern": "^artifact://"
+              }
+            },
+            "required": [
+              "id",
+              "name",
+              "mimeType",
+              "size",
+              "url"
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ]
+      }
+    },
+    {
+      "id": "search-web-in-browser",
+      "operator": "IA",
+      "blockTypes": [
+        "BUSCAR"
+      ],
+      "processTypes": [
+        "theme",
+        "title",
+        "thumbnail",
+        "script",
+        "narration",
+        "assets",
+        "editing",
+        "publishing"
+      ],
+      "inputPorts": [
+        {
+          "key": "query",
+          "label": "Consulta",
+          "required": true,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        },
+        {
+          "key": "context",
+          "label": "Contexto adicional",
+          "required": false,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        }
+      ],
+      "outputPorts": [
+        {
+          "key": "result",
+          "label": "Resultado da pesquisa",
+          "required": true,
+          "presentation": {
+            "renderer": "text-long"
+          },
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        },
+        {
+          "key": "sources",
+          "label": "Fontes consultadas",
+          "required": false,
+          "presentation": {
+            "renderer": "list"
+          },
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "many",
+            "representation": "inline"
+          }
+        }
+      ],
+      "execution": {
+        "mode": "immediate",
+        "defaultTimeoutMs": 900000,
+        "supportsCancellation": true,
+        "maxConcurrency": 1
+      },
+      "sideEffects": [
+        "external_read",
+        "external_write",
+        "subprocess"
+      ],
+      "cost": {
+        "model": "unknown",
+        "estimateSupported": false
+      },
+      "dataPolicy": {
+        "sendsDataToThirdParties": true,
+        "providers": [
+          "Anthropic / Claude web",
+          "Fontes públicas acessadas pela pesquisa do Claude"
+        ]
+      },
+      "blockConfigSchema": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "fallbackAccountProfiles": {
+            "type": "string",
+            "title": "Perfis de fallback",
+            "format": "textarea",
+            "default": "",
+            "maxLength": 512,
+            "description": "Aliases adicionais, um por linha, em ordem. O sistema avança automaticamente para o próximo perfil cadastrado sempre que houver qualquer erro na execução."
+          },
+          "accountProfile": {
+            "type": "string",
+            "title": "Perfil da conta Claude",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$",
+            "default": "default"
+          },
+          "startMinimized": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "instructionUsage": "required"
+    },
+    {
+      "id": "choose-library-item-in-browser",
+      "operator": "IA",
+      "blockTypes": [
+        "ESCOLHER"
+      ],
+      "processTypes": [
+        "theme",
+        "title",
+        "thumbnail",
+        "script",
+        "narration",
+        "assets",
+        "editing",
+        "publishing"
+      ],
+      "inputPorts": [
+        {
+          "key": "context",
+          "label": "Contexto da escolha",
+          "required": false,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        }
+      ],
+      "outputPorts": [
+        {
+          "key": "result",
+          "label": "ID do item escolhido",
+          "required": true,
+          "shape": {
+            "kind": "control",
+            "control": "identifier",
+            "cardinality": "one"
+          }
+        }
+      ],
+      "execution": {
+        "mode": "immediate",
+        "defaultTimeoutMs": 900000,
+        "supportsCancellation": true,
+        "maxConcurrency": 1
+      },
+      "sideEffects": [
+        "external_write",
+        "subprocess"
+      ],
+      "cost": {
+        "model": "unknown",
+        "estimateSupported": false
+      },
+      "dataPolicy": {
+        "sendsDataToThirdParties": true,
+        "providers": [
+          "Anthropic / Claude web"
+        ]
+      },
+      "blockConfigSchema": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "fallbackAccountProfiles": {
+            "type": "string",
+            "title": "Perfis de fallback",
+            "format": "textarea",
+            "default": "",
+            "maxLength": 512,
+            "description": "Aliases adicionais, um por linha, em ordem. O sistema avança automaticamente para o próximo perfil cadastrado sempre que houver qualquer erro na execução."
+          },
+          "accountProfile": {
+            "type": "string",
+            "title": "Perfil da conta Claude",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$",
+            "default": "default"
+          },
+          "startMinimized": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "result": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "result"
+        ]
+      },
+      "instructionUsage": "required"
+    },
+    {
+      "id": "validate-content-in-browser",
+      "operator": "IA",
+      "blockTypes": [
+        "VALIDAR"
+      ],
+      "processTypes": [
+        "theme",
+        "title",
+        "thumbnail",
+        "script",
+        "narration",
+        "assets",
+        "editing",
+        "publishing"
+      ],
+      "inputPorts": [
+        {
+          "key": "content",
+          "label": "Conteúdo a validar",
+          "required": true,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        },
+        {
+          "key": "criteria",
+          "label": "Critérios adicionais",
+          "required": false,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "many",
+            "representation": "inline"
+          }
+        }
+      ],
+      "outputPorts": [
+        {
+          "key": "decision",
+          "label": "Decisão",
+          "required": false,
+          "presentation": {
+            "renderer": "decision"
+          },
+          "shape": {
+            "kind": "control",
+            "control": "approval",
+            "cardinality": "one"
+          }
+        },
+        {
+          "key": "feedback",
+          "label": "Observações",
+          "required": false,
+          "presentation": {
+            "renderer": "text-long"
+          },
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        },
+        {
+          "key": "selected_value",
+          "label": "Opção escolhida",
+          "required": false,
+          "shape": {
+            "kind": "control",
+            "control": "selection",
+            "cardinality": "one"
+          }
+        },
+        {
+          "key": "selected_values",
+          "label": "Opções escolhidas",
+          "required": false,
+          "shape": {
+            "kind": "control",
+            "control": "selection",
+            "cardinality": "many"
+          }
+        }
+      ],
+      "execution": {
+        "mode": "immediate",
+        "defaultTimeoutMs": 900000,
+        "supportsCancellation": true,
+        "maxConcurrency": 1
+      },
+      "sideEffects": [
+        "external_write",
+        "subprocess"
+      ],
+      "cost": {
+        "model": "unknown",
+        "estimateSupported": false
+      },
+      "dataPolicy": {
+        "sendsDataToThirdParties": true,
+        "providers": [
+          "Anthropic / Claude web"
+        ]
+      },
+      "blockConfigSchema": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "fallbackAccountProfiles": {
+            "type": "string",
+            "title": "Perfis de fallback",
+            "format": "textarea",
+            "default": "",
+            "maxLength": 512,
+            "description": "Aliases adicionais, um por linha, em ordem. O sistema avança automaticamente para o próximo perfil cadastrado sempre que houver qualquer erro na execução."
+          },
+          "accountProfile": {
+            "type": "string",
+            "title": "Perfil da conta Claude",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$",
+            "default": "default"
+          },
+          "startMinimized": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      },
+      "instructionUsage": "required"
+    },
+    {
+      "id": "analyze-images-in-browser",
+      "operator": "IA",
+      "blockTypes": [
+        "CRIAR"
+      ],
+      "processTypes": [
+        "theme",
+        "title",
+        "thumbnail",
+        "script",
+        "narration",
+        "assets",
+        "editing",
+        "publishing"
+      ],
+      "inputPorts": [
+        {
+          "key": "images",
+          "label": "Imagens para visão",
+          "required": true,
+          "shape": {
+            "kind": "content",
+            "family": "image",
+            "cardinality": "many",
+            "representation": "artifact"
+          }
+        },
+        {
+          "key": "context",
+          "label": "Contexto da análise",
+          "required": false,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        }
+      ],
+      "outputPorts": [
+        {
+          "key": "result",
+          "label": "Análise visual",
+          "required": true,
+          "presentation": {
+            "renderer": "text-long"
+          },
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        }
+      ],
+      "execution": {
+        "mode": "immediate",
+        "defaultTimeoutMs": 900000,
+        "supportsCancellation": true,
+        "maxConcurrency": 1
+      },
+      "sideEffects": [
+        "external_write",
+        "subprocess"
+      ],
+      "cost": {
+        "model": "unknown",
+        "estimateSupported": false
+      },
+      "dataPolicy": {
+        "sendsDataToThirdParties": true,
+        "providers": [
+          "Anthropic / Claude web (imagens e prompt)"
+        ]
+      },
+      "blockConfigSchema": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "fallbackAccountProfiles": {
+            "type": "string",
+            "title": "Perfis de fallback",
+            "format": "textarea",
+            "default": "",
+            "maxLength": 512,
+            "description": "Aliases adicionais, um por linha, em ordem. O sistema avança automaticamente para o próximo perfil cadastrado sempre que houver qualquer erro na execução."
+          },
+          "accountProfile": {
+            "type": "string",
+            "title": "Perfil da conta Claude",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$",
+            "default": "default"
+          },
+          "startMinimized": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "result": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "result"
+        ]
+      },
+      "instructionUsage": "required"
+    },
+    {
+      "id": "analyze-documents-in-browser",
+      "operator": "IA",
+      "blockTypes": [
+        "CRIAR"
+      ],
+      "processTypes": [
+        "theme",
+        "title",
+        "thumbnail",
+        "script",
+        "narration",
+        "assets",
+        "editing",
+        "publishing"
+      ],
+      "inputPorts": [
+        {
+          "key": "documents",
+          "label": "Documentos para análise",
+          "required": true,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "many",
+            "representation": "artifact"
+          }
+        },
+        {
+          "key": "context",
+          "label": "Contexto da análise",
+          "required": false,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        }
+      ],
+      "outputPorts": [
+        {
+          "key": "result",
+          "label": "Análise dos documentos",
+          "required": true,
+          "presentation": {
+            "renderer": "text-long"
+          },
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        }
+      ],
+      "execution": {
+        "mode": "immediate",
+        "defaultTimeoutMs": 900000,
+        "supportsCancellation": true,
+        "maxConcurrency": 1
+      },
+      "sideEffects": [
+        "external_write",
+        "subprocess"
+      ],
+      "cost": {
+        "model": "unknown",
+        "estimateSupported": false
+      },
+      "dataPolicy": {
+        "sendsDataToThirdParties": true,
+        "providers": [
+          "Anthropic / Claude web (documentos e prompt)"
+        ]
+      },
+      "blockConfigSchema": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "fallbackAccountProfiles": {
+            "type": "string",
+            "title": "Perfis de fallback",
+            "format": "textarea",
+            "default": "",
+            "maxLength": 512,
+            "description": "Aliases adicionais, um por linha, em ordem. O sistema avança automaticamente para o próximo perfil cadastrado sempre que houver qualquer erro na execução."
+          },
+          "accountProfile": {
+            "type": "string",
+            "title": "Perfil da conta Claude",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$",
+            "default": "default"
+          },
+          "startMinimized": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "result": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "result"
+        ]
+      },
+      "instructionUsage": "required"
+    }
+  ],
+  "repository": "https://github.com/andremjr/plugins-contentflow"
+}

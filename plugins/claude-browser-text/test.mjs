@@ -1,0 +1,466 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { __test, execute } from "./handler.mjs";
+
+const manifest = JSON.parse(
+  await readFile(new URL("./contentflow.plugin.json", import.meta.url), "utf8"),
+);
+const handlerSource = await readFile(new URL("./handler.mjs", import.meta.url), "utf8");
+
+function outputContractFor(capabilityId, validation, fields) {
+  const selected =
+    fields ??
+    (capabilityId === "search-web-in-browser"
+      ? [
+          { key: "result", type: "textarea" },
+          { key: "sources", type: "list" },
+        ]
+      : capabilityId === "validate-content-in-browser"
+        ? validation?.mode === "select_one"
+          ? [
+              { key: "selected_value", type: "text" },
+              { key: "feedback", type: "textarea" },
+            ]
+          : validation?.mode === "select_many"
+            ? [
+                { key: "selected_values", type: "list" },
+                { key: "feedback", type: "textarea" },
+              ]
+            : [
+                { key: "decision", type: "approval" },
+                { key: "feedback", type: "textarea" },
+              ]
+        : [{ key: "result", type: "textarea" }]);
+  return selected.map((field) => ({ ...field, portKey: field.portKey ?? field.key }));
+}
+
+test("manifesto prepara perfis antes da execução", () => {
+  assert.equal(manifest.version, "2.0.0");
+  assert.equal(manifest.profileSetup.configurationKey, "accountProfile");
+  assert.equal(manifest.settingsSchema.properties.allowExistingChromeProfile.default, false);
+});
+
+test("modela as fases observáveis da resposta", () => {
+  assert.equal(
+    __test.responsePhase({ hasNewResponse: false, generating: false, stablePolls: 0 }),
+    "awaiting_response",
+  );
+  assert.equal(
+    __test.responsePhase({ hasNewResponse: true, generating: true, stablePolls: 2 }),
+    "streaming",
+  );
+  assert.equal(
+    __test.responsePhase({ hasNewResponse: true, generating: false, stablePolls: 1 }),
+    "stabilizing",
+  );
+  assert.equal(
+    __test.responsePhase({ hasNewResponse: true, generating: false, stablePolls: 2 }),
+    "completed",
+  );
+});
+
+function request(overrides = {}) {
+  return {
+    capabilityId: overrides.capabilityId ?? "generate-text-in-browser",
+    resolvedInstruction: overrides.resolvedInstruction ?? "Escreva com clareza.",
+    configuration: {
+      promptTemplate: "{{BLOCK_INSTRUCTIONS}}\n\nTema: {{CONTENT}}\nCanal: {{CHANNEL_NAME}}",
+      generationMode: "single",
+      plainTextOnly: true,
+      cleanOutput: true,
+      retryAttempts: 0,
+      ...overrides.configuration,
+    },
+    settings: { diagnosticMockResponse: "TESTE OK", ...overrides.settings },
+    inputs: { content: "Tema principal", ...overrides.inputs },
+    instructionContextInputs: overrides.instructionContextInputs,
+    context: {
+      channel: { name: "Canal A", niche: "Histórias" },
+      project: { title: "Projeto A" },
+      processType: "script",
+      block: { type: "CRIAR", name: "Criar", instructions: "Escreva com clareza." },
+      ...overrides.context,
+    },
+    validation: overrides.validation,
+    outputContract: outputContractFor(
+      overrides.capabilityId ?? "generate-text-in-browser",
+      overrides.validation,
+      overrides.outputContract,
+    ),
+  };
+}
+
+test("não repete no contexto uma entrada já interpolada na instrução", () => {
+  assert.equal(
+    __test.expandTemplate(
+      "{{BLOCK_INSTRUCTIONS}} | contexto={{CONTENT}}",
+      request({ resolvedInstruction: "Use Tema principal.", instructionContextInputs: {} }),
+    ),
+    "Use Tema principal. | contexto=",
+  );
+});
+
+test("manifesto declara as seis capabilities do Claude Browser Studio", () => {
+  assert.equal(manifest.apiVersion, "2");
+  assert.equal(manifest.id, "local.contentflow.claude-browser-text");
+  const capability = manifest.capabilities.find((item) => item.id === "generate-text-in-browser");
+  assert.ok(capability);
+  assert.equal(capability.instructionUsage, "required");
+  assert.deepEqual(Object.keys(capability.blockConfigSchema.properties), [
+    "fallbackAccountProfiles",
+    "accountProfile",
+    "generationMode",
+    "characterTolerancePercent",
+    "maxLengthRepairPrompts",
+    "startMinimized",
+  ]);
+  assert.deepEqual(capability.blockTypes, ["CRIAR"]);
+  assert.deepEqual(
+    capability.outputPorts.map((item) => item.key),
+    ["result", "parts", "document"],
+  );
+  assert.deepEqual(capability.inputPorts.find((item) => item.key === "sections").shape, {
+    kind: "control",
+    control: "number",
+    cardinality: "one",
+  });
+  assert.deepEqual(
+    manifest.capabilities.map((item) => item.id),
+    [
+      "generate-text-in-browser",
+      "search-web-in-browser",
+      "choose-library-item-in-browser",
+      "validate-content-in-browser",
+      "analyze-images-in-browser",
+      "analyze-documents-in-browser",
+    ],
+  );
+  assert.ok(manifest.permissions.includes("process"));
+  assert.ok(manifest.permissions.includes("filesystem:read"));
+  assert.deepEqual(manifest.networkHosts, ["claude.ai"]);
+  assert.deepEqual(manifest.secretKeys ?? [], []);
+});
+
+test("reúne anexos autorizados sem duplicar arquivos", () => {
+  const image = { id: "img-1", name: "frame.png", url: "staging://img-1" };
+  assert.deepEqual(__test.collectStoredFiles([image, { nested: image }]), [image, image]);
+});
+
+test("aceita SRT como documento anexado", () => {
+  assert.equal(__test.supportedUploadExtensions.has(".srt"), true);
+});
+
+test("reconhece o chip SRT quando o Claude renomeia o arquivo enviado", () => {
+  assert.equal(
+    __test.attachmentUploadIsReady(
+      { prompt: true, body: "arquivo 4764c716-19d8.srt SRT", previewCount: 0 },
+      ["mai-audio.srt"],
+      ["srt"],
+      0,
+    ),
+    true,
+  );
+});
+
+test("usa instrução e contexto para visão e documentos", () => {
+  const vision = __test.buildImageAnalysisPrompt(
+    request({
+      capabilityId: "analyze-images-in-browser",
+      configuration: {
+        analysisPromptTemplate: "VISÃO {{ANALYSIS_CONTEXT}} | {{BLOCK_INSTRUCTIONS}}",
+      },
+      inputs: { images: [{ id: "i", name: "a.png", url: "staging://i" }], context: "thumbnail" },
+    }),
+  );
+  const documents = __test.buildDocumentAnalysisPrompt(
+    request({
+      capabilityId: "analyze-documents-in-browser",
+      configuration: {
+        analysisPromptTemplate: "DOC {{ANALYSIS_CONTEXT}} | {{BLOCK_INSTRUCTIONS}}",
+      },
+      inputs: {
+        documents: [{ id: "d", name: "a.pdf", url: "staging://d" }],
+        context: "referências",
+      },
+    }),
+  );
+  assert.match(vision, /CONTEXTO DAS ENTRADAS:[\s\S]*thumbnail/);
+  assert.match(documents, /CONTEXTO DAS ENTRADAS:[\s\S]*referências/);
+});
+
+test("prioriza a instrução resolvida pelo núcleo", () => {
+  assert.equal(
+    __test.expandTemplate(
+      "{{BLOCK_INSTRUCTIONS}}",
+      request({ resolvedInstruction: "Prompt resolvido" }),
+    ),
+    "Prompt resolvido",
+  );
+});
+
+test("inclui a instrução resolvida quando o template personalizado não possui o token", () => {
+  const [prompt] = __test.buildParts(
+    request({
+      resolvedInstruction: "Não repita o tema anterior.",
+      configuration: { promptTemplate: "Gere um tema." },
+    }),
+  );
+  assert.match(prompt, /^INSTRUÇÕES DO BLOCO:\nNão repita o tema anterior\./);
+});
+
+test("sempre inclui as entradas resolvidas quando o prompt do plugin está vazio", () => {
+  const [prompt] = __test.buildParts(
+    request({
+      resolvedInstruction: "Crie um tema histórico.",
+      configuration: { promptTemplate: "" },
+      instructionContextInputs: {
+        content:
+          'ITEM ESCOLHIDO — Linha Editorial:\n{"Nome":"Mistérios da História","Descrição":"Civilizações desaparecidas"}\n\nITEM ESCOLHIDO — Perspectiva do canal:\n{"Ângulo":"O momento em que tudo deu errado","Descrição":"Investigue o ponto de ruptura"}',
+      },
+    }),
+  );
+  assert.match(prompt, /CONTEXTO DAS ENTRADAS:/);
+  assert.match(prompt, /Mistérios da História/);
+  assert.match(prompt, /Civilizações desaparecidas/);
+  assert.match(prompt, /O momento em que tudo deu errado/);
+  assert.match(prompt, /Investigue o ponto de ruptura/);
+});
+
+test("isola contas por alias sem aceitar traversal", () => {
+  assert.equal(__test.normalizeAccountProfile("canal-a"), "canal-a");
+  assert.throws(() => __test.normalizeAccountProfile("../perfil"), /Perfil da conta/);
+  assert.match(
+    __test.profilePathFor({}, "canal-a").replaceAll("\\", "/"),
+    /claude-browser-profiles\/canal-a$/,
+  );
+  assert.notEqual(__test.profilePort(9444, "canal-a"), __test.profilePort(9444, "canal-b"));
+  assert.equal(
+    __test.runtimeProfilePath({}, "canal-a", {
+      getWorkspacePath: (relativePath) => `workspace/${relativePath}`,
+    }),
+    "workspace/canal-a",
+  );
+});
+
+test("expande contexto e placeholders legados", () => {
+  const expanded = __test.expandTemplate(
+    "{{TEMA}} | {{NICHO}} | {{PROJECT_TITLE}} | {{INPUT:content}}",
+    request(),
+  );
+  assert.equal(expanded, "Tema principal | Histórias | Projeto A | Tema principal");
+});
+
+test("monta uma resposta genérica", () => {
+  const parts = __test.buildParts(request());
+  assert.equal(parts.length, 1);
+  assert.match(parts[0], /Tema principal/);
+  assert.match(parts[0], /texto puro/i);
+});
+
+test("modo single força somente um envio", () => {
+  const parts = __test.buildParts(
+    request({ configuration: { generationMode: "single" }, inputs: { sections: 8 } }),
+  );
+  assert.equal(parts.length, 1);
+});
+
+test("modo auto usa a quantidade de blocos como sequência", () => {
+  const parts = __test.buildParts(
+    request({
+      configuration: { generationMode: "auto" },
+      inputs: { sections: "3" },
+    }),
+  );
+  assert.equal(parts.length, 3);
+  assert.match(parts[0], /bloco 1\/3/i);
+  assert.match(parts[2], /bloco 3\/3/i);
+});
+
+test("divide outline em múltiplos envios na mesma conversa", () => {
+  const outline = Array.from({ length: 12 }, (_, index) => ({
+    titulo_bloco: `Ponto ${index + 1}`,
+    objetivo: `Objetivo ${index + 1}`,
+  }));
+  const parts = __test.buildParts(
+    request({
+      configuration: {
+        generationMode: "auto",
+      },
+      inputs: { content: "Contexto geral", outline },
+    }),
+  );
+  assert.equal(parts.length, 12);
+  assert.match(parts[0], /Ponto 1/);
+  assert.match(parts[11], /Ponto 12/);
+});
+
+test("distribui a meta conforme o saldo e valida a tolerância", () => {
+  const plan = __test.targetCharacterPlan(
+    request({
+      configuration: { characterTolerancePercent: 5 },
+      inputs: { target: 1000 },
+    }),
+  );
+  assert.deepEqual(plan, { target: 1000, tolerancePercent: 5, minimum: 950, maximum: 1050 });
+  assert.match(__test.promptWithCharacterBudget("Etapa", plan, [], 0, 2), /500 caracteres/);
+  assert.doesNotThrow(() => __test.validateGeneratedLength("x".repeat(980), plan));
+  assert.throws(() => __test.validateGeneratedLength("x".repeat(900), plan), /faixa aceita/);
+});
+
+test("gera artifact Markdown somente quando o contrato pede arquivo", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "claude-browser-test-"));
+  try {
+    const artifactRequest = request({
+      outputContract: [
+        { key: "script", type: "textarea", portKey: "result" },
+        { key: "script_file", type: "file", portKey: "document" },
+      ],
+      context: { project: { title: "História de Johnstown" } },
+    });
+    assert.equal(__test.markdownArtifactRequested(artifactRequest), true);
+    const generated = await __test.createMarkdownArtifact(
+      artifactRequest,
+      { getOutputPath: (name) => join(directory, name) },
+      "Roteiro pronto",
+    );
+    assert.equal(generated.file.name, "historia-de-johnstown.md");
+    assert.equal(generated.file.mimeType, "text/markdown");
+    assert.equal(await readFile(join(directory, generated.file.name), "utf8"), "Roteiro pronto");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("preserva cada resposta quando a saída parts é conectada", () => {
+  const values = __test.generationResponseValues(
+    "Parte A\n\nParte B",
+    [{ text: "Parte A" }, { text: "Parte B" }],
+    {
+      outputContract: [
+        { key: "result", portKey: "result", type: "textarea" },
+        { key: "parts", portKey: "parts", type: "list" },
+      ],
+    },
+  );
+  assert.deepEqual(values, { result: "Parte A\n\nParte B", parts: ["Parte A", "Parte B"] });
+});
+
+test("monta pesquisa web com consulta e contexto", () => {
+  const prompt = __test.buildSearchPrompt(
+    request({
+      capabilityId: "search-web-in-browser",
+      configuration: { searchPromptTemplate: "PESQUISE {{QUERY}} | {{SEARCH_CONTEXT}}" },
+      inputs: { query: "tendências atuais", context: "YouTube" },
+    }),
+  );
+  assert.match(prompt, /CONTEXTO DAS ENTRADAS:[\s\S]*tendências atuais[\s\S]*YouTube/);
+  assert.doesNotMatch(handlerSource, /ensureWebSearchEnabled|enable-web-search|open-tools/);
+});
+
+test("Buscar respeita as chaves e tipos do outputContract do bloco", () => {
+  const values = __test.searchResponseValues(
+    "- Tendência A\n- Tendência B",
+    ["https://example.com/a"],
+    {
+      outputContract: [
+        { key: "items_found", portKey: "result", label: "Itens encontrados", type: "list" },
+        { key: "sources", portKey: "sources", label: "Fontes consultadas", type: "list" },
+      ],
+    },
+  );
+  assert.deepEqual(values, {
+    result: ["Tendência A", "Tendência B"],
+    sources: ["https://example.com/a"],
+  });
+});
+
+test("Escolher aceita somente ID real da coleção", () => {
+  const chooseRequest = request({
+    capabilityId: "choose-library-item-in-browser",
+    context: {
+      selectedCollection: {
+        collectionId: "collection-1",
+        items: [
+          { id: "item-a", values: { titulo: "A" } },
+          { id: "item-b", values: { titulo: "B" } },
+        ],
+      },
+    },
+  });
+  assert.equal(__test.parseSelectedItemId('{"selectedItemId":"item-b"}', chooseRequest), "item-b");
+  assert.throws(
+    () => __test.parseSelectedItemId('{"selectedItemId":"inventado"}', chooseRequest),
+    /ID exato/,
+  );
+});
+
+test("Validar interpreta aprovação, seleção única e múltipla", () => {
+  assert.deepEqual(
+    __test.parseValidationValues(
+      '{"decision":"rejected","feedback":"Falta fonte"}',
+      request({ validation: { mode: "approval" } }),
+    ),
+    { decision: "rejected", feedback: "Falta fonte" },
+  );
+  assert.deepEqual(
+    __test.parseValidationValues(
+      '{"selectedIndex":2}',
+      request({ validation: { mode: "select_one" }, inputs: { content: ["A", "B"] } }),
+    ),
+    { selected_value: "B" },
+  );
+  assert.deepEqual(
+    __test.parseValidationValues(
+      '{"selectedIndices":[1,3]}',
+      request({ validation: { mode: "select_many" }, inputs: { content: ["A", "B", "C"] } }),
+    ),
+    { selected_values: ["A", "C"] },
+  );
+});
+
+test("rotas simuladas devolvem contratos de Buscar, Escolher e Validar", async () => {
+  const search = await execute(
+    request({
+      capabilityId: "search-web-in-browser",
+      settings: { diagnosticMockResponse: "Pesquisa pronta" },
+    }),
+    { signal: AbortSignal.timeout(5000) },
+  );
+  assert.deepEqual(search.values, { result: "Pesquisa pronta", sources: [] });
+
+  const choose = await execute(
+    request({
+      capabilityId: "choose-library-item-in-browser",
+      settings: { diagnosticMockResponse: '{"selectedItemId":"item-a"}' },
+      context: { selectedCollection: { collectionId: "c", items: [{ id: "item-a", values: {} }] } },
+    }),
+    { signal: AbortSignal.timeout(5000) },
+  );
+  assert.deepEqual(choose.values, { result: "item-a" });
+
+  const validate = await execute(
+    request({
+      capabilityId: "validate-content-in-browser",
+      settings: { diagnosticMockResponse: '{"decision":"approved","feedback":"OK"}' },
+      validation: { mode: "approval" },
+    }),
+    { signal: AbortSignal.timeout(5000) },
+  );
+  assert.deepEqual(validate.values, { decision: "approved", feedback: "OK" });
+});
+
+test("limpa artefatos, código e títulos markdown como o script original", () => {
+  const cleaned = __test.cleanGeneratedText(
+    "# Título interno\n\nTexto narrativo.\n\n```js\nconst segredo = 1;\n```\n\nContinuação.",
+  );
+  assert.equal(cleaned, "Texto narrativo.\n\nContinuação.");
+});
+
+test("fixture de diagnóstico respeita o contrato sem abrir navegador", async () => {
+  const response = await execute(request(), { signal: AbortSignal.timeout(5000) });
+  assert.equal(response.status, "success");
+  assert.equal(response.values.result, "TESTE OK");
+});

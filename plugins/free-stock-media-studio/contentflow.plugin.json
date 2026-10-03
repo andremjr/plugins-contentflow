@@ -1,0 +1,1157 @@
+{
+  "$schema": "https://raw.githubusercontent.com/andremjr/contentflow/main/docs/ecosystem/schemas/contentflow-plugin-v2.schema.json",
+  "apiVersion": "2",
+  "id": "local.contentflow.free-stock-media-studio",
+  "name": "Free Stock Media Studio",
+  "version": "1.0.1",
+  "description": "Pesquisa imagens e vídeos em escala por consulta ou briefing temporal, usando o maior lote permitido por provedor e preservando proveniência, licença e atribuição.",
+  "author": "André Marinho Jr.",
+  "license": "MIT",
+  "runtime": {
+    "kind": "node",
+    "version": ">=26 <27",
+    "module": "esm"
+  },
+  "minCoreVersion": "1.3.3",
+  "entrypoint": "handler.mjs",
+  "permissions": [
+    "network",
+    "filesystem:read",
+    "filesystem:write"
+  ],
+  "networkHosts": [
+    "api.pexels.com",
+    "images.pexels.com",
+    "videos.pexels.com",
+    "pixabay.com",
+    "*.pixabay.com",
+    "api.unsplash.com",
+    "images.unsplash.com",
+    "api.coverr.co",
+    "storage.coverr.co",
+    "cdn.coverr.co",
+    "coverr.co",
+    "api.openverse.org",
+    "commons.wikimedia.org",
+    "upload.wikimedia.org",
+    "images-api.nasa.gov",
+    "images-assets.nasa.gov"
+  ],
+  "secretKeys": [
+    "PEXELS_API_KEY",
+    "PIXABAY_API_KEY",
+    "UNSPLASH_ACCESS_KEY",
+    "COVERR_API_KEY"
+  ],
+  "optionalSecretKeys": [
+    "PEXELS_API_KEY",
+    "PIXABAY_API_KEY",
+    "UNSPLASH_ACCESS_KEY",
+    "COVERR_API_KEY"
+  ],
+  "settingsSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "requestTimeoutMs": {
+        "type": "integer",
+        "minimum": 3000,
+        "maximum": 120000,
+        "default": 30000
+      },
+      "maxImageBytes": {
+        "type": "integer",
+        "minimum": 1048576,
+        "maximum": 104857600,
+        "default": 52428800
+      },
+      "maxVideoBytes": {
+        "type": "integer",
+        "minimum": 1048576,
+        "maximum": 536870912,
+        "default": 536870912
+      },
+      "diagnosticFixture": {
+        "type": "boolean",
+        "default": false,
+        "description": "Somente para testes locais; não acessa provedores."
+      }
+    }
+  },
+  "capabilities": [
+    {
+      "id": "search-stock-images",
+      "name": "Buscar imagens stock",
+      "description": "Pesquisa imagens nas fontes disponíveis nesta conexão e devolve candidatos estruturados para validação.",
+      "operator": "Código",
+      "blockTypes": [
+        "BUSCAR"
+      ],
+      "processTypes": [
+        "thumbnail",
+        "assets",
+        "editing"
+      ],
+      "inputPorts": [
+        {
+          "key": "query",
+          "label": "Termos de busca",
+          "required": true,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        }
+      ],
+      "outputPorts": [
+        {
+          "key": "results",
+          "label": "Imagens encontradas",
+          "required": true,
+          "presentation": {
+            "renderer": "cards"
+          },
+          "shape": {
+            "kind": "record",
+            "cardinality": "many",
+            "fields": []
+          }
+        },
+        {
+          "key": "warnings",
+          "label": "Avisos dos provedores",
+          "required": false,
+          "presentation": {
+            "renderer": "list"
+          },
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "many",
+            "representation": "inline"
+          }
+        }
+      ],
+      "execution": {
+        "mode": "immediate",
+        "defaultTimeoutMs": 180000,
+        "supportsCancellation": true,
+        "maxConcurrency": 3
+      },
+      "sideEffects": [
+        "external_read"
+      ],
+      "cost": {
+        "model": "free",
+        "estimateSupported": false
+      },
+      "dataPolicy": {
+        "sendsDataToThirdParties": true,
+        "providers": [
+          "Pexels",
+          "Pixabay",
+          "Unsplash",
+          "Openverse",
+          "Wikimedia Commons",
+          "NASA"
+        ]
+      },
+      "configurationOptions": [
+        {
+          "property": "provider",
+          "providerId": "available-stock-providers",
+          "cacheTtlMs": 0
+        }
+      ],
+      "blockConfigSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "provider": {
+            "type": "string",
+            "default": "all",
+            "title": "Fonte",
+            "description": "Pexels, Pixabay e Unsplash exigem chave. Openverse, Wikimedia Commons e NASA funcionam sem chave."
+          },
+          "resultsPerProvider": {
+            "type": "integer",
+            "title": "Quantidade desejada",
+            "minimum": 1,
+            "maximum": 500,
+            "default": 20
+          },
+          "resultLimitMode": {
+            "type": "string",
+            "enum": [
+              "provider_max",
+              "custom"
+            ],
+            "visibleWhen": {
+              "property": "provider",
+              "values": [
+                "__legacy_pagination__"
+              ]
+            }
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "visibleWhen": {
+              "property": "provider",
+              "values": [
+                "__legacy_pagination__"
+              ]
+            }
+          },
+          "orientation": {
+            "type": "string",
+            "title": "Orientação",
+            "default": "any",
+            "oneOf": [
+              {
+                "const": "any",
+                "title": "Qualquer"
+              },
+              {
+                "const": "landscape",
+                "title": "Paisagem"
+              },
+              {
+                "const": "portrait",
+                "title": "Retrato"
+              },
+              {
+                "const": "square",
+                "title": "Quadrada"
+              }
+            ]
+          },
+          "safeSearch": {
+            "type": "boolean",
+            "title": "Busca segura",
+            "default": true
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "results": {
+            "type": "array"
+          },
+          "warnings": {
+            "type": "array"
+          }
+        },
+        "required": [
+          "results"
+        ]
+      }
+    },
+    {
+      "id": "search-stock-videos",
+      "name": "Buscar vídeos stock",
+      "description": "Pesquisa vídeos nas fontes disponíveis nesta conexão e devolve candidatos estruturados para validação.",
+      "operator": "Código",
+      "blockTypes": [
+        "BUSCAR"
+      ],
+      "processTypes": [
+        "assets",
+        "editing"
+      ],
+      "inputPorts": [
+        {
+          "key": "query",
+          "label": "Termos de busca",
+          "required": true,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        }
+      ],
+      "outputPorts": [
+        {
+          "key": "results",
+          "label": "Vídeos encontrados",
+          "required": true,
+          "presentation": {
+            "renderer": "cards"
+          },
+          "shape": {
+            "kind": "record",
+            "cardinality": "many",
+            "fields": []
+          }
+        },
+        {
+          "key": "warnings",
+          "label": "Avisos dos provedores",
+          "required": false,
+          "presentation": {
+            "renderer": "list"
+          },
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "many",
+            "representation": "inline"
+          }
+        }
+      ],
+      "execution": {
+        "mode": "immediate",
+        "defaultTimeoutMs": 180000,
+        "supportsCancellation": true,
+        "maxConcurrency": 3
+      },
+      "sideEffects": [
+        "external_read"
+      ],
+      "cost": {
+        "model": "free",
+        "estimateSupported": false
+      },
+      "dataPolicy": {
+        "sendsDataToThirdParties": true,
+        "providers": [
+          "Pexels",
+          "Pixabay",
+          "Coverr",
+          "Wikimedia Commons",
+          "NASA"
+        ]
+      },
+      "configurationOptions": [
+        {
+          "property": "provider",
+          "providerId": "available-stock-providers",
+          "cacheTtlMs": 0
+        }
+      ],
+      "blockConfigSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "provider": {
+            "type": "string",
+            "default": "all",
+            "title": "Fonte",
+            "description": "Pexels, Pixabay e Coverr exigem chave. Wikimedia Commons e NASA funcionam sem chave."
+          },
+          "resultsPerProvider": {
+            "type": "integer",
+            "title": "Quantidade desejada",
+            "minimum": 1,
+            "maximum": 500,
+            "default": 20
+          },
+          "resultLimitMode": {
+            "type": "string",
+            "enum": [
+              "provider_max",
+              "custom"
+            ],
+            "visibleWhen": {
+              "property": "provider",
+              "values": [
+                "__legacy_pagination__"
+              ]
+            }
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "visibleWhen": {
+              "property": "provider",
+              "values": [
+                "__legacy_pagination__"
+              ]
+            }
+          },
+          "orientation": {
+            "type": "string",
+            "title": "Orientação",
+            "default": "any",
+            "oneOf": [
+              {
+                "const": "any",
+                "title": "Qualquer"
+              },
+              {
+                "const": "landscape",
+                "title": "Paisagem"
+              },
+              {
+                "const": "portrait",
+                "title": "Retrato"
+              }
+            ]
+          },
+          "safeSearch": {
+            "type": "boolean",
+            "title": "Busca segura",
+            "default": true
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "results": {
+            "type": "array"
+          },
+          "warnings": {
+            "type": "array"
+          }
+        },
+        "required": [
+          "results"
+        ]
+      }
+    },
+    {
+      "id": "search-stock-by-briefs",
+      "operator": "Código",
+      "instructionUsage": "not_applicable",
+      "blockTypes": [
+        "BUSCAR"
+      ],
+      "processTypes": [
+        "assets",
+        "editing"
+      ],
+      "inputPorts": [
+        {
+          "key": "asset_briefs",
+          "label": "Briefings visuais por trecho",
+          "description": "Records gerados a partir da transcrição. Cada item deve conter brief_id, tempos, primary_query e, opcionalmente, fallbacks, preferência de mídia, orientação e termos negativos.",
+          "required": true,
+          "presentation": {
+            "renderer": "table"
+          },
+          "shape": {
+            "kind": "record",
+            "cardinality": "many",
+            "fields": []
+          }
+        }
+      ],
+      "outputPorts": [
+        {
+          "key": "selected_assets",
+          "label": "Asset selecionado por trecho",
+          "description": "Um candidato ranqueado ou um resultado vazio válido por briefing, sempre com brief_id, timestamps e diagnóstico seguro.",
+          "required": true,
+          "presentation": {
+            "renderer": "cards"
+          },
+          "shape": {
+            "kind": "record",
+            "cardinality": "many",
+            "fields": []
+          }
+        }
+      ],
+      "execution": {
+        "mode": "immediate",
+        "defaultTimeoutMs": 600000,
+        "supportsCancellation": true,
+        "maxConcurrency": 1,
+        "itemOrchestration": {
+          "inputPort": "asset_briefs",
+          "outputPort": "selected_assets",
+          "mode": "sequential"
+        }
+      },
+      "sideEffects": [
+        "external_read"
+      ],
+      "cost": {
+        "model": "free",
+        "estimateSupported": false
+      },
+      "dataPolicy": {
+        "sendsDataToThirdParties": true,
+        "providers": [
+          "Pexels",
+          "Pixabay",
+          "Unsplash",
+          "Coverr",
+          "Openverse",
+          "Wikimedia Commons",
+          "NASA"
+        ]
+      },
+      "blockConfigSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "providerStrategy": {
+            "type": "string",
+            "default": "balanced_fallback",
+            "enum": [
+              "balanced_fallback",
+              "priority_fallback",
+              "all"
+            ],
+            "description": "balanced_fallback distribui os trechos entre provedores para preservar cotas; priority_fallback mantém uma ordem fixa; all consulta todos os compatíveis."
+          },
+          "provider": {
+            "type": "string",
+            "default": "all",
+            "enum": [
+              "all",
+              "pexels",
+              "pixabay",
+              "unsplash",
+              "coverr",
+              "openverse",
+              "wikimedia",
+              "nasa"
+            ]
+          },
+          "minimumCandidatesPerBrief": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 30,
+            "default": 4
+          },
+          "maximumCandidatesPerBrief": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50,
+            "default": 12
+          },
+          "maximumFallbackQueries": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2,
+            "default": 2
+          },
+          "mediaPolicy": {
+            "type": "string",
+            "default": "follow_brief",
+            "enum": [
+              "follow_brief",
+              "images_only",
+              "videos_only",
+              "mixed"
+            ]
+          },
+          "minimumImageWidth": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000,
+            "default": 1280
+          },
+          "minimumVideoWidth": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000,
+            "default": 1280
+          },
+          "minimumVideoDuration": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3600,
+            "default": 3
+          },
+          "maximumVideoDuration": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 7200,
+            "default": 0,
+            "description": "Zero desativa o limite máximo de duração."
+          },
+          "minimumQualityScore": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "default": 65,
+            "description": "Piso para relevância da consulta, orientação, resolução, usabilidade e proveniência."
+          },
+          "strictOrientation": {
+            "type": "boolean",
+            "default": true,
+            "description": "Rejeita candidatos com dimensões conhecidas incompatíveis com a orientação do briefing."
+          },
+          "licenseProfile": {
+            "type": "string",
+            "default": "commercial_safe",
+            "enum": [
+              "commercial_safe",
+              "all_declared"
+            ],
+            "description": "commercial_safe remove licenças explicitamente não comerciais ou sem derivados; a validação jurídica final continua humana."
+          },
+          "safeSearch": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "selected_assets": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1
+          }
+        },
+        "required": [
+          "selected_assets"
+        ]
+      }
+    },
+    {
+      "id": "download-selected-stock-assets",
+      "operator": "Código",
+      "instructionUsage": "not_applicable",
+      "blockTypes": [
+        "CRIAR"
+      ],
+      "processTypes": [
+        "assets",
+        "editing"
+      ],
+      "inputPorts": [
+        {
+          "key": "selected_assets",
+          "label": "Assets selecionados por trecho",
+          "description": "Records produzidos pela busca automática por briefings. Somente estes vencedores serão baixados.",
+          "required": true,
+          "presentation": {
+            "renderer": "cards"
+          },
+          "shape": {
+            "kind": "record",
+            "cardinality": "many",
+            "fields": []
+          }
+        }
+      ],
+      "outputPorts": [
+        {
+          "key": "assets",
+          "label": "Arquivos por trecho",
+          "description": "Um arquivo local por briefing, preservando brief_id, timestamps, provedor, atribuição e licença.",
+          "required": true,
+          "presentation": {
+            "renderer": "cards"
+          },
+          "shape": {
+            "kind": "record",
+            "cardinality": "many",
+            "fields": []
+          }
+        }
+      ],
+      "execution": {
+        "mode": "immediate",
+        "defaultTimeoutMs": 1800000,
+        "supportsCancellation": true,
+        "maxConcurrency": 1,
+        "itemOrchestration": {
+          "inputPort": "selected_assets",
+          "outputPort": "assets",
+          "mode": "sequential"
+        }
+      },
+      "sideEffects": [
+        "external_read",
+        "external_write",
+        "local_artifact"
+      ],
+      "cost": {
+        "model": "free",
+        "estimateSupported": false
+      },
+      "dataPolicy": {
+        "sendsDataToThirdParties": true,
+        "providers": [
+          "Pexels",
+          "Pixabay",
+          "Unsplash",
+          "Coverr",
+          "Openverse",
+          "Wikimedia Commons",
+          "NASA"
+        ]
+      },
+      "blockConfigSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "assets": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1
+          }
+        },
+        "required": [
+          "assets"
+        ]
+      }
+    },
+    {
+      "id": "download-stock-image",
+      "operator": "Código",
+      "blockTypes": [
+        "CRIAR"
+      ],
+      "processTypes": [
+        "thumbnail",
+        "assets",
+        "editing"
+      ],
+      "inputPorts": [
+        {
+          "key": "asset",
+          "label": "Imagem stock escolhida",
+          "required": true,
+          "shape": {
+            "kind": "record",
+            "cardinality": "one",
+            "fields": []
+          }
+        }
+      ],
+      "outputPorts": [
+        {
+          "key": "image",
+          "label": "Imagem baixada",
+          "required": true,
+          "presentation": {
+            "renderer": "image-gallery"
+          },
+          "shape": {
+            "kind": "content",
+            "family": "image",
+            "cardinality": "one",
+            "representation": "artifact",
+            "formats": {
+              "mimeTypes": [
+                "image/*"
+              ]
+            }
+          }
+        },
+        {
+          "key": "provenance",
+          "label": "Proveniência e atribuição",
+          "required": true,
+          "presentation": {
+            "renderer": "table"
+          },
+          "shape": {
+            "kind": "record",
+            "cardinality": "one",
+            "fields": []
+          }
+        }
+      ],
+      "execution": {
+        "mode": "immediate",
+        "defaultTimeoutMs": 600000,
+        "supportsCancellation": true,
+        "maxConcurrency": 2
+      },
+      "sideEffects": [
+        "external_read",
+        "external_write",
+        "local_artifact"
+      ],
+      "cost": {
+        "model": "free",
+        "estimateSupported": false
+      },
+      "dataPolicy": {
+        "sendsDataToThirdParties": true,
+        "providers": [
+          "Pexels",
+          "Pixabay",
+          "Unsplash",
+          "Openverse",
+          "Wikimedia Commons",
+          "NASA"
+        ]
+      },
+      "blockConfigSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "image": {
+            "type": "object"
+          },
+          "provenance": {
+            "type": "array"
+          }
+        },
+        "required": [
+          "image",
+          "provenance"
+        ]
+      }
+    },
+    {
+      "id": "download-stock-video",
+      "operator": "Código",
+      "blockTypes": [
+        "CRIAR"
+      ],
+      "processTypes": [
+        "assets",
+        "editing"
+      ],
+      "inputPorts": [
+        {
+          "key": "asset",
+          "label": "Vídeo stock escolhido",
+          "required": true,
+          "shape": {
+            "kind": "record",
+            "cardinality": "one",
+            "fields": []
+          }
+        }
+      ],
+      "outputPorts": [
+        {
+          "key": "video",
+          "label": "Vídeo baixado",
+          "required": true,
+          "presentation": {
+            "renderer": "video-player"
+          },
+          "shape": {
+            "kind": "content",
+            "family": "video",
+            "cardinality": "one",
+            "representation": "artifact",
+            "formats": {
+              "mimeTypes": [
+                "video/*"
+              ]
+            }
+          }
+        },
+        {
+          "key": "provenance",
+          "label": "Proveniência e atribuição",
+          "required": true,
+          "presentation": {
+            "renderer": "table"
+          },
+          "shape": {
+            "kind": "record",
+            "cardinality": "one",
+            "fields": []
+          }
+        }
+      ],
+      "execution": {
+        "mode": "immediate",
+        "defaultTimeoutMs": 1800000,
+        "supportsCancellation": true,
+        "maxConcurrency": 1
+      },
+      "sideEffects": [
+        "external_read",
+        "external_write",
+        "local_artifact"
+      ],
+      "cost": {
+        "model": "free",
+        "estimateSupported": false
+      },
+      "dataPolicy": {
+        "sendsDataToThirdParties": true,
+        "providers": [
+          "Pexels",
+          "Pixabay",
+          "Coverr",
+          "Wikimedia Commons",
+          "NASA"
+        ]
+      },
+      "blockConfigSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "video": {
+            "type": "object"
+          },
+          "provenance": {
+            "type": "array"
+          }
+        },
+        "required": [
+          "video",
+          "provenance"
+        ]
+      }
+    }
+  ],
+  "localizations": {
+    "en": {
+      "capabilities": {
+        "search-stock-images": {
+          "name": "Search stock images",
+          "description": "Searches the sources available for this connection and returns structured image candidates for validation.",
+          "inputPorts": {
+            "query": {
+              "label": "Search terms"
+            }
+          },
+          "outputPorts": {
+            "results": {
+              "label": "Images found"
+            },
+            "warnings": {
+              "label": "Provider warnings"
+            }
+          },
+          "blockConfigSchema": {
+            "properties": {
+              "provider": {
+                "title": "Source",
+                "description": "Pexels, Pixabay, and Unsplash require an API key. Openverse, Wikimedia Commons, and NASA work without a key."
+              },
+              "resultsPerProvider": {
+                "title": "Desired quantity"
+              },
+              "orientation": {
+                "title": "Orientation",
+                "options": [
+                  {
+                    "value": "any",
+                    "label": "Any"
+                  },
+                  {
+                    "value": "landscape",
+                    "label": "Landscape"
+                  },
+                  {
+                    "value": "portrait",
+                    "label": "Portrait"
+                  },
+                  {
+                    "value": "square",
+                    "label": "Square"
+                  }
+                ]
+              },
+              "safeSearch": {
+                "title": "Safe search"
+              }
+            }
+          }
+        },
+        "search-stock-videos": {
+          "name": "Search stock videos",
+          "description": "Searches the sources available for this connection and returns structured video candidates for validation.",
+          "inputPorts": {
+            "query": {
+              "label": "Search terms"
+            }
+          },
+          "outputPorts": {
+            "results": {
+              "label": "Videos found"
+            },
+            "warnings": {
+              "label": "Provider warnings"
+            }
+          },
+          "blockConfigSchema": {
+            "properties": {
+              "provider": {
+                "title": "Source",
+                "description": "Pexels, Pixabay, and Coverr require an API key. Wikimedia Commons and NASA work without a key."
+              },
+              "resultsPerProvider": {
+                "title": "Desired quantity"
+              },
+              "orientation": {
+                "title": "Orientation",
+                "options": [
+                  {
+                    "value": "any",
+                    "label": "Any"
+                  },
+                  {
+                    "value": "landscape",
+                    "label": "Landscape"
+                  },
+                  {
+                    "value": "portrait",
+                    "label": "Portrait"
+                  }
+                ]
+              },
+              "safeSearch": {
+                "title": "Safe search"
+              }
+            }
+          }
+        },
+        "search-stock-by-briefs": {
+          "inputPorts": {
+            "asset_briefs": {
+              "label": "Visual briefs by segment",
+              "description": "Records generated from the transcript. Each item must contain brief_id, timestamps, and primary_query; fallbacks, media preference, orientation, and negative terms are optional."
+            }
+          },
+          "outputPorts": {
+            "selected_assets": {
+              "label": "Selected asset by segment",
+              "description": "One ranked candidate or a valid empty result per brief, always including brief_id, timestamps, and a safe diagnostic."
+            }
+          }
+        }
+      }
+    },
+    "es": {
+      "capabilities": {
+        "search-stock-images": {
+          "name": "Buscar imágenes de stock",
+          "description": "Busca en las fuentes disponibles para esta conexión y devuelve candidatos de imagen estructurados para validación.",
+          "inputPorts": {
+            "query": {
+              "label": "Términos de búsqueda"
+            }
+          },
+          "outputPorts": {
+            "results": {
+              "label": "Imágenes encontradas"
+            },
+            "warnings": {
+              "label": "Avisos de los proveedores"
+            }
+          },
+          "blockConfigSchema": {
+            "properties": {
+              "provider": {
+                "title": "Fuente",
+                "description": "Pexels, Pixabay y Unsplash requieren una clave de API. Openverse, Wikimedia Commons y NASA funcionan sin clave."
+              },
+              "resultsPerProvider": {
+                "title": "Cantidad deseada"
+              },
+              "orientation": {
+                "title": "Orientación",
+                "options": [
+                  {
+                    "value": "any",
+                    "label": "Cualquiera"
+                  },
+                  {
+                    "value": "landscape",
+                    "label": "Horizontal"
+                  },
+                  {
+                    "value": "portrait",
+                    "label": "Vertical"
+                  },
+                  {
+                    "value": "square",
+                    "label": "Cuadrada"
+                  }
+                ]
+              },
+              "safeSearch": {
+                "title": "Búsqueda segura"
+              }
+            }
+          }
+        },
+        "search-stock-videos": {
+          "name": "Buscar videos de stock",
+          "description": "Busca en las fuentes disponibles para esta conexión y devuelve candidatos de video estructurados para validación.",
+          "inputPorts": {
+            "query": {
+              "label": "Términos de búsqueda"
+            }
+          },
+          "outputPorts": {
+            "results": {
+              "label": "Videos encontrados"
+            },
+            "warnings": {
+              "label": "Avisos de los proveedores"
+            }
+          },
+          "blockConfigSchema": {
+            "properties": {
+              "provider": {
+                "title": "Fuente",
+                "description": "Pexels, Pixabay y Coverr requieren una clave de API. Wikimedia Commons y NASA funcionan sin clave."
+              },
+              "resultsPerProvider": {
+                "title": "Cantidad deseada"
+              },
+              "orientation": {
+                "title": "Orientación",
+                "options": [
+                  {
+                    "value": "any",
+                    "label": "Cualquiera"
+                  },
+                  {
+                    "value": "landscape",
+                    "label": "Horizontal"
+                  },
+                  {
+                    "value": "portrait",
+                    "label": "Vertical"
+                  }
+                ]
+              },
+              "safeSearch": {
+                "title": "Búsqueda segura"
+              }
+            }
+          }
+        },
+        "search-stock-by-briefs": {
+          "inputPorts": {
+            "asset_briefs": {
+              "label": "Briefings visuales por segmento",
+              "description": "Registros generados a partir de la transcripción. Cada elemento debe contener brief_id, tiempos y primary_query; los fallbacks, la preferencia de medios, la orientación y los términos negativos son opcionales."
+            }
+          },
+          "outputPorts": {
+            "selected_assets": {
+              "label": "Asset seleccionado por segmento",
+              "description": "Un candidato clasificado o un resultado vacío válido por briefing, siempre con brief_id, tiempos y un diagnóstico seguro."
+            }
+          }
+        }
+      }
+    }
+  },
+  "repository": "https://github.com/andremjr/plugins-contentflow"
+}

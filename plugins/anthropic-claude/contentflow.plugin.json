@@ -1,0 +1,153 @@
+{
+  "$schema": "https://raw.githubusercontent.com/andremjr/contentflow/main/docs/ecosystem/schemas/contentflow-plugin-v2.schema.json",
+  "apiVersion": "2",
+  "id": "official-anthropic-claude",
+  "name": "Anthropic Claude",
+  "version": "2.0.1",
+  "description": "Executa ações baseadas em linguagem com modelos Claude disponíveis na API da Anthropic.",
+  "author": "ContentFlow",
+  "license": "MIT",
+  "branding": {
+    "iconPath": "assets/icon.png"
+  },
+  "homepage": "https://github.com/andremjr/contentflow",
+  "repository": "https://github.com/andremjr/plugins-contentflow",
+  "runtime": {
+    "kind": "node",
+    "version": ">=22",
+    "module": "esm"
+  },
+  "minCoreVersion": "1.3.3",
+  "entrypoint": "handler.ts",
+  "permissions": [
+    "network"
+  ],
+  "networkHosts": [
+    "api.anthropic.com"
+  ],
+  "secretKeys": [
+    "ANTHROPIC_API_KEY"
+  ],
+  "capabilities": [
+    {
+      "id": "generate-or-validate-text",
+      "operator": "IA",
+      "instructionUsage": "optional",
+      "promptPreview": {
+        "template": "INSTRUÇÕES DO PROVEDOR:\n{{CONFIG:system_prompt}}\n\nMENSAGEM ENVIADA:\nCanal: {{CHANNEL_NAME}}\nNicho: {{NICHE}}\nProjeto: {{PROJECT_TITLE}}\nProcesso: {{PROCESS}}\nAção: {{BLOCK_NAME}}\nTipo de ação: {{BLOCK_TYPE}}\n\nInstruções da ação:\n{{BLOCK_INSTRUCTIONS}}\n\nEntradas resolvidas:\n{{ALL_INPUTS}}\n\n{{OUTPUT_CONTRACT}}"
+      },
+      "blockTypes": [
+        "BUSCAR",
+        "ESCOLHER",
+        "CRIAR",
+        "VALIDAR"
+      ],
+      "processTypes": [
+        "theme",
+        "title",
+        "thumbnail",
+        "script",
+        "narration",
+        "assets",
+        "editing",
+        "publishing"
+      ],
+      "inputPorts": [
+        {
+          "key": "context",
+          "label": "Contexto",
+          "required": false,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        }
+      ],
+      "outputPorts": [
+        {
+          "key": "result",
+          "label": "Resultado",
+          "required": true,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        }
+      ],
+      "execution": {
+        "mode": "immediate",
+        "defaultTimeoutMs": 120000,
+        "supportsCancellation": false,
+        "maxConcurrency": 1
+      },
+      "sideEffects": [
+        "external_read",
+        "external_write"
+      ],
+      "cost": {
+        "model": "metered",
+        "estimateSupported": false
+      },
+      "dataPolicy": {
+        "sendsDataToThirdParties": true,
+        "providers": [
+          "Anthropic"
+        ],
+        "retentionPolicyUrl": "https://privacy.anthropic.com/en/articles/7996866-how-long-do-you-store-my-organization-s-data",
+        "trainingPolicyUrl": "https://privacy.anthropic.com/en/articles/7996868-is-my-data-used-for-model-training"
+      },
+      "blockConfigSchema": {
+        "type": "object",
+        "properties": {
+          "model": {
+            "type": "string",
+            "title": "Modelo Claude",
+            "description": "A disponibilidade depende da sua conta Anthropic.",
+            "default": "claude-sonnet-4-6",
+            "oneOf": [
+              {
+                "const": "claude-opus-4-6",
+                "title": "Claude Opus 4.6"
+              },
+              {
+                "const": "claude-sonnet-4-6",
+                "title": "Claude Sonnet 4.6"
+              },
+              {
+                "const": "claude-haiku-4-5",
+                "title": "Claude Haiku 4.5"
+              }
+            ]
+          },
+          "system_prompt": {
+            "type": "string",
+            "title": "Prompt de sistema",
+            "format": "textarea",
+            "default": "Execute as instruções do bloco usando o contexto disponível e respeite exatamente o contrato de saída."
+          },
+          "temperature": {
+            "type": "number",
+            "title": "Temperatura",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.7
+          },
+          "max_tokens": {
+            "type": "number",
+            "title": "Máximo de tokens de saída",
+            "minimum": 1,
+            "maximum": 64000,
+            "default": 4096
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object"
+      }
+    }
+  ]
+}

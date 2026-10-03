@@ -1,0 +1,82 @@
+{
+  "executionId": "fixture-assemblyai-srt",
+  "traceId": "fixture-trace",
+  "blockId": "fixture-block",
+  "capabilityId": "transcribe-to-srt",
+  "attempt": 1,
+  "invocation": {
+    "mode": "start"
+  },
+  "configuration": {
+    "region": "us",
+    "segmentationMode": "sentence",
+    "maxWordsPerCue": 12,
+    "maxSecondsPerCue": 6,
+    "targetCueCount": 200
+  },
+  "settings": {},
+  "inputs": {
+    "audio_files": {
+      "id": "fixture-audio",
+      "name": "audio.mp3",
+      "mimeType": "audio/mpeg",
+      "size": 16,
+      "url": "stored://fixture-audio"
+    }
+  },
+  "inputContract": [
+    {
+      "id": "fixture-input",
+      "portKey": "audio_files",
+      "label": "Áudios",
+      "shape": {
+        "kind": "content",
+        "family": "audio",
+        "cardinality": "many",
+        "representation": "artifact"
+      }
+    }
+  ],
+  "outputContract": [
+    {
+      "portKey": "subtitles",
+      "label": "Legendas SRT",
+      "key": "subtitles",
+      "required": true,
+      "shape": {
+        "kind": "content",
+        "family": "text",
+        "cardinality": "many",
+        "representation": "artifact",
+        "formats": {
+          "mimeTypes": [
+            "application/x-subrip",
+            "text/plain"
+          ]
+        }
+      }
+    }
+  ],
+  "context": {
+    "locale": "pt-BR",
+    "timeZone": "America/Sao_Paulo",
+    "channel": {
+      "id": "fixture-channel",
+      "name": "Canal fictício",
+      "language": "pt-BR",
+      "niche": "Testes"
+    },
+    "project": {
+      "id": "fixture-project",
+      "title": "Projeto fictício"
+    },
+    "processType": "narration",
+    "block": {
+      "type": "CRIAR",
+      "name": "Gerar legendas",
+      "instructions": "Transcreva a mídia."
+    },
+    "previousProcessOutputs": [],
+    "previousBlockOutputs": []
+  }
+}

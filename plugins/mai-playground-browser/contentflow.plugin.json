@@ -1,0 +1,445 @@
+{
+  "$schema": "https://raw.githubusercontent.com/andremjr/contentflow/main/docs/ecosystem/schemas/contentflow-plugin-v2.schema.json",
+  "apiVersion": "2",
+  "id": "local.contentflow.mai-playground-browser",
+  "name": "MAI Playground Browser",
+  "version": "2.0.1",
+  "description": "Gera narração em áudio (TTS) com MAI-Voice-2 e texto no Microsoft AI Playground usando um perfil Chrome dedicado.",
+  "author": "André Marinho Jr.",
+  "license": "MIT",
+  "branding": {
+    "iconPath": "assets/icon.png"
+  },
+  "runtime": {
+    "kind": "node",
+    "version": ">=26 <27",
+    "module": "esm"
+  },
+  "minCoreVersion": "1.3.3",
+  "entrypoint": "handler.mjs",
+  "browserRuntime": {
+    "lifecycle": "core"
+  },
+  "permissions": [
+    "network",
+    "filesystem:read",
+    "filesystem:write",
+    "process"
+  ],
+  "networkHosts": [
+    "playground.microsoft.ai",
+    "msi-playground-pme-app.azurewebsites.net",
+    "falcon-caas.mai.microsoft.com",
+    "microsoft.com",
+    "azure.com"
+  ],
+  "profileSetup": {
+    "configurationKey": "accountProfile",
+    "fallbackConfigurationKey": "fallbackAccountProfiles",
+    "label": "Salvar perfil",
+    "description": "Abre o Microsoft AI Playground para login e fecha o Chrome após validar a interface."
+  },
+  "settingsSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "chromeExecutable": {
+        "type": "string",
+        "default": ""
+      },
+      "profilesBasePath": {
+        "type": "string",
+        "default": "",
+        "description": "Pasta-base opcional. Vazio usa o workspace autorizado do plugin."
+      },
+      "allowExistingChromeProfile": {
+        "type": "boolean",
+        "default": false,
+        "description": "Permite usar uma pasta de perfil Chrome existente escolhida explicitamente. Feche outras instâncias que estejam usando o mesmo perfil."
+      },
+      "remoteDebuggingPort": {
+        "type": "integer",
+        "minimum": 1024,
+        "maximum": 64000,
+        "default": 9944
+      },
+      "keepBrowserOpen": {
+        "type": "boolean",
+        "default": false
+      },
+      "startMinimized": {
+        "type": "boolean",
+        "default": true
+      },
+      "interactiveWaitSeconds": {
+        "type": "integer",
+        "minimum": 30,
+        "maximum": 900,
+        "default": 600
+      },
+      "responseTimeoutSeconds": {
+        "type": "integer",
+        "minimum": 30,
+        "maximum": 3600,
+        "default": 600
+      },
+      "diagnosticTrace": {
+        "type": "boolean",
+        "default": false
+      },
+      "diagnosticMockResponse": {
+        "type": "string",
+        "default": "",
+        "description": "Somente para testes automatizados; não abre navegador."
+      }
+    }
+  },
+  "capabilities": [
+    {
+      "id": "generate-voice-in-browser",
+      "operator": "IA",
+      "promptPreview": {
+        "template": "{{INPUT:text}}"
+      },
+      "blockTypes": [
+        "CRIAR"
+      ],
+      "processTypes": [
+        "narration"
+      ],
+      "inputPorts": [
+        {
+          "key": "text",
+          "label": "Texto da narração",
+          "required": true,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        }
+      ],
+      "outputPorts": [
+        {
+          "key": "audio",
+          "label": "Áudio narrado",
+          "required": true,
+          "presentation": {
+            "renderer": "audio-player"
+          },
+          "shape": {
+            "kind": "content",
+            "family": "audio",
+            "cardinality": "one",
+            "representation": "artifact"
+          }
+        },
+        {
+          "key": "transcript",
+          "label": "Texto falado",
+          "required": false,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        }
+      ],
+      "execution": {
+        "mode": "immediate",
+        "defaultTimeoutMs": 600000,
+        "supportsCancellation": true,
+        "maxConcurrency": 1
+      },
+      "sideEffects": [
+        "external_write",
+        "subprocess"
+      ],
+      "cost": {
+        "model": "free",
+        "estimateSupported": false
+      },
+      "dataPolicy": {
+        "sendsDataToThirdParties": true,
+        "providers": [
+          "Microsoft AI Playground (Voice)"
+        ]
+      },
+      "blockConfigSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "model": {
+            "type": "string",
+            "title": "Modelo de voz",
+            "enum": [
+              "mai-voice-2",
+              "mai-voice-2-flash"
+            ],
+            "default": "mai-voice-2"
+          },
+          "voice": {
+            "type": "string",
+            "title": "Voz do Copilot",
+            "enum": [
+              "Klaus",
+              "Mia",
+              "Isla",
+              "Ethan",
+              "Harper",
+              "Olivia",
+              "Marta",
+              "Alejo",
+              "Valeria",
+              "Marc",
+              "Soleil",
+              "Arjun",
+              "Dhruv",
+              "Kavya",
+              "Priya",
+              "Bence",
+              "Levente",
+              "Lilla",
+              "Réka",
+              "Luca",
+              "Rosa",
+              "Haena",
+              "Junho",
+              "Sander",
+              "Caio",
+              "Luana",
+              "Pedro",
+              "Rafael",
+              "Rui",
+              "Andrei",
+              "Elena",
+              "Ioana",
+              "Radu",
+              "Lev",
+              "Masha",
+              "Krit",
+              "Nattapong",
+              "Aydın",
+              "Elif",
+              "Bo",
+              "Lan",
+              "Mei",
+              "Wei"
+            ],
+            "default": "Caio"
+          },
+          "style": {
+            "type": "string",
+            "title": "Estilo / Tom",
+            "enum": [
+              "Neutral",
+              "Angry",
+              "Confused",
+              "Determined",
+              "Embarrassed",
+              "Excited",
+              "Happy",
+              "Hopeful",
+              "Joyful",
+              "Regretful",
+              "Relieved",
+              "Sad",
+              "Shouting",
+              "Softvoice",
+              "Whispering"
+            ],
+            "default": "Neutral"
+          },
+          "accountProfile": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$",
+            "default": "default"
+          },
+          "fallbackAccountProfiles": {
+            "type": "string",
+            "title": "Perfis de fallback",
+            "format": "textarea",
+            "default": "",
+            "maxLength": 512,
+            "description": "Aliases adicionais, um por linha. O sistema avança automaticamente para o próximo perfil cadastrado em caso de erro."
+          },
+          "startMinimized": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "audio": {
+            "type": "object"
+          },
+          "transcript": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "audio"
+        ]
+      }
+    },
+    {
+      "id": "generate-text-in-browser",
+      "operator": "IA",
+      "instructionUsage": "required",
+      "promptPreview": {
+        "template": "{{BLOCK_INSTRUCTIONS}}\n\n{{CONTENT}}",
+        "templateConfigurationKey": "promptTemplate"
+      },
+      "blockTypes": [
+        "CRIAR"
+      ],
+      "processTypes": [
+        "theme",
+        "title",
+        "thumbnail",
+        "script",
+        "narration",
+        "assets",
+        "editing",
+        "publishing"
+      ],
+      "inputPorts": [
+        {
+          "key": "content",
+          "label": "Contexto para geração",
+          "required": false,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        },
+        {
+          "key": "attachments",
+          "label": "Referências anexas",
+          "required": false,
+          "shape": {
+            "kind": "content",
+            "family": "image",
+            "cardinality": "many",
+            "representation": "artifact"
+          }
+        }
+      ],
+      "outputPorts": [
+        {
+          "key": "result",
+          "label": "Texto gerado",
+          "required": true,
+          "presentation": {
+            "renderer": "text-long"
+          },
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "inline"
+          }
+        },
+        {
+          "key": "parts",
+          "label": "Partes individuais",
+          "required": false,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "many",
+            "representation": "inline"
+          }
+        }
+      ],
+      "execution": {
+        "mode": "immediate",
+        "defaultTimeoutMs": 600000,
+        "supportsCancellation": true,
+        "maxConcurrency": 1,
+        "itemOrchestration": {
+          "inputPort": "content",
+          "outputPort": "parts",
+          "combinedOutputPort": "result",
+          "separator": "\n\n",
+          "mode": "sequential"
+        }
+      },
+      "sideEffects": [
+        "external_write",
+        "subprocess"
+      ],
+      "cost": {
+        "model": "free",
+        "estimateSupported": false
+      },
+      "dataPolicy": {
+        "sendsDataToThirdParties": true,
+        "providers": [
+          "Microsoft AI Playground (Thinking)"
+        ]
+      },
+      "blockConfigSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "promptTemplate": {
+            "type": "string",
+            "title": "Prompt do bloco",
+            "format": "textarea",
+            "default": "{{BLOCK_INSTRUCTIONS}}\n\n{{CONTENT}}",
+            "maxLength": 50000
+          },
+          "model": {
+            "type": "string",
+            "title": "Modelo",
+            "default": "mai-thinking-1-latest"
+          },
+          "accountProfile": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$",
+            "default": "default"
+          },
+          "fallbackAccountProfiles": {
+            "type": "string",
+            "title": "Perfis de fallback",
+            "format": "textarea",
+            "default": "",
+            "maxLength": 512,
+            "description": "Aliases adicionais, um por linha. O sistema avança automaticamente para o próximo perfil cadastrado em caso de erro."
+          },
+          "startMinimized": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "result": {
+            "type": "string"
+          },
+          "parts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "result"
+        ]
+      }
+    }
+  ],
+  "repository": "https://github.com/andremjr/plugins-contentflow"
+}

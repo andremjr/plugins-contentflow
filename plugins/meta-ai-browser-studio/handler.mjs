@@ -1,0 +1,2102 @@
+import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { homedir, platform } from "node:os";
+import { basename, dirname, extname, join } from "node:path";
+import { attachContentFlowBridge } from "./browser-bridge-client.mjs";
+import { createBridgeDiagnostics } from "./bridge-diagnostics.mjs";
+
+const PLUGIN_ID = "local.contentflow.meta-ai-browser-studio";
+const CHATGPT_HOST = "www.meta.ai";
+const CHATGPT_NEW_URL = "https://www.meta.ai/create";
+const CHATGPT_CHAT_URL = "https://www.meta.ai/";
+const META_VIBES_URL = "https://www.meta.ai/vibes";
+const DEFAULT_PORT = 9844;
+const MAX_PARTS = 32;
+const MAX_PROMPT_CHARACTERS = 500_000;
+const MAX_ATTACHMENTS = 20;
+const MAX_ATTACHMENT_BYTES = 512 * 1024 * 1024;
+const IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
+const VIDEO_EXTENSIONS = new Set([".mp4", ".webm", ".mov", ".m4v"]);
+const PROFILE_SETUP_WAIT_MS = Number.POSITIVE_INFINITY;
+const META_RECEIPT_VERSION = 1;
+const DOCUMENT_EXTENSIONS = new Set([
+  ".pdf",
+  ".docx",
+  ".csv",
+  ".txt",
+  ".html",
+  ".htm",
+  ".odt",
+  ".rtf",
+  ".epub",
+  ".json",
+  ".xlsx",
+  ".pptx",
+]);
+const SUPPORTED_EXTENSIONS = new Set([...IMAGE_EXTENSIONS, ...VIDEO_EXTENSIONS]);
+
+function codedError(code, message, retryable = false) {
+  const error = new Error(message);
+  error.code = code;
+  error.retryable = retryable;
+  return error;
+}
+
+function resultError(code, message, retryable = false, retryAfterMs) {
+  const result = { status: "error", code, message, retryable };
+  if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) result.retryAfterMs = retryAfterMs;
+  return result;
+}
+
+function sleep(ms, signal) {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(codedError("CANCELLED", "Execução cancelada."));
+    const timer = setTimeout(done, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(codedError("CANCELLED", "Execução cancelada."));
+    };
+    function done() {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function clampInteger(value, fallback, minimum, maximum) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) ? Math.min(maximum, Math.max(minimum, parsed)) : fallback;
+}
+
+function serialize(value) {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value ?? "");
+  }
+}
+
+function serializeInputs(inputs) {
+  const entries = Object.entries(inputs ?? {}).filter(([key]) => key !== "attachments");
+  if (!entries.length) return "";
+  if (entries.length === 1 && entries[0][0] === "content") return serialize(entries[0][1]);
+  return entries.map(([key, value]) => `${key}:\n${serialize(value)}`).join("\n\n");
+}
+
+function promptContextInputs(request) {
+  return request?.instructionContextInputs ?? request?.inputs;
+}
+
+function replaceAllLiteral(text, token, value) {
+  return String(text)
+    .split(token)
+    .join(String(value ?? ""));
+}
+
+function expandTemplate(template, request) {
+  const context = request?.context ?? {};
+  const replacements = {
+    "{{CONTENT}}": serializeInputs(promptContextInputs(request)),
+    "{{CHANNEL_NAME}}": context?.channel?.name ?? "",
+    "{{NICHE}}": context?.channel?.niche ?? "",
+    "{{PROJECT_TITLE}}": context?.project?.title ?? "",
+    "{{PROCESS}}": context?.processType ?? "",
+    "{{BLOCK_INSTRUCTIONS}}":
+      request?.resolvedInstruction || context?.block?.instructions || context?.block?.name || "",
+    "{{TEMA}}": serializeInputs(promptContextInputs(request)),
+    "{{NICHO}}": context?.channel?.niche ?? "",
+  };
+  let output = String(template ?? "");
+  for (const [token, value] of Object.entries(replacements))
+    output = replaceAllLiteral(output, token, value);
+  for (const [key, value] of Object.entries(promptContextInputs(request) ?? {}))
+    output = replaceAllLiteral(output, `{{INPUT:${key}}}`, serialize(value));
+  return output.trim();
+}
+
+function ensureBlockInstruction(prompt, template, request) {
+  const instruction = String(
+    request?.resolvedInstruction ||
+      request?.context?.block?.instructions ||
+      request?.context?.block?.name ||
+      "",
+  ).trim();
+  const expanded = String(prompt ?? "").trim();
+  if (!instruction || String(template ?? "").includes("{{BLOCK_INSTRUCTIONS}}")) return expanded;
+  if (expanded.includes(instruction)) return expanded;
+  return `INSTRUÇÕES DO BLOCO:\n${instruction}\n\n${expanded}`.trim();
+}
+
+function ensureInputContext(prompt, template, request) {
+  const sourceTemplate = String(template ?? "");
+  if (sourceTemplate.includes("{{CONTENT}}") || sourceTemplate.includes("{{TEMA}}")) {
+    return String(prompt ?? "").trim();
+  }
+  const remainingInputs = Object.fromEntries(
+    Object.entries(promptContextInputs(request) ?? {}).filter(
+      ([key]) => !sourceTemplate.includes(`{{INPUT:${key}}}`),
+    ),
+  );
+  const context = serializeInputs(remainingInputs).trim();
+  const expanded = String(prompt ?? "").trim();
+  if (!context || expanded.includes(context)) return expanded;
+  return `${expanded}\n\nCONTEXTO DAS ENTRADAS:\n${context}`.trim();
+}
+
+function expandPrimaryTemplate(template, request) {
+  return ensureInputContext(
+    ensureBlockInstruction(expandTemplate(template, request), template, request),
+    template,
+    request,
+  );
+}
+
+function buildInstructionPrompt(request, additions = []) {
+  const instruction = String(request?.resolvedInstruction ?? "").trim();
+  if (!instruction)
+    throw codedError("INVALID_INPUT", "A instrução resolvida do bloco é obrigatória.");
+  const prompt = [expandPrimaryTemplate("", request), ...additions.map(String).filter(Boolean)]
+    .join("\n\n")
+    .trim();
+  if (prompt.length > MAX_PROMPT_CHARACTERS)
+    throw codedError("INVALID_INPUT", `O prompt ultrapassou ${MAX_PROMPT_CHARACTERS} caracteres.`);
+  return prompt;
+}
+
+function expandCapabilityTemplate(template, replacements, request) {
+  let output = String(template ?? "");
+  for (const [token, value] of Object.entries(replacements))
+    output = replaceAllLiteral(output, token, typeof value === "string" ? value : serialize(value));
+  return ensureBlockInstruction(expandTemplate(output, request), template, request);
+}
+
+function flattenRecords(value, output = []) {
+  if (Array.isArray(value)) for (const item of value) flattenRecords(item, output);
+  else if (value && typeof value === "object") output.push(value);
+  return output;
+}
+
+function summarizeBlock(index, block) {
+  const title = block?.titulo_bloco || block?.titulo || block?.nome || `Bloco ${index}`;
+  const objective = block?.objetivo || block?.objetivo_emocional || block?.descricao || "";
+  const points = block?.pontos_chave || block?.pontos || block?.conteudos_obrigatorios || [];
+  const pointText = Array.isArray(points)
+    ? points.map(String).filter(Boolean).join("; ")
+    : String(points || "");
+  return [
+    `Bloco ${index}: ${title}`,
+    objective && `Objetivo: ${objective}`,
+    pointText && `Pontos: ${pointText}`,
+  ]
+    .filter(Boolean)
+    .join(" | ");
+}
+
+function outlineItems(request) {
+  if (Array.isArray(request?.inputs?.outline) && request.inputs.outline.length)
+    return request.inputs.outline.slice(0, MAX_PARTS);
+  if (
+    Array.isArray(request?.inputs?.content) &&
+    request.inputs.content.some((item) => item && typeof item === "object")
+  ) {
+    return flattenRecords(request.inputs.content).slice(0, MAX_PARTS);
+  }
+  return [];
+}
+
+function expandOutlinePrompt(template, request, block, index, total, base) {
+  let output = expandTemplate(template, request);
+  for (const [token, value] of Object.entries({
+    "{{PROMPT_BASE}}": base,
+    "{{BLOCK_NUMBER}}": String(index + 1),
+    "{{BLOCK_TOTAL}}": String(total),
+    "{{BLOCK}}": summarizeBlock(index + 1, block),
+    "{{BLOCK_JSON}}": serialize(block),
+    "{{IS_FIRST}}": index === 0 ? "true" : "false",
+    "{{IS_LAST}}": index === total - 1 ? "true" : "false",
+  }))
+    output = replaceAllLiteral(output, token, value);
+  return output.trim();
+}
+
+function buildParts(request) {
+  return [
+    buildInstructionPrompt(request, [
+      "FORMATO OBRIGATÓRIO: entregue o conteúdo diretamente como texto, sem criar arquivos ou canvas.",
+    ]),
+  ];
+}
+
+function buildSearchPrompt(request, _deep = false) {
+  const prompt = buildInstructionPrompt(request);
+  if (!prompt) throw codedError("INVALID_INPUT", "A consulta ficou vazia.");
+  return prompt;
+}
+
+function buildChoosePrompt(request) {
+  const collection = request?.context?.selectedCollection;
+  if (!collection || !Array.isArray(collection.items) || !collection.items.length)
+    throw codedError("INVALID_INPUT", "O bloco Escolher precisa de uma coleção com itens.");
+  return buildInstructionPrompt(request, [
+    `ITENS DISPONÍVEIS:\n${serialize(collection.items)}`,
+    'Responda somente JSON válido: {"selectedItemId":"ID_EXATO_DO_ITEM"}.',
+  ]);
+}
+
+function validationMode(request) {
+  return ["approval", "select_one", "select_many"].includes(request?.validation?.mode)
+    ? request.validation.mode
+    : "approval";
+}
+
+function validationOutputInstruction(mode) {
+  if (mode === "select_one")
+    return 'Responda somente JSON válido: {"selectedIndex": NUMERO_1_BASED, "feedback":"justificativa curta"}.';
+  if (mode === "select_many")
+    return 'Responda somente JSON válido: {"selectedIndices":[NUMEROS_1_BASED], "feedback":"justificativa curta"}.';
+  return 'Responda somente JSON válido: {"decision":"approved" ou "rejected", "feedback":"justificativa objetiva"}.';
+}
+
+function buildValidationPrompt(request) {
+  const mode = validationMode(request);
+  return buildInstructionPrompt(request, [validationOutputInstruction(mode)]);
+}
+
+function buildAnalysisPrompt(request, _image) {
+  return buildInstructionPrompt(request);
+}
+
+function buildImagePrompt(request) {
+  const prompt = buildInstructionPrompt(request);
+  if (!prompt) throw codedError("INVALID_INPUT", "O prompt da imagem ficou vazio.");
+  const aspectRatio = ["16:9", "1:1", "9:16"].includes(request?.configuration?.aspectRatio)
+    ? request.configuration.aspectRatio
+    : "";
+  return aspectRatio ? `${prompt}\n\nPROPORÇÃO DA IMAGEM: ${aspectRatio}` : prompt;
+}
+
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .map((key) => [key, canonicalize(value[key])]),
+    );
+  }
+  return value;
+}
+
+function p53Message(request, key) {
+  const locale = String(request?.context?.locale || "pt-BR").toLowerCase();
+  const language = locale.startsWith("es") ? "es" : locale.startsWith("en") ? "en" : "pt-BR";
+  const messages = {
+    "pt-BR": {
+      mediaRefusal: "O Meta AI respondeu ao pedido sem produzir mídia.",
+      unsafeResume: "Há um envio anterior do Meta AI sem baseline suficiente para reenvio seguro.",
+    },
+    en: {
+      mediaRefusal: "Meta AI answered the request without producing media.",
+      unsafeResume:
+        "A previous Meta AI submission has no sufficient baseline for safe resubmission.",
+    },
+    es: {
+      mediaRefusal: "Meta AI respondió a la solicitud sin producir contenido multimedia.",
+      unsafeResume:
+        "Un envío anterior de Meta AI no tiene una referencia suficiente para reenviarlo de forma segura.",
+    },
+  };
+  return messages[language][key];
+}
+
+function receiptLogicalKey(request) {
+  return [
+    request?.executionId || "execution",
+    request?.blockId || "block",
+    request?.capabilityId || "capability",
+    request?.batch?.itemId || request?.batch?.index || "single",
+    request?.itemAction
+      ? `${request?.itemAction?.key || "item"}:${request?.itemAction?.variantKey || "variant"}:${request?.itemAction?.attempt || 1}`
+      : "start",
+  ].join(":");
+}
+
+function receiptInputFingerprint(request) {
+  return createHash("sha256")
+    .update(
+      JSON.stringify(
+        canonicalize({
+          capabilityId: request?.capabilityId,
+          inputs: request?.inputs ?? {},
+          configuration: {
+            accountProfile: request?.configuration?.accountProfile,
+            aspectRatio: request?.configuration?.aspectRatio,
+            videoVariants: request?.configuration?.videoVariants,
+          },
+        }),
+      ),
+    )
+    .digest("hex");
+}
+
+function receiptPartHasExternalEffect(part) {
+  return ["submitting", "submitted", "unknown", "completed"].includes(part?.state);
+}
+
+function validMetaPageUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return (
+      url.protocol === "https:" && (url.hostname === "meta.ai" || url.hostname === "www.meta.ai")
+    );
+  } catch {
+    return false;
+  }
+}
+
+function receiptWorkspacePath(request, services) {
+  const id = createHash("sha256").update(receiptLogicalKey(request)).digest("hex").slice(0, 32);
+  return services.getWorkspacePath(`generation-receipts/${id}.json`);
+}
+
+async function createReceiptController(request, services) {
+  const path = receiptWorkspacePath(request, services);
+  const logicalKey = receiptLogicalKey(request);
+  const inputFingerprint = receiptInputFingerprint(request);
+  let receipt;
+  try {
+    receipt = JSON.parse(await readFile(path, "utf8"));
+  } catch {}
+  if (
+    receipt?.version !== META_RECEIPT_VERSION ||
+    receipt?.logicalKey !== logicalKey ||
+    receipt?.inputFingerprint !== inputFingerprint
+  ) {
+    receipt = {
+      version: META_RECEIPT_VERSION,
+      logicalKey,
+      inputFingerprint,
+      capabilityId: request?.capabilityId,
+      parts: [],
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  const save = async () => {
+    receipt.updatedAt = new Date().toISOString();
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, `${JSON.stringify(receipt, null, 2)}\n`, "utf8");
+  };
+  const part = (index) => receipt.parts?.[index];
+  const update = async (index, patch) => {
+    receipt.parts ??= [];
+    receipt.parts[index] = { ...(receipt.parts[index] ?? { index }), index, ...patch };
+    await save();
+    return receipt.parts[index];
+  };
+  return {
+    part,
+    resumeUrl() {
+      const candidate = [...(receipt.parts ?? [])]
+        .reverse()
+        .find((item) => receiptPartHasExternalEffect(item) && validMetaPageUrl(item.pageUrl));
+      return candidate?.pageUrl;
+    },
+    async beforeSubmit(index, baseline, pageUrl) {
+      return await update(index, { state: "submitting", baseline, pageUrl, response: undefined });
+    },
+    async submitted(index, pageUrl) {
+      return await update(index, { state: "submitted", pageUrl });
+    },
+    async completed(index, response, pageUrl) {
+      return await update(index, { state: "completed", response, pageUrl, errorCode: undefined });
+    },
+    async failed(index, error, pageUrl) {
+      const previous = part(index);
+      if (!receiptPartHasExternalEffect(previous)) return;
+      const definitive =
+        ["RATE_LIMIT", "PERMISSION_DENIED"].includes(error?.code) ||
+        (error?.code === "OUTPUT_VALIDATION_FAILED" && error?.retryable === false);
+      await update(index, {
+        state: definitive ? "rejected" : "unknown",
+        pageUrl,
+        errorCode: error?.code || "UPSTREAM_UNAVAILABLE",
+      });
+    },
+  };
+}
+
+async function currentPageUrl(client, sessionId) {
+  return String((await evaluate(client, sessionId, "location.href")) || "");
+}
+
+function buildVideoPrompt(request) {
+  const prompt = buildInstructionPrompt(request);
+  if (!prompt) throw codedError("INVALID_INPUT", "O prompt do vídeo ficou vazio.");
+  return prompt;
+}
+
+function buildAnimationPrompt(request) {
+  const prompt = buildInstructionPrompt(request);
+  if (!prompt) throw codedError("INVALID_INPUT", "O prompt de movimento ficou vazio.");
+  return prompt;
+}
+
+function animationVariantCount(request) {
+  return request?.configuration?.videoVariants === 2 ? 2 : 1;
+}
+
+function stripCodeFence(text) {
+  return String(text ?? "")
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "");
+}
+function parseJsonObject(text) {
+  const stripped = stripCodeFence(text);
+  try {
+    const parsed = JSON.parse(stripped);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : undefined;
+  } catch {
+    const match = stripped.match(/\{[\s\S]*\}/);
+    if (!match) return undefined;
+    try {
+      return JSON.parse(match[0]);
+    } catch {
+      return undefined;
+    }
+  }
+}
+
+function parseSelectedItemId(text, request) {
+  const items = request?.context?.selectedCollection?.items ?? [];
+  const parsed = parseJsonObject(text);
+  const candidate = String(parsed?.selectedItemId ?? stripCodeFence(text))
+    .replace(/^["']|["']$/g, "")
+    .trim();
+  if (!items.some((item) => item.id === candidate))
+    throw codedError(
+      "OUTPUT_VALIDATION_FAILED",
+      "O ChatGPT não devolveu o ID exato de um item permitido.",
+      true,
+    );
+  return candidate;
+}
+
+function parseValidationValues(text, request) {
+  const mode = validationMode(request);
+  const parsed = parseJsonObject(text) ?? {};
+  const feedback = String(parsed.feedback ?? "").trim();
+  if (mode === "approval") {
+    const raw = String(parsed.decision ?? text).toLowerCase();
+    const decision = /reprov|reject/.test(raw)
+      ? "rejected"
+      : /aprov|approve/.test(raw)
+        ? "approved"
+        : undefined;
+    if (!decision)
+      throw codedError(
+        "OUTPUT_VALIDATION_FAILED",
+        "O ChatGPT não devolveu approved ou rejected.",
+        true,
+      );
+    return { decision, ...(feedback ? { feedback } : {}) };
+  }
+  const candidates = Array.isArray(request?.inputs?.content)
+    ? request.inputs.content
+    : [request?.inputs?.content].filter((value) => value != null);
+  if (!candidates.length) throw codedError("INVALID_INPUT", "Não há opções para validar.");
+  if (mode === "select_one") {
+    const index = Number(parsed.selectedIndex) - 1;
+    if (!Number.isInteger(index) || index < 0 || index >= candidates.length)
+      throw codedError("OUTPUT_VALIDATION_FAILED", "Índice de seleção inválido.", true);
+    return { selected_value: candidates[index], ...(feedback ? { feedback } : {}) };
+  }
+  const indices = Array.isArray(parsed.selectedIndices)
+    ? parsed.selectedIndices.map((value) => Number(value) - 1)
+    : [];
+  if (
+    !indices.length ||
+    indices.some((index) => !Number.isInteger(index) || index < 0 || index >= candidates.length)
+  )
+    throw codedError("OUTPUT_VALIDATION_FAILED", "Índices de seleção inválidos.", true);
+  return {
+    selected_values: [...new Set(indices)].map((index) => candidates[index]),
+    ...(feedback ? { feedback } : {}),
+  };
+}
+
+function textAsList(text) {
+  const lines = String(text ?? "")
+    .split("\n")
+    .map((line) => line.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, "").trim())
+    .filter(Boolean);
+  return lines.length > 1 ? lines : [String(text ?? "").trim()].filter(Boolean);
+}
+
+function searchResponseValues(text, sources, request) {
+  const fields = Array.isArray(request?.outputContract) ? request.outputContract : [];
+  const values = {};
+  for (const field of fields) {
+    const isSource = /source|fonte|url|link/i.test(`${field.key} ${field.label}`);
+    if (isSource)
+      values[field.portKey] =
+        field.type === "url" ? (sources[0] ?? "https://chatgpt.com") : sources;
+    else if (["list", "multiselect"].includes(field.type)) values[field.portKey] = textAsList(text);
+    else values[field.portKey] = text;
+  }
+  return values;
+}
+
+function generationResponseValues(result, responses, request) {
+  const values = {};
+  for (const field of request?.outputContract ?? []) {
+    values[field.portKey] =
+      field.key === "parts" ? responses.map((response) => response.text) : result;
+  }
+  return values;
+}
+
+function cleanGeneratedText(input) {
+  return String(input ?? "")
+    .replace(/```[\s\S]*?```/g, "")
+    .replace(/^#+\s+/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function isStoredFile(value) {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    typeof value.id === "string" &&
+    typeof value.url === "string",
+  );
+}
+function collectStoredFiles(value, output = []) {
+  if (isStoredFile(value)) output.push(value);
+  else if (Array.isArray(value)) for (const item of value) collectStoredFiles(item, output);
+  else if (value && typeof value === "object")
+    for (const item of Object.values(value)) collectStoredFiles(item, output);
+  return output;
+}
+
+function attachmentInput(request) {
+  if (request?.capabilityId === "analyze-images-in-browser") return request?.inputs?.images;
+  if (request?.capabilityId === "analyze-documents-in-browser") return request?.inputs?.documents;
+  if (request?.capabilityId === "validate-content-in-browser") return request?.inputs?.content;
+  if (request?.capabilityId === "generate-text-in-browser") return request?.inputs?.attachments;
+  if (request?.capabilityId === "deep-research-in-browser") return request?.inputs?.context;
+  if (request?.capabilityId === "animate-image-in-browser") return request?.inputs?.image;
+  if (request?.capabilityId === "generate-image-in-browser") return request?.inputs?.references;
+  if (request?.capabilityId === "generate-video-in-browser")
+    return [request?.inputs?.references, request?.inputs?.video_references];
+  return undefined;
+}
+
+async function resolveAttachments(request, services) {
+  const unique = [
+    ...new Map(
+      collectStoredFiles(attachmentInput(request)).map((file) => [file.id, file]),
+    ).values(),
+  ];
+  if (unique.length > MAX_ATTACHMENTS)
+    throw codedError("INVALID_INPUT", `Máximo de ${MAX_ATTACHMENTS} anexos por conversa.`);
+  if (
+    ["analyze-images-in-browser", "analyze-documents-in-browser"].includes(request?.capabilityId) &&
+    !unique.length
+  )
+    throw codedError("INVALID_INPUT", "Nenhum arquivo autorizado foi recebido.");
+  if (request?.capabilityId === "animate-image-in-browser" && unique.length !== 1)
+    throw codedError("INVALID_INPUT", "A animação exige exatamente uma imagem base.");
+  const resolved = [];
+  for (const file of unique) {
+    const path = await services.resolveInputFile(file);
+    const extension = extname(file.name || path).toLowerCase();
+    if (!SUPPORTED_EXTENSIONS.has(extension))
+      throw codedError("INVALID_INPUT", `Formato não suportado: ${extension || "sem extensão"}.`);
+    if (request?.capabilityId === "analyze-images-in-browser" && !IMAGE_EXTENSIONS.has(extension))
+      throw codedError("INVALID_INPUT", `A visão não aceita ${file.name}.`);
+    if (request?.capabilityId === "animate-image-in-browser" && !IMAGE_EXTENSIONS.has(extension))
+      throw codedError("INVALID_INPUT", `A animação exige uma imagem base: ${file.name}.`);
+    if (
+      request?.capabilityId === "analyze-documents-in-browser" &&
+      !DOCUMENT_EXTENSIONS.has(extension)
+    )
+      throw codedError("INVALID_INPUT", `Documento não suportado: ${file.name}.`);
+    const info = await stat(path);
+    if (!info.isFile() || info.size > MAX_ATTACHMENT_BYTES)
+      throw codedError("INVALID_INPUT", `Arquivo inválido ou acima de 512 MB: ${file.name}.`);
+    resolved.push({ path, name: file.name || basename(path), size: info.size });
+  }
+  return resolved;
+}
+
+function defaultProfilesBasePath() {
+  return join(homedir(), ".contentflow", "meta-ai-browser-profiles");
+}
+function normalizeAccountProfile(value) {
+  const name = String(value ?? "default").trim() || "default";
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$/.test(name))
+    throw codedError(
+      "INVALID_CONFIGURATION",
+      "Perfil Meta AI inválido; use letras, números, _ ou -.",
+    );
+  return name;
+}
+function profilePathFor(settings, name) {
+  return join(settings?.profilesBasePath?.trim?.() || defaultProfilesBasePath(), name);
+}
+function runtimeProfilePath(settings, name, services) {
+  if (settings?.profilesBasePath?.trim?.()) return profilePathFor(settings, name);
+  return services.getWorkspacePath(join("browser-profiles", name));
+}
+function profileMarkerPath(path) {
+  return join(path, ".contentflow-profile-ready.json");
+}
+async function profileIsPrepared(path, name) {
+  try {
+    const marker = JSON.parse(await readFile(profileMarkerPath(path), "utf8"));
+    return (
+      marker?.provider === CHATGPT_HOST && marker?.profile === name && marker?.bridgeProtocol === 2
+    );
+  } catch {
+    return false;
+  }
+}
+async function markProfilePrepared(path, name) {
+  await writeFile(
+    profileMarkerPath(path),
+    JSON.stringify({
+      provider: CHATGPT_HOST,
+      profile: name,
+      bridgeProtocol: 2,
+      preparedAt: new Date().toISOString(),
+    }),
+    "utf8",
+  );
+}
+function profilePort(basePort, name) {
+  if (name === "default") return basePort;
+  let hash = 2166136261;
+  for (const char of name) {
+    hash ^= char.codePointAt(0);
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  return basePort + (hash % Math.min(1200, 65535 - basePort));
+}
+function assertDedicatedProfilePath(path, allowExistingChromeProfile = false) {
+  if (allowExistingChromeProfile) return;
+  const normalized = String(path).replaceAll("\\", "/").toLowerCase().replace(/\/+$/, "");
+  if (
+    normalized.endsWith("/google/chrome/user data") ||
+    normalized.includes("/google/chrome/user data/default")
+  )
+    throw codedError("INVALID_CONFIGURATION", "Use um perfil Chrome dedicado ao plugin.");
+}
+
+function requireCoreBrowserSession(coreSession) {
+  if (
+    !coreSession ||
+    !Number.isInteger(coreSession.port) ||
+    typeof coreSession.webSocketDebuggerUrl !== "string" ||
+    !coreSession.webSocketDebuggerUrl
+  ) {
+    throw codedError(
+      "INVALID_CONFIGURATION",
+      "O ContentFlow não forneceu a sessão de navegador reservada para este perfil.",
+    );
+  }
+  return coreSession;
+}
+
+async function launchOrReuseChrome({ coreSession }) {
+  const session = requireCoreBrowserSession(coreSession);
+  return {
+    version: { webSocketDebuggerUrl: session.webSocketDebuggerUrl },
+    child: null,
+    reused: true,
+    startedByCore: true,
+    startedByPlugin: false,
+  };
+}
+
+async function closeBrowserGracefully(client) {
+  client?.close();
+}
+
+class CdpClient {
+  constructor(wsUrl, trace) {
+    this.wsUrl = wsUrl;
+    this.trace = trace;
+    this.ws = null;
+    this.nextId = 1;
+    this.pending = new Map();
+  }
+  async connect(signal) {
+    this.ws = new WebSocket(this.wsUrl);
+    await new Promise((resolve, reject) => {
+      const abort = () => reject(codedError("CANCELLED", "Execução cancelada."));
+      signal?.addEventListener("abort", abort, { once: true });
+      this.ws.addEventListener(
+        "open",
+        () => {
+          signal?.removeEventListener("abort", abort);
+          resolve();
+        },
+        { once: true },
+      );
+      this.ws.addEventListener(
+        "error",
+        () => reject(codedError("UPSTREAM_UNAVAILABLE", "Falha ao conectar ao Chrome.")),
+        { once: true },
+      );
+    });
+    this.ws.addEventListener("message", (event) => this.onMessage(event));
+    this.ws.addEventListener("close", () =>
+      this.rejectAll(codedError("UPSTREAM_UNAVAILABLE", "Chrome desconectado.")),
+    );
+    return this;
+  }
+  onMessage(event) {
+    let message;
+    try {
+      message = JSON.parse(String(event.data));
+    } catch {
+      return;
+    }
+    if (!message.id) return;
+    const pending = this.pending.get(message.id);
+    if (!pending) return;
+    this.pending.delete(message.id);
+    if (message.error)
+      pending.reject(
+        codedError("UPSTREAM_UNAVAILABLE", `CDP ${pending.method}: ${message.error.message}`),
+      );
+    else pending.resolve(message.result ?? {});
+  }
+  rejectAll(error) {
+    for (const pending of this.pending.values()) pending.reject(error);
+    this.pending.clear();
+  }
+  send(method, params = {}, sessionId) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN)
+      return Promise.reject(codedError("UPSTREAM_UNAVAILABLE", "CDP não conectado."));
+    const id = this.nextId++,
+      payload = { id, method, params };
+    if (sessionId) payload.sessionId = sessionId;
+    if (method === "Input.insertText")
+      this.trace?.(
+        `Input.insertText length=${String(params.text ?? "").length}; sha256=${createHash("sha256")
+          .update(String(params.text ?? ""))
+          .digest("hex")
+          .slice(0, 12)}`,
+      );
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject, method });
+      this.ws.send(JSON.stringify(payload));
+    });
+  }
+  close() {
+    try {
+      this.ws?.close();
+    } catch {}
+  }
+}
+
+async function evaluate(client, sessionId, expression) {
+  const response = await client.send(
+    "Runtime.evaluate",
+    { expression, returnByValue: true, awaitPromise: true, userGesture: true },
+    sessionId,
+  );
+  if (response.exceptionDetails)
+    throw codedError(
+      "OUTPUT_VALIDATION_FAILED",
+      response.exceptionDetails?.exception?.description || "Erro na página do ChatGPT.",
+    );
+  return response.result?.value;
+}
+
+function responsePhase({ hasNewResponse, generating, stablePolls }) {
+  if (!hasNewResponse) return "awaiting_response";
+  if (generating) return "streaming";
+  if (stablePolls < 2) return "stabilizing";
+  return "completed";
+}
+
+function newImageCandidates(baseline, candidates) {
+  const before = new Set(Array.isArray(baseline) ? baseline.filter(Boolean) : []);
+  const seen = new Set();
+  return (Array.isArray(candidates) ? candidates : []).filter((item) => {
+    const src = typeof item?.src === "string" ? item.src : "";
+    if (!src || before.has(src) || seen.has(src)) return false;
+    seen.add(src);
+    return true;
+  });
+}
+
+function imageCollectionStability(candidates, previousSignature = "", stablePolls = 0) {
+  const signature = (Array.isArray(candidates) ? candidates : [])
+    .map((item) => item?.src)
+    .filter(Boolean)
+    .join("\n");
+  return {
+    signature,
+    stablePolls: signature && signature === previousSignature ? stablePolls + 1 : 0,
+  };
+}
+
+async function waitForDomMutation(client, sessionId, waitMs, signal) {
+  if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+  const timeoutMs = clampInteger(waitMs, 1_000, 100, 5_000);
+  try {
+    await evaluate(
+      client,
+      sessionId,
+      `(() => new Promise(resolve => { const root=document.documentElement; if(!root){resolve('no-root');return} let settled=false; const finish=reason=>{if(settled)return;settled=true;observer.disconnect();clearTimeout(timer);resolve(reason)}; const observer=new MutationObserver(()=>finish('mutation')); observer.observe(root,{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['aria-busy','aria-disabled','data-testid']}); const timer=setTimeout(()=>finish('watchdog'),${timeoutMs}); }))()`,
+    );
+  } catch {
+    await sleep(Math.min(timeoutMs, 250), signal);
+  }
+}
+
+function normalizeEditorText(value) {
+  return String(value ?? "")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+async function attachChatGptPage(client, signal, activate = false) {
+  const { targetInfos = [] } = await client.send("Target.getTargets");
+  let target = targetInfos.find(
+    (item) => item.type === "page" && String(item.url).includes(CHATGPT_HOST),
+  );
+  if (!target) {
+    const created = await client.send("Target.createTarget", { url: CHATGPT_NEW_URL });
+    target = { targetId: created.targetId };
+  }
+  const { sessionId } = await client.send("Target.attachToTarget", {
+    targetId: target.targetId,
+    flatten: true,
+  });
+  if (activate) await client.send("Target.activateTarget", { targetId: target.targetId });
+  await client.send("Page.enable", {}, sessionId);
+  await client.send("Runtime.enable", {}, sessionId);
+  if (activate)
+    try {
+      await client.send("Page.bringToFront", {}, sessionId);
+    } catch {}
+  await sleep(300, signal);
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+    try {
+      const ready = await evaluate(client, sessionId, "document.readyState");
+      if (["interactive", "complete"].includes(ready)) break;
+    } catch {}
+    await sleep(300, signal);
+  }
+  return { sessionId };
+}
+
+async function attachExistingProviderPage(client, signal, activate = false) {
+  const { targetInfos = [] } = await client.send("Target.getTargets");
+  const target = targetInfos.find(
+    (item) => item.type === "page" && String(item.url).includes(CHATGPT_HOST),
+  );
+  if (!target) return null;
+  const { sessionId } = await client.send("Target.attachToTarget", {
+    targetId: target.targetId,
+    flatten: true,
+  });
+  if (activate) await client.send("Target.activateTarget", { targetId: target.targetId });
+  await client.send("Page.enable", {}, sessionId);
+  await client.send("Runtime.enable", {}, sessionId);
+  if (activate)
+    try {
+      await client.send("Page.bringToFront", {}, sessionId);
+    } catch {}
+  await sleep(250, signal);
+  return { sessionId };
+}
+
+const PAGE_HELPERS = String.raw`
+function cfVisible(el){if(!el||!(el instanceof Element))return false;const s=getComputedStyle(el),r=el.getBoundingClientRect();return s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)!==0&&r.width>8&&r.height>8&&r.bottom>0&&r.right>0}
+function cfText(el){return [el?.innerText,el?.textContent,el?.getAttribute?.('aria-label'),el?.getAttribute?.('data-testid')].filter(Boolean).join(' ').replace(/\s+/g,' ').trim()}
+function cfPrompt(){const selectors=['textarea[placeholder]','[contenteditable="true"][role="textbox"]','[contenteditable="true"]','[role="textbox"]'];for(const s of selectors){const all=[...document.querySelectorAll(s)].filter(cfVisible);const preferred=all.find(el=>/prompt|imagine|describe|ask|create|what/i.test([el.getAttribute('placeholder'),el.getAttribute('aria-label')].filter(Boolean).join(' ')));if(preferred)return preferred;if(all.length)return all.at(-1)}return null}
+function cfAssistantNodes(){const selectors=['[data-testid="assistant-message"] [class*="text-response"]','[data-testid="assistant-message"]','[data-message-author-role="assistant"] .markdown','[data-message-author-role="assistant"]','article[data-testid^="conversation-turn-"] .markdown'];for(const s of selectors){const n=[...document.querySelectorAll(s)].filter(cfVisible);if(n.length)return n}return []}
+function cfResolveComparison(){const body=document.body?.innerText||'';if(!/giving feedback on a new version|qual resposta voc[êe] prefere|dando feedback sobre uma nova vers[ãa]o/i.test(body))return false;const button=[...document.querySelectorAll('button')].find(el=>cfVisible(el)&&/prefer this response|prefiro esta resposta|choose this response|escolher esta resposta/i.test(cfText(el)));if(!button)return false;button.click();return true}
+function cfResponseState(){const comparisonResolved=cfResolveComparison(),nodes=cfAssistantNodes(),entries=nodes.map(el=>({text:(el.innerText||el.textContent||'').trim(),links:[...el.querySelectorAll('a[href]')].map(a=>({href:a.href,label:(a.innerText||a.textContent||'').trim()})).filter(x=>/^https:\/\//i.test(x.href))})).filter(x=>x.text);const stop=[...document.querySelectorAll('button')].some(el=>cfVisible(el)&&(/stop/i.test(cfText(el))||el.getAttribute('data-testid')==='stop-button'));return{texts:entries.map(x=>x.text),entries,stop,comparisonResolved,bodyHint:(document.body?.innerText||'').slice(0,6000)}}
+`;
+
+async function openNewConversation(client, sessionId, signal, url = CHATGPT_NEW_URL) {
+  await client.send("Page.navigate", { url }, sessionId);
+  const deadline = Date.now() + 20000;
+  while (Date.now() < deadline) {
+    if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+    try {
+      const ready = await evaluate(
+        client,
+        sessionId,
+        `(() => {${PAGE_HELPERS};if(cfPrompt())return true;const b=[...document.querySelectorAll('button,a')].find(el=>cfVisible(el)&&/create|make.*video|new.*video|criar|gerar.*vídeo/i.test(cfText(el)));if(b){b.click();return false}return false})()`,
+      );
+      if (ready) return;
+    } catch {}
+    await sleep(350, signal);
+  }
+}
+
+async function waitForPrompt(client, sessionId, waitMs, signal) {
+  const deadline = Date.now() + waitMs;
+  let state;
+  while (Date.now() < deadline) {
+    if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+    try {
+      state = await evaluate(
+        client,
+        sessionId,
+        `(() => {${PAGE_HELPERS};const body=document.body?.innerText||'';const authButton=[...document.querySelectorAll('button,a,[role="button"]')].find(el=>cfVisible(el)&&/^(entrar|log in|sign in|continuar|continue)$/i.test(cfText(el)));if(authButton)authButton.click();return{host:location.hostname,prompt:!!cfPrompt(),login:/log in|sign up|entrar|criar conta/i.test(body),authClicked:!!authButton,captcha:/captcha|verify you are human/i.test(body),bodyHint:body.slice(0,4000)}})()`,
+      );
+    } catch (error) {
+      // O login da Meta/Facebook pode fechar o alvo atual e retornar ao Meta AI
+      // em uma nova aba. Reconecte ao novo alvo em vez de abortar o preparo.
+      const attached = await attachExistingProviderPage(client, signal).catch(() => null);
+      if (attached?.sessionId) sessionId = attached.sessionId;
+      await sleep(700, signal);
+      continue;
+    }
+    if (state?.host === CHATGPT_HOST && state?.prompt && !state?.login) return sessionId;
+    if (state?.host !== CHATGPT_HOST) {
+      const attached = await attachExistingProviderPage(client, signal).catch(() => null);
+      if (attached?.sessionId) sessionId = attached.sessionId;
+    }
+    await sleep(700, signal);
+  }
+  if (state?.captcha)
+    throw codedError("AUTHENTICATION_FAILED", "O ChatGPT exige verificação manual/CAPTCHA.", true);
+  throw codedError(
+    "AUTHENTICATION_FAILED",
+    "Faça login no Meta AI na janela Chrome dedicada e tente novamente.",
+    true,
+  );
+}
+
+async function persistMetaSessionCookies(client, sessionId) {
+  const { cookies = [] } = await client.send("Network.getAllCookies", {}, sessionId);
+  const expires = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
+  let persisted = 0;
+  for (const cookie of cookies) {
+    if (!cookie.session || !/(^|\.)(meta\.ai|meta\.com|facebook\.com)$/i.test(cookie.domain))
+      continue;
+    const params = {
+      name: cookie.name,
+      value: cookie.value,
+      domain: cookie.domain,
+      path: cookie.path || "/",
+      secure: Boolean(cookie.secure),
+      httpOnly: Boolean(cookie.httpOnly),
+      expires,
+    };
+    if (["Strict", "Lax", "None"].includes(cookie.sameSite)) params.sameSite = cookie.sameSite;
+    try {
+      const result = await client.send("Network.setCookie", params, sessionId);
+      if (result?.success !== false) persisted += 1;
+    } catch {}
+  }
+  return persisted;
+}
+
+async function attachFiles(client, sessionId, attachments, signal) {
+  if (!attachments.length) return;
+  await client.send("DOM.enable", {}, sessionId);
+  const target = await client.send(
+    "Runtime.evaluate",
+    {
+      expression: "document.querySelector('input[type=\"file\"]')",
+      returnByValue: false,
+    },
+    sessionId,
+  );
+  const objectId = target?.result?.objectId;
+  if (!objectId)
+    throw codedError(
+      "OUTPUT_VALIDATION_FAILED",
+      "Seletor de anexos do Meta AI não encontrado.",
+      true,
+    );
+  const described = await client.send("DOM.describeNode", { objectId }, sessionId);
+  const backendNodeId = described?.node?.backendNodeId;
+  if (!Number.isInteger(backendNodeId))
+    throw codedError("OUTPUT_VALIDATION_FAILED", "Input de anexo do Meta AI inválido.", true);
+  await client.send(
+    "DOM.setFileInputFiles",
+    { files: attachments.map((item) => item.path), backendNodeId },
+    sessionId,
+  );
+  await sleep(1500, signal);
+}
+
+async function clickMode(bridge, mode) {
+  if (!mode || mode === "standard" || mode === "image") return;
+  const terms =
+    mode === "search"
+      ? ["search the web", "pesquisar na web"]
+      : mode === "deep"
+        ? ["deep research", "pesquisa aprofundada"]
+        : mode === "video"
+          ? ["video", "animate", "motion", "vídeo", "animar"]
+          : ["think", "pensar"];
+  // A geração de imagens também funciona no chat padrão quando a conta não
+  // exibe o atalho "Criar uma imagem". Nesse caso o próprio prompt explícito
+  // aciona a ferramenta, portanto não devemos abortar antes de enviá-lo.
+  try {
+    await bridge.dispatch(
+      "click",
+      { selectors: ["button", '[role="menuitem"]'], textIncludes: terms },
+      `mode:${mode}`,
+    );
+    return true;
+  } catch (error) {
+    if (["image", "video"].includes(mode) && error?.code === "OUTPUT_VALIDATION_FAILED")
+      return false;
+    throw codedError("PERMISSION_DENIED", `A conta atual não oferece o modo ${mode}.`, false);
+  }
+}
+
+async function setPrompt(bridge, prompt, operationKey) {
+  await bridge.dispatch(
+    "setText",
+    {
+      selectors: [
+        "textarea[placeholder]",
+        '[contenteditable="true"][role="textbox"]',
+        '[contenteditable="true"]',
+        '[role="textbox"]',
+      ],
+      text: prompt,
+    },
+    operationKey,
+  );
+}
+
+async function clickSend(client, sessionId, bridge, signal, operationKey) {
+  const deadline = Date.now() + 10_000;
+  let available;
+  while (Date.now() < deadline) {
+    if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+    available = await evaluate(
+      client,
+      sessionId,
+      `(() => {${PAGE_HELPERS};return [...document.querySelectorAll('button')].some(x=>cfVisible(x)&&!x.disabled&&x.getAttribute('aria-disabled')!=='true'&&(x.getAttribute('data-testid')==='send-button'||/send|generate|create|submit|enviar|gerar|criar/i.test(cfText(x))))})()`,
+    );
+    if (available) break;
+    await sleep(200, signal);
+  }
+  if (!available)
+    throw codedError("OUTPUT_VALIDATION_FAILED", "Botão Enviar não ficou disponível.", true);
+  await bridge.dispatch(
+    "click",
+    {
+      selectors: ['button[data-testid="send-button"]', "button"],
+      textIncludes: ["send", "generate", "create", "submit", "enviar", "gerar", "criar"],
+    },
+    operationKey,
+  );
+  const sent = async (deadline) => {
+    while (Date.now() < deadline) {
+      if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+      const submitted = await evaluate(
+        client,
+        sessionId,
+        `(() => {${PAGE_HELPERS};const prompt=cfPrompt();const text=(prompt?.innerText||prompt?.textContent||'').trim();const stop=[...document.querySelectorAll('button')].some(el=>cfVisible(el)&&(/stop/i.test(cfText(el))||el.getAttribute('data-testid')==='stop-button'));return !text||stop})()`,
+      );
+      if (submitted) return true;
+      await sleep(150, signal);
+    }
+    return false;
+  };
+  if (await sent(Date.now() + 2_500)) return;
+  throw codedError("OUTPUT_VALIDATION_FAILED", "O Meta AI não confirmou o envio do prompt.", true);
+}
+
+async function responseState(client, sessionId) {
+  return await evaluate(client, sessionId, `(() => {${PAGE_HELPERS};return cfResponseState()})()`);
+}
+async function waitForResponse(client, sessionId, baselineCount, timeoutMs, signal) {
+  const deadline = Date.now() + timeoutMs;
+  let previous = "",
+    stable = 0;
+  while (Date.now() < deadline) {
+    if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+    const state = await responseState(client, sessionId),
+      texts = state?.texts ?? [],
+      newest = texts.length > baselineCount ? texts.at(-1) : "";
+    stable = newest && newest === previous ? stable + 1 : 0;
+    previous = newest;
+    const phase = responsePhase({
+      hasNewResponse: Boolean(newest),
+      generating: Boolean(state?.stop),
+      stablePolls: stable,
+    });
+    if (phase === "completed")
+      return { text: newest.trim(), links: state.entries?.at(-1)?.links ?? [] };
+    const hint = String(state?.bodyHint ?? "");
+    if (/usage limit|rate limit|reached.*limit|limite de uso/i.test(hint))
+      throw codedError("RATE_LIMIT", "O ChatGPT informou limite temporário de uso.", true);
+    if (/captcha|verify you are human/i.test(hint))
+      throw codedError("AUTHENTICATION_FAILED", "O ChatGPT exige verificação manual.", true);
+    await waitForDomMutation(client, sessionId, 1_000, signal);
+  }
+  throw codedError("TIMEOUT", "O ChatGPT não concluiu a resposta no prazo.", true);
+}
+
+async function generatePart(
+  client,
+  sessionId,
+  bridge,
+  prompt,
+  settings,
+  signal,
+  operationKey,
+  lifecycle = {},
+) {
+  const before = await responseState(client, sessionId),
+    baseline = lifecycle.resumeBaseline?.texts ?? before?.texts?.length ?? 0;
+  if (!lifecycle.resumeBaseline) {
+    await setPrompt(bridge, prompt, `prompt:${operationKey}`);
+    await lifecycle.beforeSubmit?.({ texts: baseline });
+    await clickSend(client, sessionId, bridge, signal, `send:${operationKey}`);
+    await lifecycle.submitted?.();
+  }
+  return await waitForResponse(
+    client,
+    sessionId,
+    baseline,
+    clampInteger(settings?.responseTimeoutSeconds, 600, 30, 3600) * 1000,
+    signal,
+  );
+}
+
+async function generateImagePart(
+  client,
+  sessionId,
+  bridge,
+  prompt,
+  settings,
+  signal,
+  operationKey,
+  lifecycle = {},
+) {
+  const baseline =
+    lifecycle.resumeBaseline?.images ??
+    (await evaluate(
+      client,
+      sessionId,
+      `(() => [...document.querySelectorAll('main img, img')].filter(img=>img.complete&&img.naturalWidth>=512&&img.naturalHeight>=512&&!/avatar|logo|profile/i.test(img.alt||'')).map(img=>img.currentSrc||img.src).filter(Boolean))()`,
+    ));
+  if (!lifecycle.resumeBaseline) {
+    await setPrompt(bridge, prompt, `image-prompt:${operationKey}`);
+    await lifecycle.beforeSubmit?.({ images: baseline });
+    await clickSend(client, sessionId, bridge, signal, `image-send:${operationKey}`);
+    await lifecycle.submitted?.();
+  }
+  const deadline =
+    Date.now() + clampInteger(settings?.responseTimeoutSeconds, 600, 30, 3600) * 1000;
+  let previousSignature = "",
+    stablePolls = 0;
+  while (Date.now() < deadline) {
+    if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+    const state = await evaluate(
+      client,
+      sessionId,
+      `(() => {${PAGE_HELPERS};const images=[...document.querySelectorAll('main img, img')].filter(img=>img.complete&&img.naturalWidth>=512&&img.naturalHeight>=512&&!/avatar|logo|profile/i.test(img.alt||'')).map(img=>({src:img.currentSrc||img.src||'',width:img.naturalWidth,height:img.naturalHeight,alt:img.alt||'Imagem gerada pelo Meta AI'}));const stop=[...document.querySelectorAll('button')].some(el=>cfVisible(el)&&/stop|cancel generation|parar/i.test(cfText(el)));return{images,stop}})()`,
+    );
+    const candidates = newImageCandidates(baseline, state?.images);
+    const stability = imageCollectionStability(candidates, previousSignature, stablePolls);
+    stablePolls = stability.stablePolls;
+    previousSignature = stability.signature;
+    if (candidates.length && !state?.stop && stablePolls >= 2)
+      return {
+        text: candidates
+          .map((item) => item.alt)
+          .filter(Boolean)
+          .join("\n"),
+        links: [],
+        mediaCandidates: candidates,
+      };
+    const body = await evaluate(client, sessionId, "(document.body?.innerText||'').slice(-4000)");
+    if (/usage limit|rate limit|reached.*limit|limite de uso/i.test(body))
+      throw codedError("RATE_LIMIT", "O Meta AI informou limite de geração de imagens.", true);
+    if (
+      /(?:can't|cannot|unable to|sorry.{0,80}(?:image|request)|não posso|não consigo|lo siento|no puedo).{0,160}/i.test(
+        String(body || ""),
+      )
+    )
+      throw codedError(
+        "OUTPUT_VALIDATION_FAILED",
+        lifecycle.refusalMessage || "O Meta AI respondeu ao pedido sem produzir mídia.",
+        false,
+      );
+    await sleep(1200, signal);
+  }
+  throw codedError("TIMEOUT", "O Meta AI não estabilizou as imagens no prazo.", true);
+}
+
+async function downloadMedia(client, sessionId, url, fallbackMimeType) {
+  try {
+    const payload = await evaluate(
+      client,
+      sessionId,
+      `(async()=>{const r=await fetch(${JSON.stringify(url)},{credentials:'include'});if(!r.ok)throw new Error('HTTP '+r.status);const b=new Uint8Array(await r.arrayBuffer());let s='';const n=32768;for(let i=0;i<b.length;i+=n)s+=String.fromCharCode(...b.subarray(i,i+n));return{base64:btoa(s),mimeType:(r.headers.get('content-type')||${JSON.stringify(fallbackMimeType)}).split(';')[0]}})()`,
+    );
+    return { bytes: Buffer.from(payload.base64, "base64"), mimeType: payload.mimeType };
+  } catch {
+    let cookie = "";
+    try {
+      const { cookies = [] } = await client.send("Network.getCookies", { urls: [url] }, sessionId);
+      cookie = cookies.map((item) => `${item.name}=${item.value}`).join("; ");
+    } catch {}
+    const response = await fetch(url, {
+      redirect: "follow",
+      headers: cookie ? { cookie, referer: CHATGPT_NEW_URL } : { referer: CHATGPT_NEW_URL },
+    });
+    if (!response.ok)
+      throw codedError(
+        "OUTPUT_VALIDATION_FAILED",
+        `O CDN da Meta recusou o download do artefato (HTTP ${response.status}).`,
+        true,
+      );
+    return {
+      bytes: Buffer.from(await response.arrayBuffer()),
+      mimeType: (response.headers.get("content-type") || fallbackMimeType).split(";")[0],
+    };
+  }
+}
+
+async function captureGeneratedImages(
+  client,
+  sessionId,
+  services,
+  request,
+  timeoutMs,
+  preferredCandidates,
+  onCaptured,
+) {
+  const deadline = Date.now() + timeoutMs;
+  let imageData = [];
+  while (Date.now() < deadline) {
+    if (services.signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+    imageData =
+      Array.isArray(preferredCandidates) && preferredCandidates.length
+        ? preferredCandidates
+        : await evaluate(
+            client,
+            sessionId,
+            `(() => {const seen=new Set();return [...document.querySelectorAll('main img, img')].filter(img=>img.complete&&img.naturalWidth>=512&&img.naturalHeight>=512&&!/avatar|logo|profile/i.test(img.alt||'')).map(img=>({src:img.currentSrc||img.src||'',width:img.naturalWidth,height:img.naturalHeight,alt:img.alt||'Imagem gerada pelo Meta AI'})).filter(item=>item.src&&!seen.has(item.src)&&(seen.add(item.src),true))})()`,
+          );
+    if (Array.isArray(imageData) && imageData.length) break;
+    await sleep(1000, services.signal);
+  }
+  if (!Array.isArray(imageData) || !imageData.length)
+    throw codedError(
+      "OUTPUT_VALIDATION_FAILED",
+      "A resposta terminou sem imagens geradas capturáveis.",
+      true,
+    );
+  const results = [];
+  for (let index = 0; index < imageData.length; index += 1) {
+    const candidate = imageData[index];
+    const payload = await downloadMedia(client, sessionId, candidate.src, "image/png");
+    const bytes = payload.bytes;
+    if (!bytes.length || bytes.length > 50 * 1024 * 1024)
+      throw codedError("OUTPUT_VALIDATION_FAILED", "Imagem gerada vazia ou acima de 50 MB.", true);
+    const extension =
+      payload.mimeType === "image/webp"
+        ? "webp"
+        : payload.mimeType === "image/jpeg"
+          ? "jpg"
+          : "png";
+    const artifactId = `meta-ai-image-${createHash("sha256")
+      .update(
+        [
+          request?.executionId || "execution",
+          request?.blockId || "block",
+          request?.attempt || 1,
+          request?.batch?.itemId || request?.batch?.index || "single",
+          index,
+        ].join(":"),
+      )
+      .digest("hex")
+      .slice(0, 16)}`;
+    const name = `${artifactId}.${extension}`;
+    await writeFile(services.getOutputPath(name), bytes);
+    const file = {
+      id: artifactId,
+      name,
+      mimeType: payload.mimeType,
+      size: bytes.length,
+      url: `artifact://${artifactId}`,
+    };
+    results.push({
+      file,
+      artifact: {
+        id: artifactId,
+        name,
+        mimeType: payload.mimeType,
+        size: bytes.length,
+        source: { kind: "path", path: name },
+      },
+      dimensions: candidate,
+    });
+    await onCaptured?.(results.at(-1), index, imageData.length, results);
+  }
+  return results;
+}
+
+async function generateVideoPart(
+  client,
+  sessionId,
+  bridge,
+  prompt,
+  settings,
+  signal,
+  operationKey,
+  lifecycle = {},
+) {
+  const baseline =
+    lifecycle.resumeBaseline?.videos ??
+    (await evaluate(
+      client,
+      sessionId,
+      `(() => [...document.querySelectorAll('main video, video')].map(v=>v.currentSrc||v.src||v.querySelector('source')?.src||'').filter(Boolean))()`,
+    ));
+  if (!lifecycle.resumeBaseline) {
+    await setPrompt(bridge, prompt, `video-prompt:${operationKey}`);
+    await lifecycle.beforeSubmit?.({ videos: baseline });
+    await clickSend(client, sessionId, bridge, signal, `video-send:${operationKey}`);
+    await lifecycle.submitted?.();
+  }
+  const deadline =
+    Date.now() + clampInteger(settings?.responseTimeoutSeconds, 900, 30, 3600) * 1000;
+  while (Date.now() < deadline) {
+    if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+    const state = await evaluate(
+      client,
+      sessionId,
+      `(() => {${PAGE_HELPERS};const before=new Set(${JSON.stringify(baseline)});const videos=[...document.querySelectorAll('main video, video')];const v=videos.findLast(item=>!before.has(item.currentSrc||item.src||item.querySelector('source')?.src||''));const stop=[...document.querySelectorAll('button')].some(el=>cfVisible(el)&&/stop|cancel generation|parar/i.test(cfText(el)));return{isNew:!!v,ready:!!v&&v.readyState>=2,stop,src:v?.currentSrc||v?.src||v?.querySelector('source')?.src||''}})()`,
+    );
+    if (state.isNew && state.ready && state.src && !state.stop)
+      return { text: "Vídeo gerado pelo Meta AI Vibes", links: [], mediaSrc: state.src };
+    const body = await evaluate(client, sessionId, "(document.body?.innerText||'').slice(-4000)");
+    if (
+      /can(?:not|'t) create video right now|video generation (?:is not|isn't) available right now|video generation.*(?:expected soon|being upgraded)|vídeo.*indisponível/i.test(
+        body,
+      )
+    )
+      throw codedError(
+        "PERMISSION_DENIED",
+        "A conta Meta AI conectada não oferece geração de vídeo neste momento.",
+        false,
+      );
+    if (/usage limit|rate limit|reached.*limit|limite de uso|credits? exhausted/i.test(body))
+      throw codedError("RATE_LIMIT", "O Meta AI informou limite de geração de vídeo.", true);
+    await sleep(1500, signal);
+  }
+  throw codedError("TIMEOUT", "O Meta AI não concluiu o vídeo no prazo.", true);
+}
+
+async function captureGeneratedVideo(
+  client,
+  sessionId,
+  services,
+  request,
+  timeoutMs,
+  preferredSrc,
+  variantIndex,
+) {
+  const deadline = Date.now() + timeoutMs;
+  let videoData;
+  while (Date.now() < deadline) {
+    if (services.signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+    videoData = await evaluate(
+      client,
+      sessionId,
+      `(() => {const videos=[...document.querySelectorAll('main video, video')].filter(v=>v.videoWidth>=256&&v.videoHeight>=144);const v=videos.at(-1);return v?{src:v.currentSrc||v.src||v.querySelector('source')?.src||'',width:v.videoWidth,height:v.videoHeight,duration:Number.isFinite(v.duration)?v.duration:0}:null})()`,
+    );
+    if (preferredSrc) videoData = { ...(videoData || {}), src: preferredSrc };
+    if (videoData?.src) break;
+    await sleep(1000, services.signal);
+  }
+  if (!videoData?.src)
+    throw codedError(
+      "OUTPUT_VALIDATION_FAILED",
+      "A resposta terminou sem um vídeo capturável.",
+      true,
+    );
+  const payload = await downloadMedia(client, sessionId, videoData.src, "video/mp4");
+  const bytes = payload.bytes;
+  if (!bytes.length || bytes.length > 200 * 1024 * 1024)
+    throw codedError("OUTPUT_VALIDATION_FAILED", "Vídeo gerado vazio ou acima de 200 MB.", true);
+  const extension = payload.mimeType === "video/webm" ? "webm" : "mp4";
+  const artifactIdentity = videoArtifactIdentity(request, variantIndex);
+  const artifactId = `meta-ai-video-${createHash("sha256")
+    .update(artifactIdentity)
+    .digest("hex")
+    .slice(0, 16)}`;
+  const name = `${artifactId}.${extension}`;
+  await writeFile(services.getOutputPath(name), bytes);
+  const file = {
+    id: artifactId,
+    name,
+    mimeType: payload.mimeType,
+    size: bytes.length,
+    url: `artifact://${artifactId}`,
+  };
+  return {
+    file,
+    artifact: {
+      id: artifactId,
+      name,
+      mimeType: payload.mimeType,
+      size: bytes.length,
+      source: { kind: "path", path: name },
+    },
+    metadata: videoData,
+  };
+}
+
+async function configureProfile(request, services) {
+  const settings = request?.settings ?? {};
+  let profileName, profilePath, port;
+  try {
+    profileName = normalizeAccountProfile(request?.configuration?.accountProfile);
+    profilePath = runtimeProfilePath(settings, profileName, services);
+    port = profilePort(
+      clampInteger(settings.remoteDebuggingPort, DEFAULT_PORT, 1024, 64000),
+      profileName,
+    );
+    assertDedicatedProfilePath(profilePath, settings.allowExistingChromeProfile === true);
+  } catch (error) {
+    return resultError(
+      error?.code || "INVALID_CONFIGURATION",
+      error?.message || "Perfil inválido.",
+    );
+  }
+  if (request?.invocation?.action === "status") {
+    return {
+      status: "success",
+      values: { ready: await profileIsPrepared(profilePath, profileName) },
+    };
+  }
+  if (request?.invocation?.action !== "prepare") {
+    return resultError("INVALID_CONFIGURATION", "Ação de configuração de perfil inválida.");
+  }
+
+  let client, bridge;
+  try {
+    const launched = await launchOrReuseChrome({
+      profilePath,
+      port,
+      startMinimized: false,
+      keepBrowserOpen: false,
+      signal: services.signal,
+      coreSession: settings.__contentFlowBrowserSession,
+    });
+    client = await new CdpClient(launched.version.webSocketDebuggerUrl).connect(services.signal);
+    const { sessionId } = await attachChatGptPage(client, services.signal, true);
+    await openNewConversation(client, sessionId, services.signal);
+    let authenticatedSessionId = await waitForPrompt(
+      client,
+      sessionId,
+      PROFILE_SETUP_WAIT_MS,
+      services.signal,
+    );
+    await persistMetaSessionCookies(client, authenticatedSessionId);
+    // O callback OIDC pode exibir o editor antes de terminar de persistir a
+    // sessão. Recarregue o chat e só marque o perfil se ele continuar autenticado.
+    await sleep(3000, services.signal);
+    await openNewConversation(client, authenticatedSessionId, services.signal, CHATGPT_CHAT_URL);
+    authenticatedSessionId = await waitForPrompt(
+      client,
+      authenticatedSessionId,
+      PROFILE_SETUP_WAIT_MS,
+      services.signal,
+    );
+    bridge = await attachContentFlowBridge({
+      client,
+      pageSessionId: authenticatedSessionId,
+      pluginId: PLUGIN_ID,
+      profileId: profileName,
+      request,
+      signal: services.signal,
+      allowedOrigins: ["https://meta.ai", "https://www.meta.ai"],
+      waitMs: PROFILE_SETUP_WAIT_MS,
+    });
+    await persistMetaSessionCookies(client, authenticatedSessionId);
+    await sleep(3000, services.signal);
+    await markProfilePrepared(profilePath, profileName);
+    return {
+      status: "success",
+      values: { ready: true, message: `Perfil ${profileName} validado no Meta AI.` },
+    };
+  } catch (error) {
+    return resultError(
+      error?.code || "AUTHENTICATION_FAILED",
+      error?.message || "Não foi possível validar o login do Meta AI.",
+      Boolean(error?.retryable),
+    );
+  } finally {
+    await bridge?.dispose();
+    await closeBrowserGracefully(client);
+  }
+}
+
+function incrementalItemKey(request, key) {
+  const batchItemId = request?.batch?.itemId;
+  return typeof batchItemId === "string" && batchItemId ? `batch:${batchItemId}:${key}` : key;
+}
+
+function videoArtifactIdentity(request, variantIndex) {
+  const legacy = `${request?.executionId || "execution"}:${request?.blockId || "block"}:${request?.attempt || 1}`;
+  return variantIndex == null
+    ? legacy
+    : `${legacy}:${request?.batch?.itemId || request?.batch?.index || "single"}:animate:${variantIndex}`;
+}
+
+function imagePartialUpdate(request, current, index, total, completed, description = "") {
+  const images = completed.map((item) => item.file);
+  const firstImage = images[0];
+  return {
+    values: { image: firstImage, images, description },
+    artifacts: [current.artifact],
+    itemUpdates: [
+      ...(index === 0
+        ? [
+            {
+              key: incrementalItemKey(request, "result:0"),
+              variantKey: "image:0",
+              outputPort: "image",
+              state: "completed",
+              input: request?.inputs?.prompt ?? null,
+              value: firstImage,
+            },
+          ]
+        : []),
+      {
+        key: incrementalItemKey(request, "result"),
+        variantKey: `image:${index}`,
+        outputPort: "images",
+        state: "completed",
+        input: request?.inputs?.prompt ?? null,
+        value: current.file,
+      },
+    ],
+    progress: (index + 1) / total,
+    message: `Imagem ${index + 1} de ${total} capturada.`,
+  };
+}
+
+async function executeHandler(request, services) {
+  if (request?.invocation?.mode === "configure") return await configureProfile(request, services);
+  if (request?.invocation?.mode === "item_action") {
+    if (
+      request.invocation.action !== "regenerate" ||
+      ![
+        "generate-image-in-browser",
+        "animate-image-in-browser",
+        "generate-video-in-browser",
+      ].includes(request.capabilityId)
+    ) {
+      return resultError("INVALID_CONFIGURATION", "A ação de item solicitada não é suportada.");
+    }
+    const itemInput = request?.itemAction?.input;
+    request = {
+      ...request,
+      invocation: { mode: "start" },
+      inputs: { ...(request?.inputs ?? {}), prompt: itemInput },
+    };
+  }
+  const settings = request?.settings ?? {},
+    capabilityId = String(request?.capabilityId ?? "generate-text-in-browser"),
+    mock = String(settings.diagnosticMockResponse ?? "").trim();
+  const queueDelayMs = clampInteger(settings.queueDelayMs, 1500, 0, 60000);
+  const startMinimized =
+    typeof request?.configuration?.startMinimized === "boolean"
+      ? request.configuration.startMinimized
+      : settings.startMinimized !== false;
+  if (mock) {
+    try {
+      if (capabilityId === "choose-library-item-in-browser")
+        return { status: "success", values: { result: parseSelectedItemId(mock, request) } };
+      if (capabilityId === "validate-content-in-browser")
+        return { status: "success", values: parseValidationValues(mock, request) };
+      if (["search-web-in-browser", "deep-research-in-browser"].includes(capabilityId))
+        return { status: "success", values: searchResponseValues(mock, [], request) };
+      if (capabilityId === "generate-image-in-browser") {
+        const bytes = Buffer.from(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+          "base64",
+        );
+        const id = "meta-ai-image-diagnostic";
+        const name = `${id}.png`;
+        await writeFile(services.getOutputPath(name), bytes);
+        const image = {
+          id,
+          name,
+          mimeType: "image/png",
+          size: bytes.length,
+          url: `artifact://${id}`,
+        };
+        return {
+          status: "success",
+          values: { image, images: [image], description: mock },
+          artifacts: [{ ...image, source: { kind: "path", path: name } }],
+        };
+      }
+      if (["animate-image-in-browser", "generate-video-in-browser"].includes(capabilityId))
+        return resultError("INVALID_CONFIGURATION", "O diagnóstico de vídeo exige execução real.");
+      return {
+        status: "success",
+        values: generationResponseValues(mock, [{ text: mock }], request),
+      };
+    } catch (error) {
+      return resultError(
+        error?.code || "OUTPUT_VALIDATION_FAILED",
+        error?.message || "Resposta simulada inválida.",
+      );
+    }
+  }
+
+  let parts,
+    mode = "standard";
+  try {
+    if (capabilityId === "generate-text-in-browser") {
+      parts = buildParts(request);
+      mode = "standard";
+    } else if (capabilityId === "search-web-in-browser") {
+      parts = [buildSearchPrompt(request, false)];
+      mode = "search";
+    } else if (capabilityId === "deep-research-in-browser") {
+      parts = [buildSearchPrompt(request, true)];
+      mode = "deep";
+    } else if (capabilityId === "choose-library-item-in-browser")
+      parts = [buildChoosePrompt(request)];
+    else if (capabilityId === "validate-content-in-browser")
+      parts = [buildValidationPrompt(request)];
+    else if (["analyze-images-in-browser", "analyze-documents-in-browser"].includes(capabilityId)) {
+      parts = [buildAnalysisPrompt(request, capabilityId.includes("images"))];
+      mode = "standard";
+    } else if (capabilityId === "generate-image-in-browser") {
+      parts = [buildImagePrompt(request)];
+      mode = "image";
+    } else if (capabilityId === "animate-image-in-browser") {
+      const prompt = buildAnimationPrompt(request);
+      const variantCount = animationVariantCount(request);
+      parts = Array.from({ length: variantCount }, () => prompt);
+      mode = "video";
+    } else if (capabilityId === "generate-video-in-browser") {
+      parts = [buildVideoPrompt(request)];
+      mode = "video";
+    } else throw codedError("INVALID_CONFIGURATION", `Capability desconhecida: ${capabilityId}.`);
+  } catch (error) {
+    return resultError(
+      error?.code || "INVALID_CONFIGURATION",
+      error?.message || "Configuração inválida.",
+    );
+  }
+
+  const configuration = request?.configuration ?? {};
+  let client, bridge;
+  try {
+    if (Number(request?.batch?.index) > 0 && queueDelayMs > 0) {
+      await sleep(queueDelayMs, services.signal);
+    }
+    const profileName = normalizeAccountProfile(configuration.accountProfile),
+      profilePath = runtimeProfilePath(settings, profileName, services),
+      port = profilePort(
+        clampInteger(settings.remoteDebuggingPort, DEFAULT_PORT, 1024, 64000),
+        profileName,
+      );
+    const attachments = await resolveAttachments(request, services);
+    const receiptController = [
+      "generate-text-in-browser",
+      "generate-image-in-browser",
+      "animate-image-in-browser",
+      "generate-video-in-browser",
+    ].includes(capabilityId)
+      ? await createReceiptController(request, services)
+      : undefined;
+    const resumeUrl = receiptController?.resumeUrl();
+    assertDedicatedProfilePath(profilePath, settings.allowExistingChromeProfile === true);
+    if (!(await profileIsPrepared(profilePath, profileName))) {
+      throw codedError(
+        "AUTHENTICATION_FAILED",
+        `O perfil Meta AI ${profileName} ainda não foi salvo. Use Salvar perfil antes de executar.`,
+      );
+    }
+    const trace =
+      settings.diagnosticTrace === true
+        ? (message) => process.stderr.write(`[Meta AI Browser] ${message}\n`)
+        : () => {};
+    const step = (message) => process.stderr.write(`[Meta AI Browser] ${message}\n`);
+    step(`Preparando perfil ${profileName} para ${parts.length} etapa(s).`);
+    const launched = await launchOrReuseChrome({
+      profilePath,
+      port,
+      startMinimized,
+      keepBrowserOpen: settings.keepBrowserOpen === true,
+      signal: services.signal,
+      coreSession: settings.__contentFlowBrowserSession,
+    });
+    client = await new CdpClient(launched.version.webSocketDebuggerUrl, trace).connect(
+      services.signal,
+    );
+    const attached = await attachChatGptPage(client, services.signal);
+    let sessionId = attached.sessionId;
+    await openNewConversation(
+      client,
+      sessionId,
+      services.signal,
+      resumeUrl ||
+        (["animate-image-in-browser", "generate-video-in-browser"].includes(capabilityId)
+          ? META_VIBES_URL
+          : capabilityId === "generate-image-in-browser"
+            ? CHATGPT_NEW_URL
+            : CHATGPT_CHAT_URL),
+    );
+    sessionId = await waitForPrompt(
+      client,
+      sessionId,
+      clampInteger(settings.interactiveWaitSeconds, 600, 30, 900) * 1000,
+      services.signal,
+    );
+    bridge = await attachContentFlowBridge({
+      client,
+      pageSessionId: sessionId,
+      pluginId: PLUGIN_ID,
+      profileId: profileName,
+      request,
+      signal: services.signal,
+      allowedOrigins: ["https://meta.ai", "https://www.meta.ai"],
+    });
+    if (!resumeUrl && attachments.length && capabilityId !== "animate-image-in-browser") {
+      step(`Enviando ${attachments.length} anexo(s) autorizado(s).`);
+      await attachFiles(client, sessionId, attachments, services.signal);
+    }
+    let modeReady = !resumeUrl;
+    if (modeReady) await clickMode(bridge, mode);
+    const responses = [],
+      retryAttempts = 0,
+      delayBetweenPartsMs = 0;
+    for (let index = 0; index < parts.length; index += 1) {
+      let lastError;
+      for (let attempt = 0; attempt <= retryAttempts; attempt += 1) {
+        try {
+          const receiptPart = receiptController?.part(index);
+          const reconciling = receiptPartHasExternalEffect(receiptPart);
+          if (receiptPart?.state === "completed" && receiptPart.response) {
+            responses.push(receiptPart.response);
+            lastError = undefined;
+            break;
+          }
+          if (reconciling && !receiptPart?.baseline) {
+            throw codedError("TIMEOUT", p53Message(request, "unsafeResume"), true);
+          }
+          if (!reconciling && !modeReady) {
+            await clickMode(bridge, mode);
+            modeReady = true;
+          }
+          step(
+            `Etapa ${index + 1}/${parts.length}, tentativa ${attempt + 1}/${retryAttempts + 1}.`,
+          );
+          if (capabilityId === "animate-image-in-browser" && !reconciling) {
+            step(`Enviando imagem base para a variante ${index + 1}/${parts.length}.`);
+            await attachFiles(client, sessionId, attachments, services.signal);
+          }
+          const lifecycle = {
+            refusalMessage: p53Message(request, "mediaRefusal"),
+            ...(reconciling ? { resumeBaseline: receiptPart.baseline } : {}),
+            beforeSubmit: async (baseline) =>
+              await receiptController?.beforeSubmit(
+                index,
+                baseline,
+                await currentPageUrl(client, sessionId),
+              ),
+            submitted: async () =>
+              await receiptController?.submitted(index, await currentPageUrl(client, sessionId)),
+          };
+          const response =
+            capabilityId === "generate-image-in-browser"
+              ? await generateImagePart(
+                  client,
+                  sessionId,
+                  bridge,
+                  parts[index],
+                  settings,
+                  services.signal,
+                  `${index}:${attempt}`,
+                  lifecycle,
+                )
+              : ["animate-image-in-browser", "generate-video-in-browser"].includes(capabilityId)
+                ? await generateVideoPart(
+                    client,
+                    sessionId,
+                    bridge,
+                    parts[index],
+                    settings,
+                    services.signal,
+                    `${index}:${attempt}`,
+                    lifecycle,
+                  )
+                : await generatePart(
+                    client,
+                    sessionId,
+                    bridge,
+                    parts[index],
+                    settings,
+                    services.signal,
+                    `${index}:${attempt}`,
+                    lifecycle,
+                  );
+          responses.push(response);
+          await receiptController?.completed(
+            index,
+            response,
+            await currentPageUrl(client, sessionId),
+          );
+          lastError = undefined;
+          break;
+        } catch (error) {
+          await receiptController?.failed(
+            index,
+            error,
+            client && sessionId ? await currentPageUrl(client, sessionId).catch(() => "") : "",
+          );
+          lastError = error;
+          if (
+            !error?.retryable ||
+            attempt >= retryAttempts ||
+            ["AUTHENTICATION_FAILED", "RATE_LIMIT"].includes(error?.code)
+          )
+            break;
+          await sleep(2000 * (attempt + 1), services.signal);
+        }
+      }
+      if (lastError) throw lastError;
+      if (capabilityId === "generate-text-in-browser") {
+        const partialText = cleanGeneratedText(
+          responses.map((response) => response.text).join("\n\n"),
+        );
+        await services.publishPartial?.({
+          values: { result: partialText, parts: responses.map((response) => response.text) },
+          progress: (index + 1) / parts.length,
+          message: `Resposta ${index + 1} de ${parts.length} capturada.`,
+        });
+      }
+      if (index < parts.length - 1) await sleep(delayBetweenPartsMs, services.signal);
+    }
+    const combined = responses.map((response) => response.text).join("\n\n"),
+      sources = [
+        ...new Set(responses.flatMap((response) => response.links).map((link) => link.href)),
+      ].slice(0, 10);
+    let values;
+    if (capabilityId === "generate-image-in-browser") {
+      const captured = await captureGeneratedImages(
+        client,
+        sessionId,
+        services,
+        request,
+        clampInteger(settings?.responseTimeoutSeconds, 600, 30, 3600) * 1000,
+        responses.at(-1)?.mediaCandidates,
+        async (current, index, total, completed) => {
+          await services.publishPartial?.(
+            imagePartialUpdate(request, current, index, total, completed, combined.trim()),
+          );
+        },
+      );
+      const images = captured.map((item) => item.file);
+      const artifacts = captured.map((item) => item.artifact);
+      const firstImage = images[0];
+      return {
+        status: "success",
+        values: { image: firstImage, images, description: combined.trim() },
+        artifacts,
+        usage: {
+          provider: "Meta AI / Muse Image",
+          outputUnits: images.reduce((total, file) => total + file.size, 0),
+          unit: "bytes",
+        },
+      };
+    }
+    if (capabilityId === "animate-image-in-browser") {
+      const captured = [];
+      for (let index = 0; index < responses.length; index += 1) {
+        const current = await captureGeneratedVideo(
+          client,
+          sessionId,
+          services,
+          request,
+          clampInteger(settings?.responseTimeoutSeconds, 900, 30, 3600) * 1000,
+          responses[index]?.mediaSrc,
+          index,
+        );
+        captured.push(current);
+        const videos = captured.map((item) => item.file);
+        await services.publishPartial?.({
+          values: { video: videos[0], videos, description: combined.trim() },
+          artifacts: [current.artifact],
+          itemUpdates: [
+            ...(index === 0
+              ? [
+                  {
+                    key: incrementalItemKey(request, "result:0"),
+                    variantKey: "video:0",
+                    outputPort: "video",
+                    state: "completed",
+                    input: request?.inputs?.prompt ?? null,
+                    value: videos[0],
+                  },
+                ]
+              : []),
+            {
+              key: incrementalItemKey(request, "result"),
+              variantKey: `video:${index}`,
+              outputPort: "videos",
+              state: "completed",
+              input: request?.inputs?.prompt ?? null,
+              value: current.file,
+            },
+          ],
+          progress: (index + 1) / responses.length,
+          message: `Vídeo ${index + 1} de ${responses.length} capturado.`,
+        });
+      }
+      const videos = captured.map((item) => item.file);
+      return {
+        status: "success",
+        values: { video: videos[0], videos, description: combined.trim() },
+        artifacts: captured.map((item) => item.artifact),
+        usage: {
+          provider: "Meta AI / Vibes",
+          outputUnits: videos.reduce((total, file) => total + file.size, 0),
+          unit: "bytes",
+        },
+      };
+    }
+    if (capabilityId === "generate-video-in-browser") {
+      const captured = await captureGeneratedVideo(
+        client,
+        sessionId,
+        services,
+        request,
+        clampInteger(settings?.responseTimeoutSeconds, 900, 30, 3600) * 1000,
+        responses.at(-1)?.mediaSrc,
+      );
+      await services.publishPartial?.({
+        values: { video: captured.file, description: combined.trim() },
+        artifacts: [captured.artifact],
+        itemUpdates: [
+          {
+            key: incrementalItemKey(request, "result:0"),
+            outputPort: "video",
+            state: "completed",
+            input: request?.inputs?.prompt ?? null,
+            value: captured.file,
+          },
+        ],
+        progress: 1,
+        message: "Vídeo capturado.",
+      });
+      return {
+        status: "success",
+        values: { video: captured.file, description: combined.trim() },
+        artifacts: [captured.artifact],
+        usage: { provider: "Meta AI / Vibes", outputUnits: captured.file.size, unit: "bytes" },
+      };
+    }
+    if (["search-web-in-browser", "deep-research-in-browser"].includes(capabilityId))
+      values = searchResponseValues(combined.trim(), sources, request);
+    else if (capabilityId === "choose-library-item-in-browser")
+      values = { result: parseSelectedItemId(combined, request) };
+    else if (capabilityId === "validate-content-in-browser")
+      values = parseValidationValues(combined, request);
+    else {
+      const result = cleanGeneratedText(combined);
+      const minimum = 1;
+      if (result.length < minimum)
+        throw codedError(
+          "OUTPUT_VALIDATION_FAILED",
+          `Resultado com ${result.length} caracteres; mínimo ${minimum}.`,
+          true,
+        );
+      values = generationResponseValues(result, responses, request);
+    }
+    return {
+      status: "success",
+      values,
+      usage: { provider: "Meta AI web", outputUnits: combined.length, unit: "characters" },
+    };
+  } catch (error) {
+    if (services.signal?.aborted || error?.code === "CANCELLED")
+      return resultError("CANCELLED", "Execução cancelada.");
+    return resultError(
+      error?.code || "UPSTREAM_UNAVAILABLE",
+      error?.message || "Falha na automação do Meta AI.",
+      Boolean(error?.retryable),
+    );
+  } finally {
+    await bridge?.dispose();
+    await closeBrowserGracefully(client);
+  }
+}
+
+export async function execute(request, services) {
+  const bridgeDiagnosticsState = await createBridgeDiagnostics(request, services);
+  const response = await executeHandler(
+    { ...request, __bridgeDiagnosticsState: bridgeDiagnosticsState },
+    services,
+  );
+  return { ...response, bridgeDiagnostics: bridgeDiagnosticsState.bridgeDiagnostics };
+}
+
+export const __test = {
+  buildParts,
+  buildSearchPrompt,
+  buildChoosePrompt,
+  buildValidationPrompt,
+  buildAnalysisPrompt,
+  buildImagePrompt,
+  buildAnimationPrompt,
+  animationVariantCount,
+  buildVideoPrompt,
+  cleanGeneratedText,
+  collectStoredFiles,
+  attachmentInput,
+  expandTemplate,
+  normalizeAccountProfile,
+  outlineItems,
+  parseSelectedItemId,
+  parseValidationValues,
+  profileIsPrepared,
+  markProfilePrepared,
+  profilePathFor,
+  profilePort,
+  searchResponseValues,
+  generationResponseValues,
+  summarizeBlock,
+  responsePhase,
+  newImageCandidates,
+  imageCollectionStability,
+  imagePartialUpdate,
+  videoArtifactIdentity,
+  receiptLogicalKey,
+  receiptInputFingerprint,
+  receiptPartHasExternalEffect,
+  validMetaPageUrl,
+  p53Message,
+};

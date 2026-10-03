@@ -1,0 +1,8388 @@
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { copyFile, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { homedir, platform } from "node:os";
+import { basename, join } from "node:path";
+import { createBridgeDiagnostics } from "./bridge-diagnostics.mjs";
+import { rememberMedia, recalledMedia, prepareReferenceCatalog, rememberResult, recalledResult, referenceMessage, saveAnimationReceipt, readAnimationReceipt } from "./media-catalog.mjs";
+
+let FLOW_ENGINE_CODE = "";
+try {
+  FLOW_ENGINE_CODE = readFileSync(new URL("./flow-engine.js", import.meta.url), "utf8");
+} catch {}
+
+const PLUGIN_ID = "local.contentflow.google-flow-batch-images";
+const FLOW_HOST = "flow.google.com";
+const LEGACY_FLOW_HOST = "labs.google";
+const FLOW_HOSTS = new Set([FLOW_HOST, LEGACY_FLOW_HOST]);
+const FLOW_LANDING_URL = "https://flow.google.com/";
+const GENERATION_SUFFIX = "/flowMedia:batchGenerateImages";
+const MEDIA_HOST = "flow-content.google";
+const FLOW_REST_API_BASE = "https://aisandbox-pa.googleapis.com/v1/flowWorkflows";
+const FLOW_PROJECTS_API_BASE = "https://aisandbox-pa.googleapis.com/v1/projects";
+const FLOW_PROJECTS_API_TOOL = "PINHOLE";
+const RE_SOBRECARGA =
+  /high demand|alta demanda|experiencing high demand|credits refunded|reembolsados/i;
+const RPC_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const RPC_MEDIA_URL_RE = /^https:\/\/flow-content\.google\/(image|video)\/([0-9a-f-]{36})/i;
+const TIMING = Object.freeze({
+  SHORT: [350, 700],
+  MEDIUM: [600, 1100],
+  LONG: [900, 1600],
+  DOM_SETTLE: [300, 550],
+  HUMAN_PAUSE: [500, 1100],
+  HUMAN_READ: [900, 1800],
+  GENERATION_TIMEOUT: 300000,
+  TILE_CHECK_INTERVAL: 2500,
+  STABILIZE_TIME: 6000,
+});
+
+function dynamicSleep(range, signal) {
+  const [min, max] = Array.isArray(range) ? range : [range, range];
+  const ms = Math.round(min + Math.random() * Math.max(0, max - min));
+  return sleep(ms, signal);
+}
+
+function calculateJitteredDelay(baseMs) {
+  if (!baseMs || baseMs <= 0) return 0;
+  return Math.round(baseMs * (0.85 + Math.random() * 0.3));
+}
+
+function classifyTileErrorType(text) {
+  const txt = String(text || "").toLowerCase();
+  if (/atividade incomum|unusual activity|unusual traffic|suspicious activity/i.test(txt))
+    return "unusual_activity";
+  if (/muito r[áa]pido|aguarde um instante|too quickly|too fast|rate limit|slow down/i.test(txt))
+    return "rate_limit";
+  if (/pol[íi]tica|viol|policy|policies|guidelines/i.test(txt)) return "policy";
+  if (/captcha|recaptcha/i.test(txt)) return "captcha";
+  return "other";
+}
+
+function decodificarBatchExecute(texto) {
+  const out = [];
+  const linhas = String(texto || "").split("\n");
+  for (const linha of linhas) {
+    const l = linha.trim();
+    if (!l.startsWith("[[")) continue;
+    let arr;
+    try {
+      arr = JSON.parse(l);
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(arr)) continue;
+    for (const item of arr) {
+      if (!Array.isArray(item) || item[0] !== "wrb.fr") continue;
+      let payload = null;
+      if (typeof item[2] === "string" && item[2]) {
+        try {
+          payload = JSON.parse(item[2]);
+        } catch {
+          payload = null;
+        }
+      }
+      out.push({
+        rpcid: item[1],
+        payload,
+        erro: item[5] && item[5] !== "generic" ? item[5] : null,
+      });
+    }
+  }
+  return out;
+}
+
+function extrairMidiasRpc(payload) {
+  const achados = new Map();
+  const visitar = (node, trilha) => {
+    if (typeof node === "string") {
+      const m = RPC_MEDIA_URL_RE.exec(node);
+      if (m) {
+        const mediaId = m[2].toLowerCase();
+        const reg = achados.get(mediaId) || {
+          mediaId,
+          url: node,
+          kind: m[1] === "video" ? "video" : "image",
+          workflowId: null,
+          nome: null,
+          prompt: null,
+          largura: null,
+          altura: null,
+          poster: null,
+        };
+        if (m[1] === "video") {
+          if (reg.kind !== "video" && reg.url && reg.url !== node) reg.poster = reg.url;
+          reg.kind = "video";
+          reg.url = node;
+        } else if (reg.kind === "video") {
+          reg.poster = node;
+        } else {
+          reg.url = node;
+        }
+        for (let i = trilha.length - 1; i >= 0; i--) {
+          const a = trilha[i];
+          if (Array.isArray(a) && a[0] === mediaId) {
+            if (typeof a[2] === "string" && RPC_UUID_RE.test(a[2])) reg.workflowId = a[2];
+            break;
+          }
+        }
+        achados.set(mediaId, reg);
+      }
+      return;
+    }
+    if (Array.isArray(node)) {
+      trilha.push(node);
+      for (const x of node) visitar(x, trilha);
+      trilha.pop();
+    }
+  };
+  visitar(payload, []);
+  return [...achados.values()];
+}
+
+const PAGE_BOOTSTRAP_SCRIPT = `(() => {
+  if (window.trustedTypes && window.trustedTypes.createPolicy && !window.__cfPolicyCreated) {
+    try {
+      window.trustedTypes.createPolicy("default", {
+        createHTML: (s) => s,
+        createScriptURL: (s) => s,
+        createScript: (s) => s,
+      });
+      window.__cfPolicyCreated = true;
+    } catch {}
+  }
+  function setToken(t) {
+    if (!t || typeof t !== "string") return;
+    if (document.documentElement.dataset.faFlowToken === t) return;
+    try { document.documentElement.dataset.faFlowToken = t; } catch {}
+  }
+  function captureHeaders(headers) {
+    try {
+      if (!headers) return;
+      if (typeof headers.get === "function") {
+        const v = headers.get("authorization") || headers.get("Authorization");
+        if (v && v.startsWith("Bearer ")) setToken(v);
+        return;
+      }
+      if (Array.isArray(headers)) {
+        for (const [k, v] of headers) {
+          if (typeof k === "string" && k.toLowerCase() === "authorization" && typeof v === "string" && v.startsWith("Bearer ")) setToken(v);
+        }
+        return;
+      }
+      if (typeof headers === "object") {
+        for (const k of Object.keys(headers)) {
+          const v = headers[k];
+          if (k.toLowerCase() === "authorization" && typeof v === "string" && v.startsWith("Bearer ")) setToken(v);
+        }
+      }
+    } catch {}
+  }
+  const origFetch = window.fetch;
+  if (origFetch && !window.__cfFetchPatched) {
+    window.fetch = function(input, init) {
+      try {
+        if (init?.headers) captureHeaders(init.headers);
+        if (input instanceof Request) captureHeaders(init.headers);
+      } catch {}
+      return origFetch.apply(this, arguments);
+    };
+    window.__cfFetchPatched = true;
+  }
+  const origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+  if (!XMLHttpRequest.prototype.__cfHeaderPatched) {
+    XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+      try {
+        if (typeof name === "string" && name.toLowerCase() === "authorization" && typeof value === "string" && value.startsWith("Bearer ")) setToken(value);
+      } catch {}
+      return origSetHeader.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.__cfHeaderPatched = true;
+  }
+  function findReactKey(node) {
+    if (!node || typeof node !== "object") return null;
+    const keys = Object.keys(node);
+    return keys.find(k => k.startsWith("__reactProps")) || keys.find(k => k.startsWith("__reactEventHandlers")) || null;
+  }
+  function getReactOnClick(node) {
+    const key = findReactKey(node);
+    if (!key) return null;
+    const props = node[key];
+    if (props && typeof props.onClick === "function") return { onClick: props.onClick, key, source: node };
+    return null;
+  }
+  function cfFindOnClickInTree(start) {
+    const direct = getReactOnClick(start);
+    if (direct) return { ...direct, depth: "self" };
+    let cur = start.parentElement;
+    for (let i = 0; i < 5 && cur; i++) {
+      const f = getReactOnClick(cur);
+      if (f) return { ...f, depth: "parent+" + (i + 1) };
+      cur = cur.parentElement;
+    }
+    const queue = [{ node: start, depth: 0 }];
+    let visited = 0;
+    while (queue.length > 0 && visited < 30) {
+      const { node, depth } = queue.shift();
+      visited++;
+      if (depth > 0) {
+        const f = getReactOnClick(node);
+        if (f) return { ...f, depth: "child-" + depth };
+      }
+      if (depth < 3) {
+        for (const c of node.children) queue.push({ node: c, depth: depth + 1 });
+      }
+    }
+    return null;
+  }
+  function buildSyntheticEvent(target) {
+    const rect = target?.getBoundingClientRect ? target.getBoundingClientRect() : { left: 100, top: 100, width: 20, height: 20 };
+    const cx = Math.round(rect.left + rect.width / 2);
+    const cy = Math.round(rect.top + rect.height / 2);
+    return {
+      isTrusted: true,
+      preventDefault() {},
+      stopPropagation() {},
+      stopImmediatePropagation() {},
+      type: "click",
+      target,
+      currentTarget: target,
+      bubbles: true,
+      cancelable: true,
+      defaultPrevented: false,
+      eventPhase: 2,
+      detail: 1,
+      button: 0,
+      buttons: 0,
+      clientX: cx, clientY: cy, screenX: cx + (window.screenX || 0), screenY: cy + (window.screenY || 0),
+      altKey: false, ctrlKey: false, metaKey: false, shiftKey: false,
+      view: window,
+      nativeEvent: { isTrusted: true, type: "click" },
+    };
+  }
+  function handleTrustedClick(e) {
+    const { id, selector } = e.detail || {};
+    if (!id || !selector) return;
+    try {
+      const el = document.querySelector(selector);
+      if (!el) {
+        window.dispatchEvent(new CustomEvent("fa-tc-result", { detail: { id, ok: false, error: "Elemento não encontrado" } }));
+        return;
+      }
+      const found = cfFindOnClickInTree(el);
+      if (!found) {
+        window.dispatchEvent(new CustomEvent("fa-tc-result", { detail: { id, ok: false, error: "Nenhum onClick React na árvore" } }));
+        return;
+      }
+      found.onClick(buildSyntheticEvent(found.source));
+      window.dispatchEvent(new CustomEvent("fa-tc-result", { detail: { id, ok: true, depth: found.depth, key: found.key } }));
+    } catch (err) {
+      window.dispatchEvent(new CustomEvent("fa-tc-result", { detail: { id, ok: false, error: err?.message || String(err) } }));
+    }
+  }
+  if (!window.__cfTrustedClickHandlerRegistered) {
+    window.addEventListener("fa-tc-request", handleTrustedClick);
+    window.__cfTrustedClickHandlerRegistered = true;
+  }
+})();`;
+
+function createCredentialsTracker(client, sessionId, signal) {
+  let bearerToken = null;
+  let projectId = null;
+  let cookies = "";
+
+  const offRequest = client.on?.("Network.requestWillBeSent", (params, eventSessionId) => {
+    if (eventSessionId && eventSessionId !== sessionId) return;
+    const req = params?.request;
+    if (!req) return;
+    const auth = req.headers?.Authorization || req.headers?.authorization;
+    if (typeof auth === "string" && auth.startsWith("Bearer ")) {
+      bearerToken = auth;
+    }
+    const cookie = req.headers?.Cookie || req.headers?.cookie;
+    if (typeof cookie === "string" && cookie) {
+      cookies = cookie;
+    }
+    const url = String(req.url || "");
+    const projMatch = url.match(/\/projects\/([a-zA-Z0-9_-]+)/);
+    if (projMatch) {
+      projectId = projMatch[1];
+    }
+  });
+
+  async function refreshCookies() {
+    try {
+      const res = await client.send("Network.getCookies", {}, sessionId);
+      if (Array.isArray(res?.cookies)) {
+        cookies = res.cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+      }
+    } catch {}
+    return cookies;
+  }
+
+  async function readTokenFromDom() {
+    try {
+      const res = await evaluate(
+        client,
+        sessionId,
+        `document.documentElement.dataset.faFlowToken || null`,
+      );
+      if (typeof res === "string" && res.startsWith("Bearer ")) {
+        bearerToken = res;
+      }
+    } catch {}
+    return bearerToken;
+  }
+
+  async function waitForToken(timeoutMs = 10000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (signal?.aborted) break;
+      if (bearerToken) return bearerToken;
+      const domToken = await readTokenFromDom();
+      if (domToken) return domToken;
+      await sleep(200, signal);
+    }
+    return bearerToken;
+  }
+
+  return {
+    getCredentials() {
+      return { bearerToken, projectId, cookies };
+    },
+    setBearerToken(val) {
+      bearerToken = val;
+    },
+    refreshCookies,
+    readTokenFromDom,
+    waitForToken,
+    close() {
+      if (typeof offRequest === "function") offRequest();
+    },
+  };
+}
+
+async function waitForFlowToken(tracker, timeoutMs = 10000, signal) {
+  if (typeof tracker?.waitForToken === "function") {
+    return await tracker.waitForToken(timeoutMs);
+  }
+  return null;
+}
+
+async function apiRenameProject(bearerToken, projectId, title) {
+  if (!projectId) throw codedError("INVALID_INPUT", "projectId ausente.");
+  const url = `${FLOW_PROJECTS_API_BASE}/${encodeURIComponent(projectId)}?clientContext.tool=${encodeURIComponent(FLOW_PROJECTS_API_TOOL)}&updateMask=projectTitle`;
+  const res = await fetch(url, {
+    method: "PATCH",
+    headers: { Authorization: bearerToken, "Content-Type": "text/plain;charset=UTF-8" },
+    body: JSON.stringify({ projectTitle: title }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw codedError("JOB_FAILED", `apiRenameProject HTTP ${res.status}: ${text.slice(0, 200)}`);
+  }
+  return res.json().catch(() => ({}));
+}
+
+async function applyTileMetadataPatch(bearerToken, projectId, workflowId, metadata, updateMask) {
+  const url = `${FLOW_REST_API_BASE}/${encodeURIComponent(workflowId)}`;
+  const body = JSON.stringify({ workflow: { name: workflowId, projectId, metadata }, updateMask });
+  const res = await fetch(url, {
+    method: "PATCH",
+    headers: { Authorization: bearerToken, "Content-Type": "text/plain;charset=UTF-8" },
+    body,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw codedError(
+      "JOB_FAILED",
+      `applyTileMetadataPatch HTTP ${res.status}: ${text.slice(0, 200)}`,
+    );
+  }
+  return res.json().catch(() => ({}));
+}
+
+async function ensureAgentOff(client, sessionId, signal) {
+  const expression = `(() => {
+    const btns = [...document.querySelectorAll('button[aria-pressed]')];
+    const txt = (b) => ((b.querySelector('span.content') || b).textContent || '').trim().toLowerCase();
+    const byText = btns.filter(b => ['agente', 'agent'].includes(txt(b)));
+    const target = byText.length ? byText[0] : (btns.find(b => b.querySelector('span.content')) || null);
+    if (!target || target.getAttribute('aria-pressed') !== 'true') return { active: false };
+    target.click();
+    return { active: true, clicked: true };
+  })()`;
+  const res = await evaluate(client, sessionId, expression);
+  if (!res || (typeof res === "object" && !res.active)) return false;
+  if (typeof res === "boolean") return res;
+  for (let i = 0; i < 6; i++) {
+    if (signal?.aborted) break;
+    await dynamicSleep(TIMING.DOM_SETTLE, signal);
+    const check = await evaluate(
+      client,
+      sessionId,
+      `(() => {
+      const btns = [...document.querySelectorAll('button[aria-pressed]')];
+      const txt = (b) => ((b.querySelector('span.content') || b).textContent || '').trim().toLowerCase();
+      const byText = btns.filter(b => ['agente', 'agent'].includes(txt(b)));
+      const target = byText.length ? byText[0] : (btns.find(b => b.querySelector('span.content')) || null);
+      return Boolean(target && target.getAttribute('aria-pressed') === 'true');
+    })()`,
+    );
+    if (!check) return true;
+  }
+  return true;
+}
+
+async function triggerTrustedReactClick(client, sessionId, settings = {}) {
+  const customSelector = String(settings?.generateSelector || "").trim();
+  const expression = `(() => {
+    function findReactKey(node) {
+      if (!node || typeof node !== "object") return null;
+      const keys = Object.keys(node);
+      return keys.find(k => k.startsWith("__reactProps")) || keys.find(k => k.startsWith("__reactEventHandlers")) || null;
+    }
+    function getReactOnClick(node) {
+      const key = findReactKey(node);
+      if (!key) return null;
+      const props = node[key];
+      if (props && typeof props.onClick === "function") {
+        return { onClick: props.onClick, key, source: node };
+      }
+      return null;
+    }
+    function cfFindOnClickInTree(start) {
+      const direct = getReactOnClick(start);
+      if (direct) return { ...direct, depth: "self" };
+      let cur = start.parentElement;
+      for (let i = 0; i < 5 && cur; i++) {
+        const f = getReactOnClick(cur);
+        if (f) return { ...f, depth: "parent+" + (i + 1) };
+        cur = cur.parentElement;
+      }
+      const queue = [{ node: start, depth: 0 }];
+      let visited = 0;
+      while (queue.length > 0 && visited < 30) {
+        const { node, depth } = queue.shift();
+        visited++;
+        if (depth > 0) {
+          const f = getReactOnClick(node);
+          if (f) return { ...f, depth: "child-" + depth };
+        }
+        if (depth < 3) {
+          for (const c of node.children) queue.push({ node: c, depth: depth + 1 });
+        }
+      }
+      return null;
+    }
+    function buildSyntheticEvent(target) {
+      const rect = target?.getBoundingClientRect ? target.getBoundingClientRect() : { left: 100, top: 100, width: 20, height: 20 };
+      const cx = Math.round(rect.left + rect.width / 2);
+      const cy = Math.round(rect.top + rect.height / 2);
+      return {
+        isTrusted: true,
+        preventDefault() {},
+        stopPropagation() {},
+        stopImmediatePropagation() {},
+        type: "click",
+        target,
+        currentTarget: target,
+        bubbles: true,
+        cancelable: true,
+        defaultPrevented: false,
+        eventPhase: 2,
+        detail: 1,
+        button: 0,
+        buttons: 0,
+        clientX: cx, clientY: cy, screenX: cx + (window.screenX || 0), screenY: cy + (window.screenY || 0),
+        altKey: false, ctrlKey: false, metaKey: false, shiftKey: false,
+        view: window,
+        nativeEvent: { isTrusted: true, type: "click" },
+      };
+    }
+    const selector = ${JSON.stringify(customSelector)};
+    const btn = (selector ? document.querySelector(selector) : null) || Array.from(document.querySelectorAll("button, [role='button']")).find(b => {
+      const aria = (b.getAttribute("aria-label") || "").toLowerCase();
+      const txt = (b.textContent || "").toLowerCase();
+      return /iniciar gera|start genera|iniciar creaci|iniciar generaci|criar|create|gerar|generate|enviar|submit/.test(aria) ||
+             /criar|create|gerar|generate|enviar|submit|arrow_forward/.test(txt);
+    });
+    if (!btn) return { ok: false, error: "Botão de envio não encontrado." };
+    const rect = btn.getBoundingClientRect();
+    const coords = { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
+    const found = cfFindOnClickInTree(btn);
+    if (!found) {
+      try { btn.click(); return { ok: true, fallback: true }; }
+      catch (e) { return { ok: false, error: e?.message || String(e) }; }
+    }
+    try {
+      found.onClick(buildSyntheticEvent(found.source));
+      return { ok: true, depth: found.depth, key: found.key };
+    } catch (e) {
+      return { ok: false, error: e?.message || String(e) };
+    }
+  })()`;
+  const result = await evaluate(client, sessionId, expression);
+  if (!result?.ok) {
+    throw codedError(
+      "OUTPUT_VALIDATION_FAILED",
+      result?.error || "Falha ao acionar clique confiável no botão de envio.",
+    );
+  }
+  return result;
+}
+
+async function clickSubmit(client, sessionId, settings = {}, signal) {
+  await dynamicSleep(TIMING.MEDIUM, signal);
+  const customSelector = String(settings?.generateSelector || "").trim();
+  const checkExpression = `(() => {
+    const selector = ${JSON.stringify(customSelector)};
+    const btn = (selector ? document.querySelector(selector) : null) || Array.from(document.querySelectorAll("button, [role='button']")).find(b => {
+      const aria = (b.getAttribute("aria-label") || "").toLowerCase();
+      const txt = (b.textContent || "").toLowerCase();
+      return /iniciar gera|start genera|iniciar creaci|iniciar generaci|criar|create|gerar|generate|enviar|submit/.test(aria) ||
+             /criar|create|gerar|generate|enviar|submit|arrow_forward/.test(txt);
+    });
+    if (!btn) return { exists: false };
+    const disabled = Boolean(btn.disabled || btn.getAttribute("aria-disabled") === "true");
+    return { exists: true, disabled, text: (btn.textContent || "").trim() };
+  })()`;
+  let btnState = null;
+  for (let i = 0; i < 30; i++) {
+    if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+    const rawState = await evaluate(client, sessionId, checkExpression);
+    btnState = rawState === true ? { exists: true, disabled: false, text: "Criar" } : rawState;
+    if (btnState?.exists && !btnState?.disabled) break;
+    await dynamicSleep(TIMING.SHORT, signal);
+  }
+  if (!btnState?.exists) {
+    throw codedError(
+      "OUTPUT_VALIDATION_FAILED",
+      "Botão Enviar/Criar não foi encontrado na interface do Flow.",
+    );
+  }
+  if (btnState?.disabled) {
+    throw codedError(
+      "OUTPUT_VALIDATION_FAILED",
+      "Botão Enviar/Criar permaneceu desabilitado após 30 verificações.",
+    );
+  }
+  const result = await triggerTrustedReactClick(client, sessionId, settings);
+  await dynamicSleep(TIMING.LONG, signal);
+  return { ok: true, text: btnState.text || "Criar", ...result };
+}
+
+const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
+const MAX_VIDEO_BYTES = 512 * 1024 * 1024;
+const FLOW_INTERNAL_CONTEXT = Symbol("flowInternalContext");
+const DEFAULT_PORT = 9333;
+const PROFILE_SETUP_WAIT_MS = Number.POSITIVE_INFINITY;
+const EXTENSION_BRIDGE_ID = "com.contentflow.browser-bridge";
+const EXTENSION_PROTOCOL_VERSION = 2;
+const EXTENSION_PROTOCOL_RANGE = Object.freeze({ min: 2, max: 2 });
+const EXTENSION_REQUIRED_CAPABILITIES = Object.freeze([
+  "idempotent-replay.v1",
+  "lifecycle-events.v1",
+  "snapshot.v1",
+  "condition-observer.v1",
+  "reload.v1",
+]);
+const EXTENSION_EFFECTFUL_ACTIONS = new Set([
+  "click",
+  "clickGenerate",
+  "pressEnter",
+  "setFiles",
+  "reload",
+]);
+const IMAGE_MODELS = Object.freeze({
+  flow_auto: null,
+  nano_banana_2: "NARWHAL",
+  nano_banana_2_lite: "HARBOR_SEAL",
+  nano_banana: "GEM_PIX",
+  nano_banana_pro: "GEM_PIX_2",
+});
+const MODEL_LABELS = Object.freeze({
+  flow_auto: "Automático do Flow",
+  nano_banana_2: "Nano Banana 2",
+  nano_banana_2_lite: "Nano Banana 2 Lite",
+  nano_banana: "Nano Banana",
+  nano_banana_pro: "Nano Banana Pro",
+});
+const IMAGE_MODEL_FALLBACK_ORDER = Object.freeze([
+  "nano_banana_pro",
+  "nano_banana_2",
+  "nano_banana_2_lite",
+]);
+const VIDEO_MODELS = Object.freeze({
+  veo_3_1_quality: "Veo 3.1 - Quality",
+  veo_3_1_fast: "Veo 3.1 - Fast",
+  veo_3_1_lite: "Veo 3.1 - Lite",
+  omni_1_1_flash: "Omni Flash",
+  veo_3_1_lite_lower_priority: "Veo 3.1 - Lite [Lower Priority]",
+});
+const VIDEO_MODEL_LABELS = Object.freeze({
+  veo_3_1_quality: "Veo 3.1 - Quality",
+  veo_3_1_fast: "Veo 3.1 - Fast",
+  veo_3_1_lite: "Veo 3.1 - Lite",
+  omni_1_1_flash: "Omni Flash",
+  veo_3_1_lite_lower_priority: "Veo 3.1 - Lite [Lower Priority]",
+});
+const FLOW_ATTACHED_REFERENCE_SELECTOR = [
+  "flow-base-prompt-box flow-ingredient-chip",
+  "flow-base-prompt-box flow-image-ingredient-chip",
+  "flow-base-prompt-box flow-audio-ingredient-chip",
+  "flow-base-prompt-box .frame-trigger img",
+  "flow-ingredient-bar flow-ingredient-chip",
+  "flow-ingredient-bar flow-image-ingredient-chip",
+  "flow-ingredient-bar flow-audio-ingredient-chip",
+].join(", ");
+const FLOW_MODEL_VALUE_PREFIX = "flow_label:";
+const FLOW_MEDIA_MESSAGES = Object.freeze({
+  "pt-BR": {
+    imageMime: (mime) => `MIME inesperado: ${mime}`,
+    imageTooLarge: "Imagem excede 25 MB.",
+    imageInvalidSize: "Imagem vazia ou maior que 25 MB.",
+    imageLengthMismatch: "O tamanho declarado da imagem não corresponde aos bytes recebidos.",
+    imageInvalidSignature:
+      "O download do Flow declarou imagem, mas os bytes não têm assinatura JPEG, PNG ou WebP válida.",
+    imageMimeMismatch: (mime) =>
+      `O MIME ${mime} não corresponde à assinatura binária do arquivo baixado.`,
+    videoMime: (mime) => `MIME inesperado: ${mime}`,
+    videoTooLarge: "Vídeo excede 512 MB.",
+    videoInvalidSize: "Vídeo vazio, truncado ou maior que 512 MB.",
+    videoLengthMismatch: "O tamanho declarado do vídeo não corresponde aos bytes recebidos.",
+    videoInvalidSignature:
+      "O download do Flow declarou vídeo MP4, mas os bytes não têm assinatura compatível.",
+    reconciled: (position) =>
+      `Prompt ${position}: efeito externo reconciliado no projeto sem novo envio.`,
+    generationNotConfirmed:
+      "O botão de geração recebeu o clique, mas o Flow manteve o prompt pronto para envio; nenhuma geração foi confirmada.",
+    videoModeNotConfirmed:
+      "O Flow não confirmou o modo e a duração do vídeo; o prompt não será enviado.",
+    videoModeConfirmed: ({ mode, duration }) =>
+      `Modo de vídeo confirmado: ${mode === "frames" ? "Frames" : "Elementos"}; duração ${duration}s.`,
+    browserVisible: "Janela do Chrome confirmada em modo visível (headless desativado).",
+    continuousInvalidTransition: ({ from, to }) =>
+      `Transição incremental inválida do Flow: ${from} -> ${to}.`,
+    continuousTextItem: "A sessão contínua do Flow recebeu uma unidade sem prompt textual.",
+    continuousAwaitHuman: (kind) =>
+      `O item de ${kind === "video" ? "vídeo" : "imagem"} do Google Flow aguarda intervenção humana antes de uma nova submissão.`,
+    continuousReceiptMissing: (kind) =>
+      `O item de ${kind === "video" ? "vídeo" : "imagem"} já havia sido submetido, mas o recibo local de reconciliação não está disponível.`,
+    continuousReconciling: ({ position, kind }) =>
+      `${kind === "video" ? "Vídeo" : "Prompt"} ${position}: reconciliando a submissão anterior no mesmo projeto antes de qualquer retry.`,
+    continuousCompleted: ({ position, kind }) =>
+      `${kind === "video" ? "Vídeo" : "Prompt"} ${position} concluído no Google Flow.`,
+    continuousSafeRefresh: (position) =>
+      `Prompt ${position}: refresh controlado executado antes do retry seguro.`,
+  },
+  en: {
+    imageMime: (mime) => `Unexpected MIME type: ${mime}`,
+    imageTooLarge: "Image exceeds 25 MB.",
+    imageInvalidSize: "Image is empty or larger than 25 MB.",
+    imageLengthMismatch: "The declared image size does not match the received bytes.",
+    imageInvalidSignature:
+      "Flow declared an image, but the downloaded bytes do not have a valid JPEG, PNG, or WebP signature.",
+    imageMimeMismatch: (mime) => `MIME type ${mime} does not match the downloaded file signature.`,
+    videoMime: (mime) => `Unexpected MIME type: ${mime}`,
+    videoTooLarge: "Video exceeds 512 MB.",
+    videoInvalidSize: "Video is empty, truncated, or larger than 512 MB.",
+    videoLengthMismatch: "The declared video size does not match the received bytes.",
+    videoInvalidSignature:
+      "Flow declared an MP4 video, but the downloaded bytes do not have a compatible signature.",
+    reconciled: (position) =>
+      `Prompt ${position}: external effect reconciled in the project without resubmission.`,
+    generationNotConfirmed:
+      "The generation button was clicked, but Flow kept the prompt ready to submit; no generation was confirmed.",
+    videoModeNotConfirmed:
+      "Flow did not confirm the video mode and duration; the prompt will not be submitted.",
+    videoModeConfirmed: ({ mode, duration }) =>
+      `Video mode confirmed: ${mode === "frames" ? "Frames" : "Elements"}; duration ${duration}s.`,
+    browserVisible: "Chrome window confirmed in visible mode (headless disabled).",
+    continuousInvalidTransition: ({ from, to }) =>
+      `Invalid Flow incremental transition: ${from} -> ${to}.`,
+    continuousTextItem: "The continuous Flow session received a work item without a text prompt.",
+    continuousAwaitHuman: (kind) =>
+      `The Google Flow ${kind === "video" ? "video" : "image"} item requires human intervention before another submission.`,
+    continuousReceiptMissing: (kind) =>
+      `The ${kind === "video" ? "video" : "image"} item was already submitted, but its local reconciliation receipt is unavailable.`,
+    continuousReconciling: ({ position, kind }) =>
+      `${kind === "video" ? "Video" : "Prompt"} ${position}: reconciling the previous submission in the same project before any retry.`,
+    continuousCompleted: ({ position, kind }) =>
+      `${kind === "video" ? "Video" : "Prompt"} ${position} completed in Google Flow.`,
+    continuousSafeRefresh: (position) =>
+      `Prompt ${position}: controlled refresh completed before the safe retry.`,
+  },
+  es: {
+    imageMime: (mime) => `Tipo MIME inesperado: ${mime}`,
+    imageTooLarge: "La imagen supera los 25 MB.",
+    imageInvalidSize: "La imagen está vacía o supera los 25 MB.",
+    imageLengthMismatch: "El tamaño declarado de la imagen no coincide con los bytes recibidos.",
+    imageInvalidSignature:
+      "Flow declaró una imagen, pero los bytes descargados no tienen una firma JPEG, PNG o WebP válida.",
+    imageMimeMismatch: (mime) =>
+      `El tipo MIME ${mime} no coincide con la firma del archivo descargado.`,
+    videoMime: (mime) => `Tipo MIME inesperado: ${mime}`,
+    videoTooLarge: "El vídeo supera los 512 MB.",
+    videoInvalidSize: "El vídeo está vacío, truncado o supera los 512 MB.",
+    videoLengthMismatch: "El tamaño declarado del vídeo no coincide con los bytes recibidos.",
+    videoInvalidSignature:
+      "Flow declaró un vídeo MP4, pero los bytes descargados no tienen una firma compatible.",
+    reconciled: (position) =>
+      `Prompt ${position}: efecto externo reconciliado en el proyecto sin un nuevo envío.`,
+    generationNotConfirmed:
+      "Se hizo clic en el botón de generación, pero Flow mantuvo el prompt listo para enviar; no se confirmó ninguna generación.",
+    videoModeNotConfirmed:
+      "Flow no confirmó el modo ni la duración del vídeo; el prompt no se enviará.",
+    videoModeConfirmed: ({ mode, duration }) =>
+      `Modo de vídeo confirmado: ${mode === "frames" ? "Frames" : "Elementos"}; duración ${duration}s.`,
+    browserVisible: "Ventana de Chrome confirmada en modo visible (headless desactivado).",
+    continuousInvalidTransition: ({ from, to }) =>
+      `Transición incremental inválida de Flow: ${from} -> ${to}.`,
+    continuousTextItem: "La sesión continua de Flow recibió una unidad sin prompt de texto.",
+    continuousAwaitHuman: (kind) =>
+      `El elemento de ${kind === "video" ? "vídeo" : "imagen"} de Google Flow requiere intervención humana antes de otro envío.`,
+    continuousReceiptMissing: (kind) =>
+      `El elemento de ${kind === "video" ? "vídeo" : "imagen"} ya se había enviado, pero su recibo local de reconciliación no está disponible.`,
+    continuousReconciling: ({ position, kind }) =>
+      `${kind === "video" ? "Vídeo" : "Prompt"} ${position}: reconciliando el envío anterior en el mismo proyecto antes de cualquier reintento.`,
+    continuousCompleted: ({ position, kind }) =>
+      `${kind === "video" ? "Vídeo" : "Prompt"} ${position} completado en Google Flow.`,
+    continuousSafeRefresh: (position) =>
+      `Prompt ${position}: actualización controlada completada antes del reintento seguro.`,
+  },
+});
+
+function flowMediaMessage(locale, key, argument) {
+  const language = String(locale || "pt-BR").toLowerCase();
+  const catalog = language.startsWith("en")
+    ? FLOW_MEDIA_MESSAGES.en
+    : language.startsWith("es")
+      ? FLOW_MEDIA_MESSAGES.es
+      : FLOW_MEDIA_MESSAGES["pt-BR"];
+  const message = catalog[key];
+  return typeof message === "function" ? message(argument) : message;
+}
+
+function actionableOutputPort(capabilityId) {
+  if (capabilityId === "generate-images-in-browser") return "images";
+  if (["animate-image-in-browser", "generate-video-in-browser"].includes(capabilityId)) {
+    return "video";
+  }
+  return undefined;
+}
+
+function artifactNamespace(value, fallback = "media") {
+  const namespace = String(value || fallback)
+    .trim()
+    .toLowerCase();
+  return /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(namespace) ? namespace : fallback;
+}
+
+function mediaItemUpdate({ key, variantKey, outputPort, input, value }) {
+  return {
+    key,
+    ...(variantKey ? { variantKey } : {}),
+    outputPort,
+    state: "completed",
+    input,
+    value,
+  };
+}
+
+function mediaItemUpdatesForInvocation(request, updates) {
+  // The Core completes the granted batch unit from this invocation's values.
+  // Incremental keys here would create a second logical unit for the same effect.
+  return isCoreItemInvocation(request) ? undefined : updates;
+}
+
+function generationFailureRecovery(cause, awaitingAnimation) {
+  if (cause?.recovery?.externalEffect === "possible" || cause?.externalEffectUncertain || cause?.code === "COMMAND_OUTCOME_UNKNOWN" || awaitingAnimation) {
+    return { externalEffect: "possible", stage: "awaiting_result" };
+  }
+  return undefined;
+}
+
+function singleAnimationResult(media, locale) {
+  if (!Array.isArray(media) || media.length !== 1 || !media[0]?.video?.fifeUrl) {
+    throw Object.assign(codedError("OUTPUT_VALIDATION_FAILED", referenceMessage(locale, "animationAmbiguous")), { externalEffectUncertain: true });
+  }
+  return media[0];
+}
+
+function mediaItemUpdatesForPrompt({ continuous, index, outputPort, input, value }) {
+  if (continuous) return undefined;
+  return value.map((result, variantIndex) =>
+    mediaItemUpdate({
+      key: `prompt:${index}`,
+      variantKey: `image:${variantIndex}`,
+      outputPort,
+      input,
+      value: result.file,
+    }),
+  );
+}
+const VIDEO_RESOLUTIONS = Object.freeze({
+  flow_current: null,
+  res_720p: "720p",
+  res_1080p: "1080p",
+});
+const ASPECT_RATIOS = Object.freeze({
+  flow_current: null,
+  landscape: "IMAGE_ASPECT_RATIO_LANDSCAPE",
+  portrait: "IMAGE_ASPECT_RATIO_PORTRAIT",
+  square: "IMAGE_ASPECT_RATIO_SQUARE",
+});
+const ASPECT_RATIO_LABELS = Object.freeze({
+  flow_current: null,
+  landscape: "16:9",
+  portrait: "9:16",
+  square: "1:1",
+});
+
+function resultError(code, message, retryable = false, retryAfterMs) {
+  const out = { status: "error", code, message, retryable };
+  if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) out.retryAfterMs = retryAfterMs;
+  return out;
+}
+
+function normalizeFlowModelLabel(value) {
+  const label = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!label || label.length > 120 || /[\u0000-\u001f\u007f]/.test(label)) {
+    throw codedError("OUTPUT_VALIDATION_FAILED", "O Flow devolveu um rótulo de modelo inválido.");
+  }
+  return label;
+}
+
+function modelLabelMap(type) {
+  return type === "video" ? VIDEO_MODEL_LABELS : MODEL_LABELS;
+}
+
+function dynamicFlowModelLabel(value, type) {
+  const key = String(value ?? "");
+  if (Object.hasOwn(modelLabelMap(type), key)) return modelLabelMap(type)[key];
+  if (!key.startsWith(FLOW_MODEL_VALUE_PREFIX)) return null;
+  const encoded = key.slice(FLOW_MODEL_VALUE_PREFIX.length);
+  if (!/^[A-Za-z0-9_-]{2,180}$/.test(encoded)) return null;
+  try {
+    return normalizeFlowModelLabel(Buffer.from(encoded, "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function codedError(code, message, retryable = false) {
+  const err = new Error(message);
+  err.code = code;
+  err.retryable = retryable;
+  return err;
+}
+
+function sleep(ms, signal) {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(codedError("CANCELLED", "Execução cancelada."));
+    const timer = setTimeout(done, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(codedError("CANCELLED", "Execução cancelada."));
+    };
+    function done() {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function normalizePrompts(value, format = "plain", locale) {
+  const out = [];
+  const visit = (item) => {
+    if (typeof item === "string") {
+      const text = item.trim();
+      if (text && format === "json") {
+        const parsed = parseFlowTextItem(text, locale);
+        out.push(parsed.prompt);
+      } else if (text) out.push(text);
+      return;
+    }
+    if (Array.isArray(item)) for (const nested of item) visit(nested);
+    else if (item && typeof item === "object") {
+      visit(item.visual_prompt ?? item.prompt ?? item.description);
+    }
+  };
+  visit(value);
+  return out;
+}
+
+function safeFilename(text, fallback) {
+  const stem = String(text ?? "")
+    .normalize("NFKD")
+    .replace(/[^\p{L}\p{N}\s_-]+/gu, "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 72);
+  return stem || fallback;
+}
+
+function isFlowHost(hostname) {
+  return FLOW_HOSTS.has(String(hostname || "").toLowerCase());
+}
+
+function isFlowProjectPath(pathname) {
+  return (
+    /^\/project\//i.test(String(pathname || "")) ||
+    /\/tools\/flow\/project\//i.test(String(pathname || ""))
+  );
+}
+
+function isFlowUrl(raw, requireProject = false) {
+  try {
+    const url = new URL(raw);
+    return (
+      url.protocol === "https:" &&
+      isFlowHost(url.hostname) &&
+      (!requireProject || isFlowProjectPath(url.pathname))
+    );
+  } catch {
+    return false;
+  }
+}
+
+function validateFlowUrl(raw) {
+  const url = new URL(raw);
+  if (!isFlowUrl(url.toString(), true)) {
+    throw codedError(
+      "INVALID_CONFIGURATION",
+      "flowUrl precisa apontar para um projeto em https://flow.google.com/project/...",
+    );
+  }
+  return url.toString();
+}
+
+function resolveNavigationTarget(request) {
+  const projectMode = String(request?.configuration?.projectMode || "auto")
+    .trim()
+    .toLowerCase();
+  if (projectMode === "new") {
+    return { url: FLOW_LANDING_URL, pinned: false };
+  }
+
+  const projectInput =
+    typeof request?.inputs?.project_url === "string"
+      ? request.inputs.project_url.trim()
+      : typeof request?.inputs?.flow_url === "string"
+        ? request.inputs.flow_url.trim()
+        : "";
+
+  const projectConfig =
+    typeof request?.configuration?.projectUrl === "string"
+      ? request.configuration.projectUrl.trim()
+      : typeof request?.configuration?.project_url === "string"
+        ? request.configuration.project_url.trim()
+        : "";
+
+  const projectSetting =
+    typeof request?.settings?.flowUrl === "string" ? request.settings.flowUrl.trim() : "";
+
+  if (projectMode === "existing") {
+    const target = projectConfig || projectInput || projectSetting;
+    if (!target || !isFlowUrl(target, true)) {
+      throw codedError(
+        "INVALID_CONFIGURATION",
+        "O modo 'Usar projeto específico' exige uma URL de projeto em https://flow.google.com/project/...",
+      );
+    }
+    return { url: validateFlowUrl(target), pinned: true };
+  }
+
+  const validProjectUrl = [projectConfig, projectInput, projectSetting].find(
+    (item) => item && isFlowUrl(item, true),
+  );
+
+  if (validProjectUrl) {
+    return { url: validateFlowUrl(validProjectUrl), pinned: true };
+  }
+
+  return { url: FLOW_LANDING_URL, pinned: false };
+}
+
+function captchaRetryStatePath(request, services) {
+  if (typeof services?.getWorkspacePath !== "function") return undefined;
+  const key = createHash("sha256")
+    .update(`${request?.executionId || "execution"}:${request?.blockId || "block"}`)
+    .digest("hex")
+    .slice(0, 24);
+  return services.getWorkspacePath(`.flow-captcha-retry-${key}.json`);
+}
+
+async function readCaptchaRetryNavigation(request, services) {
+  const statePath = captchaRetryStatePath(request, services);
+  if (!statePath || Number(request?.attempt) <= 1) return undefined;
+  try {
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    if (
+      state?.executionId !== request.executionId ||
+      state?.blockId !== request.blockId ||
+      state?.failedAttempt !== Number(request.attempt) - 1 ||
+      state?.accountProfile !== String(request?.configuration?.accountProfile || "").trim()
+    ) {
+      return undefined;
+    }
+    if (!state?.projectUrl || !isFlowUrl(state.projectUrl, true)) {
+      return undefined;
+    }
+    return {
+      url: validateFlowUrl(state.projectUrl),
+      pinned: true,
+      captchaRetry: !state.referencesAttached && !state.preparationRetry,
+      referencesAttached: state.referencesAttached === true,
+      captureLabel:
+        typeof state.captureLabel === "string" ? state.captureLabel.slice(0, 300) : undefined,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+async function saveCaptchaRetryNavigation(
+  request,
+  services,
+  projectUrl,
+  referencesAttached = false,
+) {
+  const statePath = captchaRetryStatePath(request, services);
+  if (!statePath || !projectUrl || !isFlowUrl(projectUrl, true)) return;
+  await writeFile(
+    statePath,
+    JSON.stringify({
+      executionId: request.executionId,
+      blockId: request.blockId,
+      failedAttempt: Number(request.attempt),
+      accountProfile: String(request?.configuration?.accountProfile || "").trim(),
+      projectUrl: validateFlowUrl(projectUrl),
+      referencesAttached,
+    }),
+    { encoding: "utf8", flag: "w" },
+  );
+}
+
+async function clearCaptchaRetryNavigation(request, services) {
+  const statePath = captchaRetryStatePath(request, services);
+  if (statePath) await rm(statePath, { force: true }).catch(() => undefined);
+}
+
+function generationCheckpointPath(request, services) {
+  if (typeof services?.getWorkspacePath !== "function") return undefined;
+  const key = createHash("sha256")
+    .update(`${request?.executionId || "execution"}:${request?.blockId || "block"}`)
+    .digest("hex")
+    .slice(0, 24);
+  return services.getWorkspacePath(`.flow-generation-${key}.json`);
+}
+
+function generationCacheDirectory(request, services) {
+  if (typeof services?.getWorkspacePath !== "function") return undefined;
+  const key = createHash("sha256")
+    .update(`${request?.executionId || "execution"}:${request?.blockId || "block"}`)
+    .digest("hex")
+    .slice(0, 24);
+  return services.getWorkspacePath(`.flow-generation-cache-${key}`);
+}
+
+async function findFileRecursively(root, filename) {
+  if (!root || !existsSync(root)) return undefined;
+  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    const candidate = join(root, entry.name);
+    if (entry.isFile() && entry.name === filename) return candidate;
+    if (entry.isDirectory()) {
+      const nested = await findFileRecursively(candidate, filename);
+      if (nested) return nested;
+    }
+  }
+  return undefined;
+}
+
+async function cacheGenerationArtifact(request, services, artifact) {
+  if (!artifact?.source?.path || typeof services?.getOutputPath !== "function") return;
+  const cacheDirectory = generationCacheDirectory(request, services);
+  if (!cacheDirectory) return;
+  const sourcePath = services.getOutputPath(artifact.source.path);
+  if (!existsSync(sourcePath)) return;
+  await mkdir(cacheDirectory, { recursive: true });
+  await copyFile(sourcePath, join(cacheDirectory, artifact.source.path));
+}
+
+async function restoreCheckpointArtifacts(request, services, files) {
+  if (!Array.isArray(files) || files.length === 0) return [];
+  const cacheDirectory = generationCacheDirectory(request, services);
+  const executionOutputRoot =
+    typeof services?.getWorkspacePath === "function"
+      ? services.getWorkspacePath(`.contentflow-output/${request.executionId}`)
+      : undefined;
+  const artifacts = [];
+  for (const file of files) {
+    if (!file?.id || !file?.name || !file?.mimeType) continue;
+    if (typeof services?.getOutputPath === "function") {
+      const targetPath = services.getOutputPath(file.name);
+      if (!existsSync(targetPath)) {
+        const cachedPath = cacheDirectory ? join(cacheDirectory, file.name) : undefined;
+        const sourcePath =
+          cachedPath && existsSync(cachedPath)
+            ? cachedPath
+            : await findFileRecursively(executionOutputRoot, file.name);
+        if (sourcePath) {
+          await copyFile(sourcePath, targetPath).catch(() => undefined);
+        }
+      }
+    }
+    artifacts.push({
+      id: file.id,
+      name: file.name,
+      mimeType: file.mimeType,
+      size: file.size,
+      source: { kind: "path", path: file.name },
+    });
+  }
+  return artifacts;
+}
+
+function durableResumeFiles(request, kind) {
+  const files = Array.isArray(request?.resume?.artifacts) ? request.resume.artifacts : [];
+  return files
+    .filter((file) => {
+      const mimeType = String(file?.mimeType || "").toLowerCase();
+      return kind === "video" ? mimeType.startsWith("video/") : mimeType.startsWith("image/");
+    })
+    .sort((left, right) => {
+      const leftMatch = String(left?.id || left?.name || "").match(/(?:image-|video-|^)(\d{3})/i);
+      const rightMatch = String(right?.id || right?.name || "").match(
+        /(?:image-|video-|^)(\d{3})/i,
+      );
+      return Number(leftMatch?.[1] || 0) - Number(rightMatch?.[1] || 0);
+    });
+}
+
+function durableResumeOutputFiles(request, portKey, kind) {
+  const field = (request?.outputContract ?? []).find((item) => item?.portKey === portKey);
+  const mappedKey = field?.key;
+  const mappedValue = mappedKey ? request?.resume?.values?.[mappedKey] : undefined;
+  const candidates = normalizeReferenceImages(mappedValue);
+  const typed = candidates.filter((file) => {
+    const mimeType = String(file?.mimeType || "").toLowerCase();
+    return kind === "video" ? mimeType.startsWith("video/") : mimeType.startsWith("image/");
+  });
+  return typed.length > 0 ? typed : durableResumeFiles(request, kind);
+}
+
+function promptIndexFromGeneratedFile(file, kind) {
+  const prefix = kind === "video" ? "google-flow-video-" : "google-flow-image-";
+  const id = String(file?.id || "");
+  if (id.startsWith(prefix)) {
+    const ordinal = Number(id.slice(prefix.length).match(/^\d+/)?.[0]);
+    if (Number.isInteger(ordinal) && ordinal > 0) return ordinal - 1;
+  }
+  const ordinal = Number(String(file?.name || "").match(/^(\d{3})_/)?.[1]);
+  return Number.isInteger(ordinal) && ordinal > 0 ? ordinal - 1 : undefined;
+}
+
+function sortGeneratedOutputs(items, kind = "image") {
+  return items.sort((left, right) => {
+    const promptDifference =
+      (promptIndexFromGeneratedFile(left, kind) ?? Number.MAX_SAFE_INTEGER) -
+      (promptIndexFromGeneratedFile(right, kind) ?? Number.MAX_SAFE_INTEGER);
+    if (promptDifference !== 0) return promptDifference;
+    const leftVariant = Number(String(left?.id || left?.name || "").match(/-v(\d+)/i)?.[1] || 0);
+    const rightVariant = Number(String(right?.id || right?.name || "").match(/-v(\d+)/i)?.[1] || 0);
+    return leftVariant - rightVariant;
+  });
+}
+
+function generationPromptDigest(prompts) {
+  return createHash("sha256").update(JSON.stringify(prompts)).digest("hex");
+}
+
+async function readGenerationCheckpoint(request, services, prompts) {
+  const statePath = generationCheckpointPath(request, services);
+  if (!statePath) return undefined;
+  try {
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    if (
+      state?.executionId !== request.executionId ||
+      state?.blockId !== request.blockId ||
+      (state?.capabilityId
+        ? state.capabilityId !== request.capabilityId
+        : request.capabilityId !== "generate-images-in-browser") ||
+      state?.promptDigest !== generationPromptDigest(prompts) ||
+      !Array.isArray(state.completedPromptIndexes) ||
+      !Array.isArray(state.files)
+    ) {
+      return undefined;
+    }
+    return state;
+  } catch {
+    return undefined;
+  }
+}
+
+async function saveGenerationCheckpoint(request, services, prompts, state) {
+  const statePath = generationCheckpointPath(request, services);
+  if (!statePath) return;
+  await writeFile(
+    statePath,
+    JSON.stringify({
+      executionId: request.executionId,
+      blockId: request.blockId,
+      capabilityId: request.capabilityId,
+      promptDigest: generationPromptDigest(prompts),
+      completedPromptIndexes: [...new Set(state.completedPromptIndexes)].sort((a, b) => a - b),
+      files: state.files,
+      accountProfile: state.accountProfile,
+      projectUrl:
+        state.projectUrl && isFlowUrl(state.projectUrl, true)
+          ? validateFlowUrl(state.projectUrl)
+          : undefined,
+      updatedAt: new Date().toISOString(),
+    }),
+    { encoding: "utf8", flag: "w" },
+  );
+}
+
+async function clearGenerationCheckpoint(request, services) {
+  const statePath = generationCheckpointPath(request, services);
+  if (statePath) await rm(statePath, { force: true }).catch(() => undefined);
+  const cacheDirectory = generationCacheDirectory(request, services);
+  if (cacheDirectory)
+    await rm(cacheDirectory, { recursive: true, force: true }).catch(() => undefined);
+}
+
+function defaultProfilePath() {
+  return join(homedir(), ".contentflow", "google-flow-chrome-profile");
+}
+
+function defaultProfilesRootPath() {
+  return join(homedir(), ".contentflow", "google-flow-chrome-profiles");
+}
+
+function normalizeAccountProfile(value) {
+  const profile = String(value || "default").trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$/.test(profile)) {
+    throw codedError(
+      "INVALID_CONFIGURATION",
+      "accountProfile deve usar 1 a 48 caracteres: letras, números, _ ou -.",
+    );
+  }
+  return profile;
+}
+
+function stableProfileOffset(profile) {
+  const digest = createHash("sha256").update(profile).digest();
+  return 1 + (digest.readUInt16BE(0) % 400);
+}
+
+function profileReadinessFile(accountProfile) {
+  const digest = createHash("sha256").update(accountProfile).digest("hex").slice(0, 16);
+  return `.contentflow-flow-profile-ready-${digest}.json`;
+}
+
+function resolveProfileRuntime(request, services) {
+  const settings = request?.settings ?? {};
+  const accountProfile = normalizeAccountProfile(request?.configuration?.accountProfile);
+  const basePort = Number.isInteger(settings.remoteDebuggingPort)
+    ? settings.remoteDebuggingPort
+    : DEFAULT_PORT;
+  if (basePort < 1024 || basePort > 65134) {
+    throw codedError(
+      "INVALID_CONFIGURATION",
+      "remoteDebuggingPort deve ficar entre 1024 e 65134 para permitir perfis adicionais.",
+    );
+  }
+  if (typeof services?.getProfilePath === "function") {
+    const profilePath = services.getProfilePath(".");
+    return {
+      accountProfile,
+      profilePath,
+      readinessPath:
+        typeof services?.getWorkspacePath === "function"
+          ? services.getWorkspacePath(profileReadinessFile(accountProfile))
+          : profileMarkerPath(profilePath),
+      legacyReadinessPath: profileMarkerPath(profilePath),
+      port: basePort + (accountProfile === "default" ? 0 : stableProfileOffset(accountProfile)),
+    };
+  }
+  if (accountProfile === "default") {
+    const profilePath =
+      settings.profilePath?.trim?.() ||
+      (services ? services.getWorkspacePath(".") : defaultProfilePath());
+    return {
+      accountProfile,
+      profilePath,
+      readinessPath: profileMarkerPath(profilePath),
+      port: basePort,
+    };
+  }
+  const root = settings.profilesRootPath?.trim?.();
+  const profilePath =
+    root || !services
+      ? join(root || defaultProfilesRootPath(), accountProfile)
+      : services.getWorkspacePath(accountProfile);
+  return {
+    accountProfile,
+    profilePath,
+    readinessPath: profileMarkerPath(profilePath),
+    port: basePort + stableProfileOffset(accountProfile),
+  };
+}
+function profileMarkerPath(path) {
+  return join(path, ".contentflow-profile-ready.json");
+}
+function profileReadinessPaths(runtimeOrPath) {
+  if (typeof runtimeOrPath === "string") return [profileMarkerPath(runtimeOrPath)];
+  return [runtimeOrPath?.readinessPath, runtimeOrPath?.legacyReadinessPath].filter(
+    (value, index, values) => value && values.indexOf(value) === index,
+  );
+}
+async function profileIsPrepared(runtimeOrPath, name) {
+  for (const readinessPath of profileReadinessPaths(runtimeOrPath)) {
+    try {
+      const marker = JSON.parse(await readFile(readinessPath, "utf8"));
+      if (
+        marker?.provider === FLOW_HOST &&
+        marker?.profile === name &&
+        marker?.extensionProtocol === EXTENSION_PROTOCOL_VERSION
+      ) {
+        return true;
+      }
+    } catch {}
+  }
+  return false;
+}
+async function markProfilePrepared(runtimeOrPath, name, extensionIdentity) {
+  const [readinessPath] = profileReadinessPaths(runtimeOrPath);
+  if (!readinessPath) {
+    throw codedError("INVALID_CONFIGURATION", "Não foi possível resolver o readiness do perfil.");
+  }
+  await writeFile(
+    readinessPath,
+    JSON.stringify({
+      provider: FLOW_HOST,
+      profile: name,
+      extensionProtocol: EXTENSION_PROTOCOL_VERSION,
+      extensionVersion: extensionIdentity?.extensionVersion || "unknown",
+      preparedAt: new Date().toISOString(),
+    }),
+    "utf8",
+  );
+}
+
+function resolveGenerationPreferences(configuration = {}) {
+  const requestedModelKey = configuration.imageModel || "flow_auto";
+  const aspectRatioKey = configuration.aspectRatio || "flow_current";
+  const discoveredModelLabel = Object.hasOwn(IMAGE_MODELS, requestedModelKey)
+    ? null
+    : dynamicFlowModelLabel(requestedModelKey, "image");
+  if (!Object.hasOwn(IMAGE_MODELS, requestedModelKey) && !discoveredModelLabel) {
+    throw codedError("INVALID_CONFIGURATION", "imageModel não é reconhecido.");
+  }
+  if (!Object.hasOwn(ASPECT_RATIOS, aspectRatioKey)) {
+    throw codedError("INVALID_CONFIGURATION", "aspectRatio não é reconhecido.");
+  }
+  const modelKey =
+    requestedModelKey === "flow_auto"
+      ? "nano_banana_pro"
+      : Object.hasOwn(IMAGE_MODELS, requestedModelKey)
+        ? requestedModelKey
+        : null;
+  const customModelLabel = String(configuration.imageModelLabel || "").trim();
+  return {
+    requestedModelKey,
+    modelKey,
+    imageModelName: modelKey ? IMAGE_MODELS[modelKey] : null,
+    imageModelLabel:
+      customModelLabel || discoveredModelLabel || MODEL_LABELS[requestedModelKey] || null,
+    aspectRatioKey,
+    imageAspectRatio: ASPECT_RATIOS[aspectRatioKey],
+    // "flow_auto" is the automatic Pro -> 2 -> 2 Lite chain by definition.
+    // Older Method snapshots may contain fallbackOnModelLimit=false from the
+    // previous schema default, so that stale flag must not disable auto mode.
+    // A custom visible Flow label has no known fallback chain and therefore
+    // remains isolated from the preset model sequence.
+    fallbackOnModelLimit:
+      !customModelLabel &&
+      (requestedModelKey === "flow_auto" || configuration.fallbackOnModelLimit !== false),
+  };
+}
+
+function visualProductionCheckpointPath(request, services) {
+  if (typeof services?.getWorkspacePath !== "function") return undefined;
+  const key = createHash("sha256")
+    .update(`${request?.executionId || "execution"}:${request?.blockId || "block"}`)
+    .digest("hex")
+    .slice(0, 24);
+  return services.getWorkspacePath(`.flow-visual-production-${key}.json`);
+}
+
+function visualProductionDigest({ prompts, characterPrompts, animationPrompts, configuration }) {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        prompts,
+        characterPrompts,
+        animationPrompts,
+        productionMode: configuration.productionMode ?? "images_only",
+        animationSelection: configuration.animationSelection,
+        animationIndexes: configuration.animationIndexes,
+        maxVideosToAnimate: configuration.maxVideosToAnimate,
+        imageRetention: configuration.imageRetention,
+        maxCharacterReferences: configuration.maxCharacterReferences,
+        saveCharacterReferences: configuration.saveCharacterReferences,
+        enableCharacterConsistency: configuration.enableCharacterConsistency,
+      }),
+    )
+    .digest("hex");
+}
+
+async function readVisualProductionCheckpoint(request, services, descriptor) {
+  const statePath = visualProductionCheckpointPath(request, services);
+  if (!statePath) return undefined;
+  try {
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    if (
+      state?.executionId !== request.executionId ||
+      state?.blockId !== request.blockId ||
+      state?.digest !== visualProductionDigest(descriptor)
+    ) {
+      return undefined;
+    }
+    return state;
+  } catch {
+    return undefined;
+  }
+}
+
+async function saveVisualProductionCheckpoint(request, services, descriptor, state) {
+  const statePath = visualProductionCheckpointPath(request, services);
+  if (!statePath) return;
+  await writeFile(
+    statePath,
+    JSON.stringify({
+      executionId: request.executionId,
+      blockId: request.blockId,
+      digest: visualProductionDigest(descriptor),
+      characterReferences: state.characterReferences ?? [],
+      images: state.images ?? [],
+      animationResults: state.animationResults ?? [],
+      accountProfile: normalizeAccountProfile(request?.configuration?.accountProfile),
+      projectUrl:
+        state.projectUrl && isFlowUrl(state.projectUrl, true)
+          ? validateFlowUrl(state.projectUrl)
+          : undefined,
+      updatedAt: new Date().toISOString(),
+    }),
+    { encoding: "utf8", flag: "w" },
+  );
+}
+
+async function clearVisualProductionCheckpoint(request, services) {
+  const statePath = visualProductionCheckpointPath(request, services);
+  if (statePath) await rm(statePath, { force: true }).catch(() => undefined);
+}
+
+function isFreshRetryRequest(request) {
+  return Number(request?.attempt ?? 1) > 1 && !request?.[FLOW_INTERNAL_CONTEXT];
+}
+
+function checkpointProjectUrlForProfile(checkpoint, accountProfile) {
+  if (!checkpoint?.projectUrl) return undefined;
+  return checkpoint.accountProfile === normalizeAccountProfile(accountProfile)
+    ? checkpoint.projectUrl
+    : undefined;
+}
+
+function visualProductionProjectUrlForProfile(checkpoint, accountProfile, inputProjectUrl) {
+  if (checkpoint) return checkpointProjectUrlForProfile(checkpoint, accountProfile);
+  return inputProjectUrl && isFlowUrl(inputProjectUrl, true)
+    ? validateFlowUrl(inputProjectUrl)
+    : undefined;
+}
+
+function nextImageModelFallback(modelKey) {
+  if (!modelKey || modelKey === "flow_auto" || modelKey === "nano_banana_pro") {
+    return "nano_banana_2";
+  }
+  const index = IMAGE_MODEL_FALLBACK_ORDER.indexOf(modelKey);
+  return index >= 0 ? IMAGE_MODEL_FALLBACK_ORDER[index + 1] || null : null;
+}
+
+function normalizeReferenceImages(value) {
+  const out = [];
+  const visit = (item) => {
+    if (!item) return;
+    if (Array.isArray(item)) {
+      for (const nested of item) visit(nested);
+      return;
+    }
+    if (typeof item === "object") out.push(item);
+  };
+  visit(value);
+  return out;
+}
+
+const flowTextMessages = {
+  "Invalid Flow JSON text item.": [
+    "Texto JSON inválido para o Flow.",
+    "Texto JSON inválido para Flow.",
+  ],
+  "Flow JSON requires a prompt and optional referenceItemIds array.": [
+    "O texto JSON exige prompt e uma lista opcional referenceItemIds.",
+    "El texto JSON requiere prompt y una lista opcional referenceItemIds.",
+  ],
+  "Per-prompt references require referenceItemIds, including [] for no references.": [
+    "Cada cena exige referenceItemIds; use [] quando não houver referências.",
+    "Cada escena requiere referenceItemIds; use [] cuando no haya referencias.",
+  ],
+  "A requested reference ID has no image with preserved provenance.": [
+    "Um ID solicitado não possui imagem com proveniência preservada.",
+    "Un ID solicitado no tiene imagen con procedencia preservada.",
+  ],
+  "Per-prompt references require JSON prompts.": [
+    "Referências por cena exigem prompts em texto JSON.",
+    "Las referencias por escena requieren prompts en texto JSON.",
+  ],
+  "Per-prompt references require canonical prompt items.": [
+    "Referências por cena exigem prompts com IDs canônicos.",
+    "Las referencias por escena requieren prompts con IDs canónicos.",
+  ],
+  "The scene exceeds the configured reference limit.": [
+    "A cena excede o limite de referências configurado.",
+    "La escena supera el límite de referencias configurado.",
+  ],
+};
+function flowTextMessage(locale, message) {
+  const language = String(locale ?? "pt-BR");
+  return language.startsWith("en")
+    ? message
+    : (flowTextMessages[message]?.[language.startsWith("es") ? 1 : 0] ?? message);
+}
+
+function parseFlowTextItem(value, locale) {
+  let item;
+  try {
+    item = JSON.parse(value);
+  } catch {
+    throw codedError("INVALID_INPUT", flowTextMessage(locale, "Invalid Flow JSON text item."));
+  }
+  if (
+    !item ||
+    typeof item.prompt !== "string" ||
+    !item.prompt.trim() ||
+    (item.referenceItemIds !== undefined &&
+      (!Array.isArray(item.referenceItemIds) ||
+        item.referenceItemIds.some((id) => typeof id !== "string" || !id.trim())))
+  )
+    throw codedError(
+      "INVALID_INPUT",
+      flowTextMessage(locale, "Flow JSON requires a prompt and optional referenceItemIds array."),
+    );
+  return item;
+}
+
+function referenceImagesForSourceItem(request, sourceItemId) {
+  if (request?.configuration?.referenceMode === "per_prompt") {
+    const deliveries = request.inputDeliveries ?? [];
+    const source = deliveries
+      .filter((delivery) => ["prompts", "prompt"].includes(delivery.portKey))
+      .flatMap((delivery) => delivery.items ?? [])
+      .find((item) => item.id === sourceItemId);
+    if (!sourceItemId && !request.batch) return [];
+    const raw = source?.value ?? request.inputs?.prompts ?? request.inputs?.prompt;
+    const item = parseFlowTextItem(
+      Array.isArray(raw) && raw.length === 1 ? raw[0] : raw,
+      request?.context?.locale,
+    );
+    if (!Array.isArray(item.referenceItemIds))
+      throw codedError(
+        "INVALID_INPUT",
+        flowTextMessage(
+          request?.context?.locale,
+          "Per-prompt references require referenceItemIds, including [] for no references.",
+        ),
+      );
+    const images = deliveries
+      .filter((delivery) => ["reference_images", "reference_image"].includes(delivery.portKey))
+      .flatMap((delivery) => delivery.items ?? []);
+    const selected = new Map();
+    for (const id of new Set(item.referenceItemIds)) {
+      const matches = images.filter(
+        (image) =>
+          image.id === id ||
+          image.references?.some((ref) => ref.role === "derived_from" && ref.itemId === id),
+      );
+      if (!matches.length)
+        throw codedError(
+          "INVALID_INPUT",
+          flowTextMessage(
+            request?.context?.locale,
+            "A requested reference ID has no image with preserved provenance.",
+          ),
+        );
+      for (const image of matches) selected.set(image.id, image.value);
+    }
+    return normalizeReferenceImages([...selected.values()]);
+  }
+  const fallback = normalizeReferenceImages([
+    request?.inputs?.reference_images,
+    request?.inputs?.reference_image,
+  ]);
+  if (!sourceItemId) return fallback;
+  const deliveries = request?.inputDeliveries ?? [];
+  const relations = deliveries.find((delivery) => delivery.portKey === "item_relations");
+  const references = deliveries.find((delivery) => delivery.portKey === "reference_images");
+  if (!relations?.items?.length || !references?.items?.length) return fallback;
+
+  const relatedRecordIds = new Set(
+    relations.items
+      .filter((item) => item.references?.some((reference) => reference.itemId === sourceItemId))
+      .map((item) => item.id),
+  );
+  if (relatedRecordIds.size === 0) return [];
+  const matchedCharacterIds = new Set();
+  const matchedReferences = references.items.filter((item) => {
+    const derived = item.references?.filter((reference) => reference.role === "derived_from") ?? [];
+    const matches = derived.filter((reference) => relatedRecordIds.has(reference.itemId));
+    for (const reference of matches) matchedCharacterIds.add(reference.itemId);
+    return matches.length > 0;
+  });
+  if (matchedCharacterIds.size !== relatedRecordIds.size) {
+    throw codedError(
+      "INVALID_INPUT",
+      `A cena possui ${relatedRecordIds.size} personagem(ns) relacionado(s), mas somente ${matchedCharacterIds.size} possui(em) imagem de referência com linhagem preservada.`,
+    );
+  }
+  return normalizeReferenceImages(matchedReferences.map((item) => item.value));
+}
+
+function referenceImagesForCurrentItem(request) {
+  const references = referenceImagesForSourceItem(request, request?.batch?.sourceItemId);
+  if (request?.capabilityId === "animate-image-in-browser" && references.length === 0)
+    return normalizeReferenceImages(request?.inputs?.images ?? request?.inputs?.image);
+  return references;
+}
+
+function requestsSingleImage(request) {
+  return (request?.outputContract ?? []).some(
+    (field) =>
+      field?.portKey === "image" ||
+      (field?.portKey === "images" &&
+        (field?.type === "image" ||
+          (field?.shape?.kind === "content" &&
+            field?.shape?.family === "image" &&
+            field?.shape?.cardinality === "one"))),
+  );
+}
+
+function imageOutputValues(request, files, projectUrl) {
+  return {
+    ...(requestsSingleImage(request) ? { image: files[0] } : { images: files }),
+    ...(projectUrl ? { project_url: projectUrl } : {}),
+  };
+}
+
+function requestsSingleVideo(request) {
+  return (request?.outputContract ?? []).some(
+    (field) => field?.portKey === "video" && field?.type === "video",
+  );
+}
+
+function selectAnimationIndexes(total, configuration = {}) {
+  const requested = Number.isInteger(configuration.maxVideosToAnimate)
+    ? configuration.maxVideosToAnimate
+    : 0;
+  const limit = Math.min(Math.max(requested, 0), total);
+  if (limit === 0 || total === 0) return [];
+
+  const strategy = String(configuration.animationSelection ?? "first");
+  if (strategy === "manual_indexes") {
+    const selected = new Set();
+    for (const token of String(configuration.animationIndexes ?? "").split(/[,;\s]+/)) {
+      const range = token.match(/^(\d+)-(\d+)$/);
+      if (range) {
+        const start = Number(range[1]);
+        const end = Number(range[2]);
+        for (let index = Math.min(start, end); index <= Math.max(start, end); index += 1) {
+          if (index >= 1 && index <= total) selected.add(index - 1);
+        }
+      } else if (/^\d+$/.test(token)) {
+        const index = Number(token);
+        if (index >= 1 && index <= total) selected.add(index - 1);
+      }
+    }
+    return [...selected].sort((a, b) => a - b).slice(0, limit);
+  }
+  if (strategy === "last")
+    return Array.from({ length: limit }, (_, index) => total - limit + index);
+  if (strategy === "evenly_spaced" && limit > 1) {
+    return [
+      ...new Set(
+        Array.from({ length: limit }, (_, index) =>
+          Math.round((index * (total - 1)) / (limit - 1)),
+        ),
+      ),
+    ];
+  }
+  return Array.from({ length: limit }, (_, index) => index);
+}
+
+function generatedArtifactInputPath(file, artifacts, services) {
+  const artifact = (artifacts ?? []).find(
+    (candidate) => candidate?.id && candidate.id === file?.id && candidate?.source?.kind === "path",
+  );
+  const relativePath = String(artifact?.source?.path || "").trim();
+  return relativePath ? services.getOutputPath(relativePath) : null;
+}
+
+function configurationForProjectContinuation(configuration, projectUrl) {
+  return projectUrl ? { ...configuration, projectMode: "auto", projectUrl: "" } : configuration;
+}
+
+function visualBatchSessionPath(request, services) {
+  if (typeof services?.getWorkspacePath !== "function") return undefined;
+  const key = createHash("sha256")
+    .update(`${request?.executionId || "execution"}:${request?.blockId || "block"}`)
+    .digest("hex")
+    .slice(0, 24);
+  return services.getWorkspacePath(`.flow-visual-batch-${key}.json`);
+}
+
+async function readVisualBatchSession(request, services) {
+  const statePath = visualBatchSessionPath(request, services);
+  if (!statePath) return undefined;
+  try {
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    if (state?.executionId !== request.executionId || state?.blockId !== request.blockId) {
+      return undefined;
+    }
+    return state;
+  } catch {
+    return undefined;
+  }
+}
+
+async function saveVisualBatchProjectUrl(request, services, projectUrl) {
+  if (!projectUrl || !isFlowUrl(projectUrl, true)) return;
+  const statePath = visualBatchSessionPath(request, services);
+  if (!statePath) return;
+  const previous = (await readVisualBatchSession(request, services)) ?? {};
+  const profile = normalizeAccountProfile(request?.configuration?.accountProfile);
+  await writeFile(
+    statePath,
+    JSON.stringify({
+      ...previous,
+      executionId: request.executionId,
+      blockId: request.blockId,
+      projectUrls: {
+        ...(previous.projectUrls && typeof previous.projectUrls === "object"
+          ? previous.projectUrls
+          : {}),
+        [profile]: validateFlowUrl(projectUrl),
+      },
+      updatedAt: new Date().toISOString(),
+    }),
+    { encoding: "utf8", flag: "w" },
+  );
+}
+
+async function saveVisualBatchItemBaseline(request, services, itemId, kind, baselineUrls) {
+  const statePath = visualBatchSessionPath(request, services);
+  if (
+    !statePath ||
+    typeof itemId !== "string" ||
+    !itemId ||
+    !["image", "video"].includes(kind) ||
+    !Array.isArray(baselineUrls)
+  ) {
+    return;
+  }
+  const previous = (await readVisualBatchSession(request, services)) ?? {};
+  await writeFile(
+    statePath,
+    JSON.stringify({
+      ...previous,
+      executionId: request.executionId,
+      blockId: request.blockId,
+      itemBaselines: {
+        ...(previous.itemBaselines && typeof previous.itemBaselines === "object"
+          ? previous.itemBaselines
+          : {}),
+        [itemId]: {
+          kind,
+          urls: baselineUrls.filter((value) => typeof value === "string"),
+          updatedAt: new Date().toISOString(),
+        },
+      },
+      updatedAt: new Date().toISOString(),
+    }),
+    { encoding: "utf8", flag: "w" },
+  );
+}
+
+async function visualBatchItemBaseline(request, services, itemId, kind) {
+  const state = await readVisualBatchSession(request, services);
+  const candidate = state?.itemBaselines?.[itemId];
+  if (candidate?.kind !== kind || !Array.isArray(candidate.urls)) return undefined;
+  return candidate.urls.filter((value) => typeof value === "string");
+}
+
+async function clearVisualBatchItemBaseline(request, services, itemId) {
+  const statePath = visualBatchSessionPath(request, services);
+  if (!statePath) return;
+  const previous = await readVisualBatchSession(request, services);
+  if (!previous?.itemBaselines?.[itemId]) return;
+  const itemBaselines = { ...previous.itemBaselines };
+  delete itemBaselines[itemId];
+  await writeFile(
+    statePath,
+    JSON.stringify({
+      ...previous,
+      itemBaselines,
+      updatedAt: new Date().toISOString(),
+    }),
+    { encoding: "utf8", flag: "w" },
+  );
+}
+
+async function visualBatchProjectUrl(request, services) {
+  const state = await readVisualBatchSession(request, services);
+  const profile = normalizeAccountProfile(request?.configuration?.accountProfile);
+  const saved = state?.projectUrls?.[profile];
+  if (saved && isFlowUrl(saved, true)) return validateFlowUrl(saved);
+  const input = request?.inputs?.project_url;
+  return input && isFlowUrl(input, true) ? validateFlowUrl(input) : undefined;
+}
+
+async function clearVisualBatchSession(request, services) {
+  const statePath = visualBatchSessionPath(request, services);
+  if (statePath) await rm(statePath, { force: true }).catch(() => undefined);
+}
+
+function isCoreItemInvocation(request) {
+  return (
+    typeof request?.batch?.itemId === "string" &&
+    request.batch.itemId.length > 0 &&
+    Number.isInteger(request.batch.index) &&
+    request.batch.index >= 0 &&
+    Number.isInteger(request.batch.total) &&
+    request.batch.total > request.batch.index
+  );
+}
+
+function invocationMediaContext(request) {
+  return {
+    ...(isCoreItemInvocation(request) ? { promptOrdinal: request.batch.index + 1 } : {}),
+    ...(request?.[FLOW_INTERNAL_CONTEXT] ?? {}),
+  };
+}
+
+function keepBrowserForCurrentItem(request, hasFollowUpPhase = false) {
+  if (request?.settings?.keepBrowserOpen === true || hasFollowUpPhase) return true;
+  return isCoreItemInvocation(request) && request.batch.index < request.batch.total - 1;
+}
+
+function visualBatchItemSelection(request, configuration) {
+  if (!isCoreItemInvocation(request)) return [];
+  if (configuration.productionMode === "images_to_video_all") {
+    return Array.from({ length: request.batch.total }, (_, index) => index);
+  }
+  if (configuration.productionMode !== "images_then_selected_videos") return [];
+  return selectAnimationIndexes(request.batch.total, configuration);
+}
+
+function filesForCurrentBatchItem(request, portKey, kind) {
+  if (!isCoreItemInvocation(request)) return [];
+  return durableResumeOutputFiles(request, portKey, kind).filter(
+    (file) => promptIndexFromGeneratedFile(file, kind) === request.batch.index,
+  );
+}
+
+function resumeValueForPort(request, portKey) {
+  const field = (request?.outputContract ?? []).find((item) => item?.portKey === portKey);
+  return request?.resume?.values?.[field?.key ?? portKey];
+}
+
+function remapNestedFailure(result, sourcePort, targetPort, extraValues = {}) {
+  if (result?.status === "success") return result;
+  const sourceValue = result?.partialValues?.[sourcePort] ?? result?.values?.[sourcePort];
+  const projectUrl = result?.partialValues?.project_url ?? result?.values?.project_url;
+  return {
+    ...result,
+    partialValues: {
+      ...extraValues,
+      ...(targetPort && sourceValue !== undefined
+        ? { [targetPort]: normalizeReferenceImages(sourceValue) }
+        : {}),
+      ...(projectUrl ? { project_url: projectUrl } : {}),
+    },
+  };
+}
+
+const FLOW_CONTINUOUS_ITEM_TRANSITIONS = Object.freeze({
+  leased: new Set(["submitted", "failed", "cancelled"]),
+  submitted: new Set(["awaiting_result", "completed", "failed", "awaiting_human"]),
+  awaiting_result: new Set(["submitted", "completed", "failed", "awaiting_human"]),
+  failed: new Set(["submitted", "cancelled"]),
+  awaiting_human: new Set(["submitted", "cancelled"]),
+});
+
+function flowContinuousStateCanRefresh(state, reconciled = false) {
+  return state === "leased" || state === "failed" || (reconciled && state === "awaiting_human");
+}
+
+function createFlowContinuousItemState(claims = [], locale = "pt-BR") {
+  const byItemId = new Map(
+    claims.map((claim) => [
+      claim.itemId,
+      {
+        claim,
+        revision: Number.isInteger(claim.revision) ? claim.revision : 0,
+        state: claim.state === "pending" ? "leased" : claim.state || "leased",
+      },
+    ]),
+  );
+  return {
+    get(itemId) {
+      return byItemId.get(itemId);
+    },
+    async publish(services, itemId, state, extra = {}) {
+      const current = byItemId.get(itemId);
+      if (!current || typeof services?.publishItemUpdate !== "function") return undefined;
+      const allowed = FLOW_CONTINUOUS_ITEM_TRANSITIONS[current.state];
+      if (current.state !== state && allowed && !allowed.has(state)) {
+        throw codedError(
+          "INVALID_CONFIGURATION",
+          flowMediaMessage(locale, "continuousInvalidTransition", {
+            from: current.state,
+            to: state,
+          }),
+        );
+      }
+      const receipt = await services.publishItemUpdate({
+        itemId,
+        expectedRevision: current.revision,
+        state,
+        ...extra,
+      });
+      current.revision = receipt.revision;
+      current.state = state;
+      return receipt;
+    },
+  };
+}
+
+async function claimFlowContinuousItems(request, services) {
+  if (
+    request?.batch !== undefined ||
+    typeof services?.claimItems !== "function" ||
+    typeof services?.publishItemUpdate !== "function"
+  ) {
+    return undefined;
+  }
+  if (
+    request?.capabilityId !== "generate-images-in-browser" &&
+    request?.capabilityId !== "generate-video-in-browser"
+  ) {
+    return undefined;
+  }
+  // A continuous invocation receives the whole collection on the port that
+  // declared the association. Do not assume that port is named `prompts`:
+  // the same capability can be bound to prompt records, animation prompts,
+  // or another collection without changing the plugin's semantics. The
+  // collection size controls how many core-owned work units we claim for this
+  // single browser/project session.
+  const source = normalizePrompts(
+    request?.inputs?.prompts ?? request?.inputs?.prompt ?? request?.inputs?.prompt_records,
+    request?.configuration?.promptFormat,
+    request?.context?.locale,
+  );
+  const claimed = await services.claimItems(Math.max(1, source.length));
+  if (!Array.isArray(claimed) || claimed.length === 0) return [];
+  const normalized = claimed
+    .filter(
+      (item) =>
+        typeof item?.itemId === "string" &&
+        normalizePrompts(
+          item?.input,
+          request?.configuration?.promptFormat,
+          request?.context?.locale,
+        ).length === 1,
+    )
+    .sort((left, right) => left.order - right.order);
+  if (normalized.length !== claimed.length) {
+    throw codedError(
+      "INVALID_INPUT",
+      flowMediaMessage(request?.context?.locale, "continuousTextItem"),
+    );
+  }
+  return normalized;
+}
+
+async function executeVisualProductionItem(request, services) {
+  const prompts = normalizePrompts(request?.inputs?.prompts);
+  if (prompts.length !== 1) {
+    return resultError(
+      "INVALID_INPUT",
+      "A orquestração por item exige exatamente um prompt visual por chamada.",
+    );
+  }
+  const configuration = request?.configuration ?? {};
+  const productionMode = String(configuration.productionMode ?? "images_only");
+  if (
+    ![
+      "images_only",
+      "text_to_video",
+      "images_then_selected_videos",
+      "images_to_video_all",
+    ].includes(productionMode)
+  ) {
+    return resultError("INVALID_CONFIGURATION", "Modo de produção visual inválido.");
+  }
+
+  const batchIndex = request.batch.index;
+  const batchTotal = request.batch.total;
+  const prompt = prompts[0];
+  const animationPrompts = normalizePrompts(request?.inputs?.animation_prompts);
+  const selectedIndexes = visualBatchItemSelection(request, configuration);
+  const shouldAnimate = selectedIndexes.includes(batchIndex);
+  const retainImages = configuration.imageRetention !== "omit_from_final_delivery";
+  const retainCurrentImage =
+    retainImages && (configuration.imageRetention !== "keep_animated_only" || shouldAnimate);
+  const atomicConfiguration = {
+    ...configuration,
+    maxConcurrentGenerations: 1,
+    retryAttempts: 0,
+    rateLimitRetryAttempts: 0,
+  };
+  let activeProjectUrl = await visualBatchProjectUrl(request, services);
+  const logs = [
+    `Produção visual: item ${batchIndex + 1}/${batchTotal} assumido pela orquestração do ContentFlow.`,
+  ];
+  const artifacts = [];
+  const assets = [];
+
+  if (productionMode === "text_to_video") {
+    const videoResult = await execute(
+      {
+        ...request,
+        capabilityId: "generate-video-in-browser",
+        configuration: configurationForProjectContinuation(atomicConfiguration, activeProjectUrl),
+        settings: {
+          ...request?.settings,
+          keepBrowserOpen: keepBrowserForCurrentItem(request),
+        },
+        [FLOW_INTERNAL_CONTEXT]: {
+          artifactNamespace: "video",
+          promptOrdinal: batchIndex + 1,
+        },
+        inputs: {
+          prompts: prompt,
+          reference_images: request?.inputs?.reference_images,
+          project_url: activeProjectUrl,
+        },
+        outputContract: [{ portKey: "video", type: "files" }],
+      },
+      {
+        ...services,
+        publishPartial: async (update) =>
+          await services.publishPartial?.({
+            ...update,
+            values: {
+              videos: normalizeReferenceImages(update.values?.video),
+              ...(update.values?.project_url ? { project_url: update.values.project_url } : {}),
+            },
+            itemUpdates: update.itemUpdates?.map((item) => ({
+              ...item,
+              key: `video:${request.batch.itemId}:${item.key}`,
+              variantKey: item.variantKey
+                ? `video:${request.batch.itemId}:${item.variantKey}`
+                : "video:0",
+              outputPort: item.outputPort === "video" ? "videos" : item.outputPort,
+            })),
+          }),
+      },
+    );
+    if (videoResult.status !== "success") {
+      return remapNestedFailure(videoResult, "video", "videos");
+    }
+    const videos = normalizeReferenceImages(videoResult.values?.video);
+    assets.push(...videos);
+    artifacts.push(...(videoResult.artifacts ?? []));
+    activeProjectUrl = videoResult.values?.project_url ?? activeProjectUrl;
+    await saveVisualBatchProjectUrl(request, services, activeProjectUrl);
+    if (batchIndex === batchTotal - 1) await clearVisualBatchSession(request, services);
+    return {
+      status: "success",
+      values: { assets, project_url: activeProjectUrl },
+      artifacts,
+      usage: { provider: "Google Labs / Flow", outputUnits: videos.length, unit: "video" },
+      logs: [...logs, ...(videoResult.logs ?? [])],
+    };
+  }
+
+  const characterPrompts = normalizePrompts(
+    request?.inputs?.character_prompts ??
+      (configuration.enableCharacterConsistency === true
+        ? configuration.characterPrompts
+        : undefined),
+  );
+  let characterReferences = normalizeReferenceImages(
+    resumeValueForPort(request, "character_references"),
+  );
+  if (characterPrompts.length > 0 && characterReferences.length === 0) {
+    const characterResult = await execute(
+      {
+        ...request,
+        batch: undefined,
+        capabilityId: "generate-images-in-browser",
+        configuration: configurationForProjectContinuation(atomicConfiguration, activeProjectUrl),
+        settings: { ...request?.settings, keepBrowserOpen: true },
+        [FLOW_INTERNAL_CONTEXT]: { artifactNamespace: "character-reference" },
+        inputs: {
+          prompts: characterPrompts,
+          reference_images: request?.inputs?.reference_images,
+          project_url: activeProjectUrl,
+        },
+        outputContract: [{ portKey: "images", type: "files" }],
+      },
+      {
+        ...services,
+        publishPartial: async (update) =>
+          await services.publishPartial?.({
+            ...update,
+            values: {
+              character_references: normalizeReferenceImages(update.values?.images),
+              ...(update.values?.project_url ? { project_url: update.values.project_url } : {}),
+            },
+            itemUpdates: update.itemUpdates?.map((item) => ({
+              ...item,
+              key: `character:${item.key}`,
+              variantKey: item.variantKey ? `character:${item.variantKey}` : "character:image:0",
+              outputPort: item.outputPort === "images" ? "character_references" : item.outputPort,
+            })),
+          }),
+      },
+    );
+    if (characterResult.status !== "success") {
+      return remapNestedFailure(characterResult, "images", "character_references");
+    }
+    const characterLimit = Number.isInteger(configuration.maxCharacterReferences)
+      ? Math.max(1, Math.min(configuration.maxCharacterReferences, 10))
+      : 1;
+    characterReferences = normalizeReferenceImages(characterResult.values?.images).slice(
+      0,
+      characterLimit,
+    );
+    artifacts.push(...(characterResult.artifacts ?? []));
+    activeProjectUrl = characterResult.values?.project_url ?? activeProjectUrl;
+    await saveVisualBatchProjectUrl(request, services, activeProjectUrl);
+    logs.push(...(characterResult.logs ?? []));
+  }
+
+  let images = filesForCurrentBatchItem(request, "images", "image");
+  let imageArtifacts = [];
+  if (images.length === 0) {
+    const imageResult = await execute(
+      {
+        ...request,
+        capabilityId: "generate-images-in-browser",
+        configuration: configurationForProjectContinuation(atomicConfiguration, activeProjectUrl),
+        settings: {
+          ...request?.settings,
+          keepBrowserOpen: keepBrowserForCurrentItem(request, shouldAnimate),
+        },
+        [FLOW_INTERNAL_CONTEXT]: {
+          artifactNamespace: "image",
+          promptOrdinal: batchIndex + 1,
+        },
+        inputs: {
+          prompts: prompt,
+          reference_images: [request?.inputs?.reference_images, characterReferences],
+          project_url: activeProjectUrl,
+        },
+        outputContract: [{ portKey: "images", type: "files" }],
+      },
+      {
+        ...services,
+        publishPartial: async (update) =>
+          await services.publishPartial?.({
+            ...update,
+            values: {
+              ...(retainCurrentImage
+                ? { images: normalizeReferenceImages(update.values?.images) }
+                : {}),
+              ...(update.values?.project_url ? { project_url: update.values.project_url } : {}),
+            },
+            itemUpdates: retainCurrentImage ? update.itemUpdates : undefined,
+          }),
+      },
+    );
+    if (imageResult.status !== "success") {
+      return remapNestedFailure(imageResult, "images", retainCurrentImage ? "images" : undefined);
+    }
+    images = normalizeReferenceImages(imageResult.values?.images);
+    imageArtifacts = imageResult.artifacts ?? [];
+    artifacts.push(...imageArtifacts);
+    activeProjectUrl = imageResult.values?.project_url ?? activeProjectUrl;
+    await saveVisualBatchProjectUrl(request, services, activeProjectUrl);
+    logs.push(...(imageResult.logs ?? []));
+  } else {
+    logs.push(`Produção visual: imagem ${batchIndex + 1} restaurada do estado durável.`);
+  }
+  assets.push(...images);
+
+  if (shouldAnimate) {
+    const animationResult = await execute(
+      {
+        ...request,
+        capabilityId: "animate-image-in-browser",
+        configuration: configurationForProjectContinuation(atomicConfiguration, activeProjectUrl),
+        settings: {
+          ...request?.settings,
+          keepBrowserOpen: keepBrowserForCurrentItem(request),
+        },
+        [FLOW_INTERNAL_CONTEXT]: {
+          artifactNamespace: "animation",
+          promptOrdinal: batchIndex + 1,
+        },
+        inputs: {
+          images: images[0],
+          prompts: animationPrompts[batchIndex] ?? prompt,
+          project_url: activeProjectUrl,
+        },
+        outputContract: [{ portKey: "video", type: "files" }],
+      },
+      {
+        ...services,
+        resolveInputFile: async (file) => {
+          const generatedPath = generatedArtifactInputPath(file, imageArtifacts, services);
+          if (generatedPath) return generatedPath;
+          return await services.resolveInputFile(file);
+        },
+        publishPartial: async (update) =>
+          await services.publishPartial?.({
+            ...update,
+            values: {
+              videos: normalizeReferenceImages(update.values?.video),
+              ...(update.values?.project_url ? { project_url: update.values.project_url } : {}),
+            },
+            itemUpdates: update.itemUpdates?.map((item) => ({
+              ...item,
+              key: `animation:${request.batch.itemId}:${item.key}`,
+              variantKey: item.variantKey
+                ? `animation:${request.batch.itemId}:${item.variantKey}`
+                : "animation:video:0",
+              outputPort: item.outputPort === "video" ? "videos" : item.outputPort,
+            })),
+          }),
+      },
+    );
+    if (animationResult.status !== "success") {
+      return remapNestedFailure(animationResult, "video", "videos");
+    }
+    const videos = normalizeReferenceImages(animationResult.values?.video);
+    assets.push(...videos);
+    artifacts.push(...(animationResult.artifacts ?? []));
+    activeProjectUrl = animationResult.values?.project_url ?? activeProjectUrl;
+    await saveVisualBatchProjectUrl(request, services, activeProjectUrl);
+    logs.push(...(animationResult.logs ?? []));
+  }
+
+  if (batchIndex === batchTotal - 1) await clearVisualBatchSession(request, services);
+  return {
+    status: "success",
+    values: {
+      assets,
+      ...(retainCurrentImage ? { images } : {}),
+      ...(configuration.saveCharacterReferences === true && characterReferences.length > 0
+        ? { character_references: characterReferences }
+        : {}),
+      project_url: activeProjectUrl,
+    },
+    artifacts,
+    usage: { provider: "Google Labs / Flow", outputUnits: assets.length, unit: "visual_asset" },
+    logs,
+  };
+}
+
+async function executeVisualProductionBatch(request, services) {
+  if (isCoreItemInvocation(request)) {
+    return await executeVisualProductionItem(request, services);
+  }
+  const prompts = normalizePrompts(request?.inputs?.prompts);
+  if (prompts.length === 0)
+    return resultError("INVALID_INPUT", "Informe pelo menos um prompt visual.");
+  const configuration = request?.configuration ?? {};
+  const productionMode = String(configuration.productionMode ?? "images_only");
+  if (
+    ![
+      "images_only",
+      "text_to_video",
+      "images_then_selected_videos",
+      "images_to_video_all",
+    ].includes(productionMode)
+  ) {
+    return resultError("INVALID_CONFIGURATION", "Modo de produção visual inválido.");
+  }
+  if (productionMode === "text_to_video") {
+    const videoResult = await execute(
+      {
+        ...request,
+        capabilityId: "generate-video-in-browser",
+        [FLOW_INTERNAL_CONTEXT]: { artifactNamespace: "video" },
+        inputs: {
+          prompts,
+          reference_images: request?.inputs?.reference_images,
+          project_url: request?.inputs?.project_url,
+        },
+        outputContract: [{ portKey: "video", type: "files" }],
+      },
+      {
+        ...services,
+        publishPartial: async (update) =>
+          await services.publishPartial?.({
+            ...update,
+            values: {
+              videos: normalizeReferenceImages(update.values?.video),
+              ...(update.values?.project_url ? { project_url: update.values.project_url } : {}),
+            },
+            itemUpdates: update.itemUpdates?.map((item) => ({
+              ...item,
+              key: `video:${item.key}`,
+              variantKey: item.variantKey ? `video:${item.variantKey}` : "video:0",
+              outputPort: item.outputPort === "video" ? "videos" : item.outputPort,
+            })),
+          }),
+      },
+    );
+    if (videoResult.status !== "success") return videoResult;
+    return {
+      ...videoResult,
+      values: {
+        videos: normalizeReferenceImages(videoResult.values?.video),
+        project_url: videoResult.values?.project_url,
+      },
+      logs: ["Produção visual: modo texto para vídeo.", ...(videoResult.logs ?? [])],
+    };
+  }
+  const characterPrompts = normalizePrompts(
+    request?.inputs?.character_prompts ??
+      (configuration.enableCharacterConsistency === true
+        ? configuration.characterPrompts
+        : undefined),
+  );
+  const animationPrompts = normalizePrompts(request?.inputs?.animation_prompts);
+  const checkpointDescriptor = {
+    prompts,
+    characterPrompts,
+    animationPrompts,
+    configuration,
+  };
+  const productionCheckpoint = await readVisualProductionCheckpoint(
+    request,
+    services,
+    checkpointDescriptor,
+  );
+  const durableImages = durableResumeOutputFiles(request, "images", "image").filter((file) => {
+    const index = promptIndexFromGeneratedFile(file, "image");
+    return Number.isInteger(index) && index >= 0 && index < prompts.length;
+  });
+  let characterReferences = normalizeReferenceImages(productionCheckpoint?.characterReferences);
+  let characterArtifacts = await restoreCheckpointArtifacts(request, services, characterReferences);
+  const checkpointProjectUrl = visualProductionProjectUrlForProfile(
+    productionCheckpoint,
+    configuration.accountProfile,
+    request?.inputs?.project_url,
+  );
+  let activeProjectUrl = checkpointProjectUrl;
+  if (characterPrompts.length > 0 && characterReferences.length === 0) {
+    const characterResult = await execute(
+      {
+        ...request,
+        capabilityId: "generate-images-in-browser",
+        configuration: configurationForProjectContinuation(configuration, activeProjectUrl),
+        settings: { ...request?.settings, keepBrowserOpen: true },
+        [FLOW_INTERNAL_CONTEXT]: { artifactNamespace: "character-reference" },
+        inputs: {
+          prompts: characterPrompts,
+          reference_images: request?.inputs?.reference_images,
+          project_url: activeProjectUrl,
+        },
+        outputContract: [{ portKey: "images", type: "files" }],
+      },
+      {
+        ...services,
+        publishPartial: async (update) =>
+          await services.publishPartial?.({
+            ...update,
+            values: {
+              character_references: normalizeReferenceImages(update.values?.images),
+              ...(update.values?.project_url ? { project_url: update.values.project_url } : {}),
+            },
+            itemUpdates: update.itemUpdates?.map((item) => ({
+              ...item,
+              key: `character:${item.key}`,
+              variantKey: item.variantKey ? `character:${item.variantKey}` : "character:image:0",
+              outputPort: item.outputPort === "images" ? "character_references" : item.outputPort,
+            })),
+          }),
+      },
+    );
+    if (characterResult.status !== "success") return characterResult;
+    const characterLimit = Number.isInteger(configuration.maxCharacterReferences)
+      ? Math.max(1, Math.min(configuration.maxCharacterReferences, 10))
+      : 1;
+    characterReferences = normalizeReferenceImages(characterResult.values?.images).slice(
+      0,
+      characterLimit,
+    );
+    const characterIds = new Set(characterReferences.map((image) => image?.id).filter(Boolean));
+    characterArtifacts = (characterResult.artifacts ?? []).filter((artifact) =>
+      characterIds.has(artifact?.id),
+    );
+    activeProjectUrl = characterResult.values?.project_url ?? activeProjectUrl;
+    await saveVisualProductionCheckpoint(request, services, checkpointDescriptor, {
+      characterReferences,
+      images: productionCheckpoint?.images,
+      animationResults: productionCheckpoint?.animationResults,
+      projectUrl: activeProjectUrl,
+    });
+  } else if (characterReferences.length > 0) {
+    characterReferences = characterReferences.slice(
+      0,
+      Number.isInteger(configuration.maxCharacterReferences)
+        ? Math.max(1, Math.min(configuration.maxCharacterReferences, 10))
+        : 1,
+    );
+  }
+  let images =
+    durableImages.length > 0
+      ? durableImages
+      : normalizeReferenceImages(productionCheckpoint?.images);
+  let imageArtifacts =
+    durableImages.length > 0 ? [] : await restoreCheckpointArtifacts(request, services, images);
+  let imageLogs = [];
+  if (images.length < prompts.length) {
+    const imageRequest = {
+      ...request,
+      capabilityId: "generate-images-in-browser",
+      configuration: configurationForProjectContinuation(configuration, activeProjectUrl),
+      settings: {
+        ...request?.settings,
+        keepBrowserOpen: productionMode !== "images_only" || request?.settings?.keepBrowserOpen,
+      },
+      [FLOW_INTERNAL_CONTEXT]: { artifactNamespace: "image" },
+      inputs: {
+        prompts,
+        reference_images: [request?.inputs?.reference_images, characterReferences],
+        project_url: activeProjectUrl,
+      },
+      outputContract: [{ portKey: "images", type: "files" }],
+    };
+    const imageResult = await execute(imageRequest, services);
+    if (imageResult.status !== "success") return imageResult;
+    images = normalizeReferenceImages(imageResult.values?.images);
+    imageArtifacts = imageResult.artifacts ?? [];
+    imageLogs = imageResult.logs ?? [];
+    activeProjectUrl = imageResult.values?.project_url ?? activeProjectUrl;
+    await saveVisualProductionCheckpoint(request, services, checkpointDescriptor, {
+      characterReferences,
+      images,
+      animationResults: productionCheckpoint?.animationResults,
+      projectUrl: activeProjectUrl,
+    });
+  }
+  const selectedIndexes =
+    productionMode === "images_to_video_all"
+      ? Array.from({ length: images.length }, (_, index) => index)
+      : productionMode === "images_then_selected_videos"
+        ? selectAnimationIndexes(images.length, configuration)
+        : [];
+  const retainImages = configuration.imageRetention !== "omit_from_final_delivery";
+  const retainedImages =
+    configuration.imageRetention === "keep_animated_only"
+      ? selectedIndexes.map((index) => images[index])
+      : images;
+  const retainedImageIds = new Set(retainedImages.map((image) => image?.id).filter(Boolean));
+  const retainedImageArtifacts =
+    configuration.imageRetention === "keep_animated_only"
+      ? imageArtifacts.filter((artifact) => retainedImageIds.has(artifact?.id))
+      : imageArtifacts;
+  const animationResults = new Map(
+    (Array.isArray(productionCheckpoint?.animationResults)
+      ? productionCheckpoint.animationResults
+      : []
+    )
+      .filter((entry) => Number.isInteger(entry?.imageIndex) && Array.isArray(entry?.videos))
+      .map((entry) => [entry.imageIndex, normalizeReferenceImages(entry.videos)]),
+  );
+  let videos = selectedIndexes.flatMap((imageIndex) => animationResults.get(imageIndex) ?? []);
+  const videoArtifacts = await restoreCheckpointArtifacts(request, services, videos);
+  const logs = [
+    ...(characterPrompts.length > 0
+      ? [`Produção visual: ${characterReferences.length} referência(s) de personagem gerada(s).`]
+      : []),
+    ...imageLogs,
+  ];
+  logs.push(
+    `Produção visual: ${images.length} imagem(ns) gerada(s); ${selectedIndexes.length} selecionada(s) para animação.`,
+  );
+
+  for (let position = 0; position < selectedIndexes.length; position += 1) {
+    const imageIndex = selectedIndexes[position];
+    if (animationResults.has(imageIndex)) {
+      logs.push(
+        `Produção visual: animação ${position + 1}/${selectedIndexes.length} já concluída; retomando da próxima tarefa.`,
+      );
+      continue;
+    }
+    const animationRequest = {
+      ...request,
+      capabilityId: "animate-image-in-browser",
+      configuration: configurationForProjectContinuation(configuration, activeProjectUrl),
+      settings: {
+        ...request?.settings,
+        keepBrowserOpen:
+          position < selectedIndexes.length - 1 || request?.settings?.keepBrowserOpen === true,
+      },
+      [FLOW_INTERNAL_CONTEXT]: {
+        artifactNamespace: "animation",
+        promptOrdinal: imageIndex + 1,
+      },
+      inputs: {
+        images: images[imageIndex],
+        prompts:
+          animationPrompts[imageIndex] ?? animationPrompts[position] ?? prompts[imageIndex] ?? "",
+        project_url: activeProjectUrl,
+      },
+      outputContract: [{ portKey: "video", type: "files" }],
+    };
+    const animationResult = await execute(animationRequest, {
+      ...services,
+      resolveInputFile: async (file) => {
+        const generatedPath = generatedArtifactInputPath(file, imageArtifacts, services);
+        if (generatedPath) return generatedPath;
+        return await services.resolveInputFile(file);
+      },
+      publishPartial: async (update) =>
+        await services.publishPartial?.({
+          ...update,
+          itemUpdates: update.itemUpdates?.map((item) => ({
+            ...item,
+            key: `animation:${imageIndex}:${item.key}`,
+            variantKey: item.variantKey
+              ? `animation:${imageIndex}:${item.variantKey}`
+              : `animation:${imageIndex}:video:0`,
+            outputPort: item.outputPort === "video" ? "videos" : item.outputPort,
+          })),
+        }),
+    });
+    logs.push(...(animationResult.logs ?? []));
+    if (animationResult.status !== "success") {
+      activeProjectUrl =
+        animationResult.partialValues?.project_url ??
+        animationResult.values?.project_url ??
+        activeProjectUrl;
+      await saveVisualProductionCheckpoint(request, services, checkpointDescriptor, {
+        characterReferences,
+        images,
+        animationResults: [...animationResults.entries()].map(
+          ([completedImageIndex, resultVideos]) => ({
+            imageIndex: completedImageIndex,
+            videos: resultVideos,
+          }),
+        ),
+        projectUrl: activeProjectUrl,
+      });
+      const failure = {
+        ...animationResult,
+        partialValues: {
+          ...(retainImages ? { images: retainedImages } : {}),
+          ...(configuration.saveCharacterReferences === true
+            ? { character_references: characterReferences }
+            : {}),
+          ...(videos.length > 0 ? { videos } : {}),
+          project_url: activeProjectUrl,
+        },
+        partialArtifacts: [
+          ...(retainImages ? retainedImageArtifacts : []),
+          ...(configuration.saveCharacterReferences === true ? characterArtifacts : []),
+          ...videoArtifacts,
+        ],
+        logs,
+      };
+      return failure;
+    }
+    const completedVideos = normalizeReferenceImages(animationResult.values?.video);
+    animationResults.set(imageIndex, completedVideos);
+    videos = selectedIndexes.flatMap((selectedIndex) => animationResults.get(selectedIndex) ?? []);
+    videoArtifacts.push(...(animationResult.artifacts ?? []));
+    activeProjectUrl = animationResult.values?.project_url ?? activeProjectUrl;
+    await saveVisualProductionCheckpoint(request, services, checkpointDescriptor, {
+      characterReferences,
+      images,
+      animationResults: [...animationResults.entries()].map(
+        ([completedImageIndex, resultVideos]) => ({
+          imageIndex: completedImageIndex,
+          videos: resultVideos,
+        }),
+      ),
+      projectUrl: activeProjectUrl,
+    });
+    logs.push(
+      `Produção visual: animação ${position + 1}/${selectedIndexes.length} concluída (imagem ${imageIndex + 1}).`,
+    );
+    await services.publishPartial?.({
+      values: {
+        ...(retainImages ? { images: retainedImages } : {}),
+        ...(configuration.saveCharacterReferences === true
+          ? { character_references: characterReferences }
+          : {}),
+        videos,
+        project_url: activeProjectUrl,
+      },
+      artifacts: [
+        ...(configuration.saveCharacterReferences === true ? characterArtifacts : []),
+        ...(retainImages ? retainedImageArtifacts : []),
+        ...videoArtifacts,
+      ],
+      progress: (position + 1) / selectedIndexes.length,
+      message: `Animação ${position + 1} de ${selectedIndexes.length} capturada.`,
+    });
+  }
+
+  await clearVisualProductionCheckpoint(request, services);
+
+  return {
+    status: "success",
+    values: {
+      ...(retainImages ? { images: retainedImages } : {}),
+      ...(configuration.saveCharacterReferences === true
+        ? { character_references: characterReferences }
+        : {}),
+      ...(videos.length > 0 ? { videos } : {}),
+      project_url: activeProjectUrl,
+    },
+    artifacts: [
+      ...(configuration.saveCharacterReferences === true ? characterArtifacts : []),
+      ...(retainImages ? retainedImageArtifacts : []),
+      ...videoArtifacts,
+    ],
+    usage: {
+      provider: "Google Labs / Flow",
+      outputUnits: images.length + videos.length,
+      unit: "visual_asset",
+    },
+    logs,
+  };
+}
+
+function resolveVideoPreferences(configuration = {}) {
+  const videoModelKey = configuration.videoModel || "veo_3_1_fast";
+  const videoResolutionKey = configuration.videoResolution || "flow_current";
+  const aspectRatioKey = configuration.aspectRatio || "flow_current";
+  const discoveredModelLabel = Object.hasOwn(VIDEO_MODELS, videoModelKey)
+    ? null
+    : dynamicFlowModelLabel(videoModelKey, "video");
+  if (!Object.hasOwn(VIDEO_MODELS, videoModelKey) && !discoveredModelLabel) {
+    throw codedError("INVALID_CONFIGURATION", "videoModel não é reconhecido.");
+  }
+  return {
+    videoModelKey,
+    videoModelName:
+      configuration.videoModelLabel || discoveredModelLabel || VIDEO_MODELS[videoModelKey],
+    videoResolutionKey,
+    videoResolutionLabel: VIDEO_RESOLUTIONS[videoResolutionKey] || null,
+    aspectRatioKey,
+    imageAspectRatio: ASPECT_RATIOS[aspectRatioKey] || null,
+    videoReferenceMode: configuration.videoReferenceMode || "elements",
+    durationSeconds: configuration.videoDurationSeconds || 5,
+  };
+}
+
+function assertDedicatedProfilePath(path) {
+  const normalized = String(path).replaceAll("\\", "/").toLowerCase().replace(/\/+$/, "");
+  const looksLikeDefaultChrome =
+    normalized.endsWith("/google/chrome/user data") ||
+    normalized.endsWith("/google/chrome/default") ||
+    normalized.includes("/google/chrome/user data/default");
+  if (looksLikeDefaultChrome) {
+    throw codedError(
+      "INVALID_CONFIGURATION",
+      "Não use o perfil pessoal padrão do Chrome. Configure profilePath para uma pasta dedicada ao ContentFlow.",
+    );
+  }
+}
+
+function dedupeStrings(values) {
+  return [
+    ...new Set(
+      values
+        .filter(Boolean)
+        .map((value) => String(value).trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
+function requireCoreBrowserSession(coreSession) {
+  if (
+    !coreSession ||
+    !Number.isInteger(coreSession.port) ||
+    typeof coreSession.webSocketDebuggerUrl !== "string" ||
+    !coreSession.webSocketDebuggerUrl
+  ) {
+    throw codedError(
+      "INVALID_CONFIGURATION",
+      "O ContentFlow não forneceu a sessão de navegador reservada para este perfil.",
+    );
+  }
+  return coreSession;
+}
+
+async function launchOrReuseChrome({ coreSession }) {
+  const session = requireCoreBrowserSession(coreSession);
+  return {
+    version: { webSocketDebuggerUrl: session.webSocketDebuggerUrl },
+    child: null,
+    reused: true,
+    startedByCore: true,
+    startedByPlugin: false,
+  };
+}
+
+async function closeBrowserGracefully(client) {
+  client?.close();
+}
+
+function extensionExecutionKey(request, profileId) {
+  return createHash("sha256")
+    .update(
+      [
+        request?.executionId || "configuration",
+        request?.blockId || "profile",
+        request?.capabilityId || "google-flow",
+        Number(request?.attempt) || 1,
+        request?.batch?.itemId || request?.batch?.index || "single",
+        profileId,
+      ].join(":"),
+    )
+    .digest("hex");
+}
+
+function extensionCommandId(executionKey, action, operationKey) {
+  return createHash("sha256").update(`${executionKey}:${action}:${operationKey}`).digest("hex");
+}
+
+async function evaluateWorker(client, sessionId, expression) {
+  const evaluated = await client.send(
+    "Runtime.evaluate",
+    { expression, returnByValue: true, awaitPromise: true },
+    sessionId,
+  );
+  if (evaluated.exceptionDetails) return undefined;
+  return evaluated.result?.value;
+}
+
+function isMissingCdpSession(error) {
+  return /Session with given id not found|No session with given id|Target session .*not found/i.test(
+    String(error?.message || error || ""),
+  );
+}
+
+function supportsRequiredBridge(identity) {
+  const min = Number(identity?.protocol?.min ?? identity?.protocolVersion);
+  const max = Number(identity?.protocol?.max ?? identity?.protocolVersion);
+  const capabilities = Array.isArray(identity?.capabilities) ? identity.capabilities : [];
+  return (
+    identity?.bridgeId === EXTENSION_BRIDGE_ID &&
+    Number.isInteger(min) &&
+    Number.isInteger(max) &&
+    Math.min(EXTENSION_PROTOCOL_RANGE.max, max) >= Math.max(EXTENSION_PROTOCOL_RANGE.min, min) &&
+    EXTENSION_REQUIRED_CAPABILITIES.every((capability) => capabilities.includes(capability))
+  );
+}
+
+async function attachExtensionBridge(
+  client,
+  flowSessionId,
+  { signal, request, profileId, waitMs = 10000 },
+) {
+  let workerTarget;
+  let workerSessionId;
+  let extensionIdentity;
+
+  const attachWorkerSession = async (timeoutMs = waitMs) => {
+    const deadline = Date.now() + timeoutMs;
+    const rejectedTargets = new Set();
+    let nextDiscoveryAt = 0;
+    while (Date.now() < deadline) {
+      if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+      if (Date.now() >= nextDiscoveryAt) {
+        nextDiscoveryAt = Date.now() + 1_000;
+        await client.send("Runtime.evaluate", {
+          expression: `window.postMessage({ source: "contentflow-bridge-client", action: "discover" }, location.origin)`,
+        }, flowSessionId).catch(() => undefined);
+      }
+      const { targetInfos = [] } = await client.send("Target.getTargets");
+      const candidates = targetInfos.filter(
+        (item) =>
+          item.type === "service_worker" &&
+          /^chrome-extension:\/\/[^/]+\/service-worker\.js$/i.test(String(item.url || "")) &&
+          !rejectedTargets.has(item.targetId),
+      );
+      for (const candidate of candidates) {
+        let attached;
+        try {
+          attached = await client.send("Target.attachToTarget", {
+            targetId: candidate.targetId,
+            flatten: true,
+          });
+          await client.send("Runtime.enable", {}, attached.sessionId);
+          const identity = await evaluateWorker(
+            client,
+            attached.sessionId,
+            "globalThis.contentFlowBridge?.identity",
+          );
+          if (supportsRequiredBridge(identity)) {
+            return { target: candidate, sessionId: attached.sessionId, identity };
+          }
+          if (identity?.bridgeId === EXTENSION_BRIDGE_ID) {
+            throw codedError("BRIDGE_INCOMPATIBLE", "A extensão instalada é incompatível.");
+          }
+        } catch (error) {
+          if (!isMissingCdpSession(error)) throw error;
+        }
+        rejectedTargets.add(candidate.targetId);
+        if (attached?.sessionId) {
+          await client
+            .send("Target.detachFromTarget", { sessionId: attached.sessionId })
+            .catch(() => undefined);
+        }
+      }
+      await sleep(250, signal);
+    }
+    throw codedError(
+      "BRIDGE_MISSING",
+      "A ContentFlow Browser Bridge não está instalada neste perfil do Chrome. Abra chrome://extensions, ative o modo do desenvolvedor, use Carregar sem compactação na pasta contentflow-browser-bridge e recarregue a extensão. O plugin não continuará usando teclado ou mouse como alternativa.",
+    );
+  };
+
+  ({
+    target: workerTarget,
+    sessionId: workerSessionId,
+    identity: extensionIdentity,
+  } = await attachWorkerSession());
+
+  const sessionToken = randomUUID();
+  const executionKey = extensionExecutionKey(request, profileId);
+  let negotiatedProtocolVersion = EXTENSION_PROTOCOL_VERSION;
+  const connectionExpression = () =>
+    `globalThis.contentFlowBridge.connect(${JSON.stringify({
+      pluginId: PLUGIN_ID,
+      protocolVersion: EXTENSION_PROTOCOL_VERSION,
+      protocol: EXTENSION_PROTOCOL_RANGE,
+      clientVersion: "1",
+      requestedCapabilities: EXTENSION_REQUIRED_CAPABILITIES,
+      profileId,
+      sessionToken,
+    })})`;
+
+  const connectWorker = async () => {
+    const handshake = await evaluateWorker(client, workerSessionId, connectionExpression());
+    if (!handshake?.ok) {
+      throw codedError(
+        "BRIDGE_INCOMPATIBLE",
+        handshake?.message || "A extensão recusou a conexão efêmera do plugin.",
+      );
+    }
+    if (
+      !Number.isInteger(handshake.protocolVersion) ||
+      handshake.protocolVersion < EXTENSION_PROTOCOL_RANGE.min ||
+      handshake.protocolVersion > EXTENSION_PROTOCOL_RANGE.max ||
+      !EXTENSION_REQUIRED_CAPABILITIES.every((capability) =>
+        handshake.capabilities?.includes(capability),
+      )
+    ) {
+      throw codedError("BRIDGE_INCOMPATIBLE", "A extensão instalada é incompatível.");
+    }
+    negotiatedProtocolVersion = handshake.protocolVersion;
+  };
+
+  const recoverWorkerSession = async () => {
+    if (workerSessionId) {
+      await client
+        .send("Target.detachFromTarget", { sessionId: workerSessionId })
+        .catch(() => undefined);
+    }
+    ({
+      target: workerTarget,
+      sessionId: workerSessionId,
+      identity: extensionIdentity,
+    } = await attachWorkerSession(5000));
+    await connectWorker();
+  };
+
+  const evaluateBridge = async (expression) => {
+    try {
+      return await evaluateWorker(client, workerSessionId, expression);
+    } catch (error) {
+      if (!isMissingCdpSession(error)) throw error;
+      await recoverWorkerSession();
+      return await evaluateWorker(client, workerSessionId, expression);
+    }
+  };
+
+  await connectWorker();
+
+  const dispatch = async (action, payload = {}, operationKey = action, timeoutMs = 30000) => {
+    if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+    const page = await evaluate(
+      client,
+      flowSessionId,
+      "({ url: location.href, origin: location.origin })",
+    );
+    if (!isFlowUrl(page?.url)) {
+      throw codedError("OUTPUT_VALIDATION_FAILED", "A aba anexada deixou de ser o Google Flow.");
+    }
+    const issuedAt = Date.now();
+    const commandTimeoutMs = Math.max(1000, Math.min(30000, timeoutMs));
+    const command = {
+      pluginId: PLUGIN_ID,
+      protocolVersion: negotiatedProtocolVersion,
+      profileId,
+      sessionToken,
+      executionKey,
+      commandId: extensionCommandId(executionKey, action, operationKey),
+      issuedAt,
+      expiresAt: issuedAt + commandTimeoutMs,
+      expectedUrl: page.url,
+      action,
+      payload,
+    };
+    const dispatchExpression = `(() => { const bridge = globalThis.contentFlowBridge; return Promise.race([bridge.dispatch(${JSON.stringify(command)}),new Promise(resolve=>setTimeout(()=>resolve({ok:false,code:"COMMAND_TIMEOUT",message:"A extensão não respondeu no prazo."}),${commandTimeoutMs + 1000}))]); })()`;
+    let response = await evaluateBridge(dispatchExpression);
+    if (response?.code === "SESSION_MISMATCH") {
+      await connectWorker();
+      response = await evaluateBridge(dispatchExpression);
+    }
+    client.trace?.(`Bridge ${action}: ${response?.ok ? "OK" : String(response?.code || "NO_RESPONSE")}`);
+    if (!response?.ok) {
+      const code = String(response?.code || "");
+      if (code === "CANCELLED") throw codedError("CANCELLED", "Execução cancelada.");
+      if (code === "UNKNOWN_ACTION") {
+        throw codedError(
+          "UNKNOWN_ACTION",
+          response?.message || `A extensão não conhece a ação ${action}.`,
+          true,
+        );
+      }
+      if (
+        ["COMMAND_TIMEOUT", "CONTENT_SCRIPT_UNAVAILABLE"].includes(code) &&
+        !EXTENSION_EFFECTFUL_ACTIONS.has(action)
+      ) {
+        throw codedError(
+          "BRIDGE_PAGE_UNAVAILABLE",
+          response?.message || "A extensão deixou de responder.",
+          true,
+        );
+      }
+      if (
+        code === "COMMAND_OUTCOME_UNKNOWN" ||
+        (["COMMAND_TIMEOUT", "CONTENT_SCRIPT_UNAVAILABLE"].includes(code) &&
+          EXTENSION_EFFECTFUL_ACTIONS.has(action))
+      ) {
+        throw codedError(
+          "COMMAND_OUTCOME_UNKNOWN",
+          response?.message || "O resultado do último comando precisa ser reconciliado.",
+          true,
+        );
+      }
+      if (
+        [
+          "SESSION_MISMATCH",
+          "PROFILE_MISMATCH",
+          "PROTOCOL_MISMATCH",
+          "HANDSHAKE_REJECTED",
+        ].includes(code)
+      ) {
+        throw codedError(
+          "BRIDGE_INCOMPATIBLE",
+          response?.message || "A extensão instalada é incompatível.",
+        );
+      }
+      throw codedError(
+        "OUTPUT_VALIDATION_FAILED",
+        response?.message || `A extensão recusou a ação ${action}.`,
+        true,
+      );
+    }
+    return response;
+  };
+
+  const cancel = () => {
+    const payload = {
+      pluginId: PLUGIN_ID,
+      protocolVersion: negotiatedProtocolVersion,
+      sessionToken,
+      profileId,
+      executionKey,
+      commandId: extensionCommandId(executionKey, "cancel", "execution"),
+    };
+    void client
+      .send(
+        "Runtime.evaluate",
+        {
+          expression: `globalThis.contentFlowBridge?.cancel(${JSON.stringify(payload)})`,
+          returnByValue: true,
+          awaitPromise: true,
+        },
+        workerSessionId,
+      )
+      .catch(() => undefined);
+  };
+  signal?.addEventListener("abort", cancel, { once: true });
+  let disposed = false;
+
+  try {
+    if (request?.recoveryDirective?.action === "reload_page") {
+      await dispatch(
+        "reload",
+        {
+          reconciliationState: "safe",
+          bypassCache: true,
+          reasonCode: request.recoveryDirective.reasonCode,
+        },
+        `core-recovery:${request.recoveryDirective.reasonCode}`,
+      );
+    }
+    const ping = await dispatch("ping", {}, "bridge-ready");
+    if (ping?.protocolVersion !== negotiatedProtocolVersion) {
+      throw codedError("BRIDGE_INCOMPATIBLE", "A ContentFlow Browser Bridge está desatualizada.");
+    }
+  } catch (error) {
+    await evaluateWorker(
+      client,
+      workerSessionId,
+      `globalThis.contentFlowBridge?.disconnect(${JSON.stringify({
+        pluginId: PLUGIN_ID,
+        protocolVersion: negotiatedProtocolVersion,
+        profileId,
+        sessionToken,
+      })})`,
+    ).catch(() => undefined);
+    await client
+      .send("Target.detachFromTarget", { sessionId: workerSessionId })
+      .catch(() => undefined);
+    throw error;
+  }
+
+  return {
+    dispatch,
+    identity: extensionIdentity,
+    sessionId: workerSessionId,
+    targetId: workerTarget.targetId,
+    async dispose() {
+      if (disposed) return;
+      disposed = true;
+      signal?.removeEventListener("abort", cancel);
+      const payload = {
+        pluginId: PLUGIN_ID,
+        protocolVersion: negotiatedProtocolVersion,
+        profileId,
+        sessionToken,
+      };
+      await client
+        .send(
+          "Runtime.evaluate",
+          {
+            expression: `globalThis.contentFlowBridge?.disconnect(${JSON.stringify(payload)})`,
+            returnByValue: true,
+            awaitPromise: true,
+          },
+          workerSessionId,
+        )
+        .catch(() => undefined);
+      await client
+        .send("Target.detachFromTarget", { sessionId: workerSessionId })
+        .catch(() => undefined);
+    },
+  };
+}
+
+function describeCdpParams(method, params) {
+  if (method === "Page.navigate" || method === "Target.createTarget") {
+    try {
+      const url = new URL(String(params?.url ?? ""));
+      return `url=${url.origin}${url.pathname}`;
+    } catch {
+      return "url=invalid";
+    }
+  }
+  return "";
+}
+
+class CdpClient {
+  constructor(wsUrl, trace) {
+    this.wsUrl = wsUrl;
+    this.trace = trace;
+    this.ws = null;
+    this.nextId = 1;
+    this.pending = new Map();
+    this.listeners = new Map();
+  }
+
+  async connect(signal) {
+    if (typeof WebSocket !== "function")
+      throw codedError("UPSTREAM_UNAVAILABLE", "Runtime Node sem WebSocket global para CDP.");
+    this.ws = new WebSocket(this.wsUrl);
+    await new Promise((resolve, reject) => {
+      const onAbort = () => reject(codedError("CANCELLED", "Execução cancelada."));
+      signal?.addEventListener("abort", onAbort, { once: true });
+      this.ws.addEventListener(
+        "open",
+        () => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve();
+        },
+        { once: true },
+      );
+      this.ws.addEventListener(
+        "error",
+        () => {
+          signal?.removeEventListener("abort", onAbort);
+          reject(
+            codedError(
+              "UPSTREAM_UNAVAILABLE",
+              "Não foi possível conectar ao Chrome DevTools Protocol.",
+            ),
+          );
+        },
+        { once: true },
+      );
+    });
+
+    this.ws.addEventListener("message", (event) => this.#onMessage(event));
+    this.ws.addEventListener("close", () =>
+      this.#rejectAll(codedError("UPSTREAM_UNAVAILABLE", "Conexão CDP encerrada.")),
+    );
+    return this;
+  }
+
+  #onMessage(event) {
+    let message;
+    try {
+      message = JSON.parse(String(event.data));
+    } catch {
+      return;
+    }
+    if (message.id) {
+      const pending = this.pending.get(message.id);
+      if (!pending) return;
+      this.pending.delete(message.id);
+      if (message.error) {
+        this.trace?.(`CDP ← ${pending.method}: ERRO ${message.error.message}`);
+        pending.reject(
+          codedError("UPSTREAM_UNAVAILABLE", `CDP ${pending.method}: ${message.error.message}`),
+        );
+      } else {
+        this.trace?.(`CDP ← ${pending.method}: OK`);
+        pending.resolve(message.result ?? {});
+      }
+      return;
+    }
+
+    if (message.method) {
+      if (/^(Fetch\.|Page\.frameNavigated|Runtime\.executionContext)/.test(message.method)) {
+        this.trace?.(`CDP ← evento ${message.method}`);
+      }
+      const handlers = this.listeners.get(message.method);
+      if (!handlers) return;
+      for (const handler of [...handlers]) {
+        try {
+          handler(message.params ?? {}, message.sessionId);
+        } catch {}
+      }
+    }
+  }
+
+  #rejectAll(error) {
+    for (const pending of this.pending.values()) pending.reject(error);
+    this.pending.clear();
+  }
+
+  send(method, params = {}, sessionId) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN)
+      return Promise.reject(codedError("UPSTREAM_UNAVAILABLE", "CDP não conectado.", true));
+    const id = this.nextId++;
+    const message = { id, method, params };
+    if (sessionId) message.sessionId = sessionId;
+    const detail = describeCdpParams(method, params);
+    this.trace?.(`CDP → ${method}${detail ? `: ${detail}` : ""}`);
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject, method });
+      this.ws.send(JSON.stringify(message));
+    });
+  }
+
+  on(method, handler) {
+    if (!this.listeners.has(method)) this.listeners.set(method, new Set());
+    this.listeners.get(method).add(handler);
+    return () => this.listeners.get(method)?.delete(handler);
+  }
+
+  close() {
+    try {
+      this.ws?.close();
+    } catch {}
+  }
+}
+
+async function waitForPageReady(client, sessionId, signal, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+    try {
+      const state = await evaluate(
+        client,
+        sessionId,
+        "({readyState: document.readyState, url: location.href})",
+      );
+      if (["interactive", "complete"].includes(state?.readyState)) return state;
+    } catch {}
+    await sleep(400, signal);
+  }
+}
+
+async function attachFlowPage(client, startUrl, pinned, signal, interactive = false) {
+  const { targetInfos = [] } = await client.send("Target.getTargets");
+  let target =
+    targetInfos.find((item) => item.type === "page" && isFlowUrl(item.url)) ||
+    targetInfos.find((item) => item.type === "page");
+
+  let targetId = target?.targetId;
+  if (!targetId) {
+    const created = await client.send("Target.createTarget", { url: FLOW_LANDING_URL });
+    targetId = created.targetId;
+  }
+
+  const { sessionId } = await client.send("Target.attachToTarget", { targetId, flatten: true });
+  if (interactive) {
+    try {
+      await client.send("Target.activateTarget", { targetId });
+    } catch {}
+  }
+  await client.send("Page.enable", {}, sessionId);
+  await client.send("Runtime.enable", {}, sessionId);
+  await client.send(
+    "Network.enable",
+    { maxTotalBufferSize: 50 * 1024 * 1024, maxResourceBufferSize: 25 * 1024 * 1024 },
+    sessionId,
+  );
+  await client.send("Page.setBypassCSP", { enabled: true }, sessionId);
+  await client.send(
+    "Page.addScriptToEvaluateOnNewDocument",
+    { source: PAGE_BOOTSTRAP_SCRIPT },
+    sessionId,
+  );
+  if (FLOW_ENGINE_CODE) {
+    await client
+      .send("Page.addScriptToEvaluateOnNewDocument", { source: FLOW_ENGINE_CODE }, sessionId)
+      .catch(() => undefined);
+  }
+  try {
+    await client.send("Runtime.evaluate", { expression: PAGE_BOOTSTRAP_SCRIPT }, sessionId);
+    if (FLOW_ENGINE_CODE) {
+      await client
+        .send("Runtime.evaluate", { expression: FLOW_ENGINE_CODE }, sessionId)
+        .catch(() => undefined);
+    }
+  } catch {}
+  if (interactive) {
+    try {
+      await client.send("Page.bringToFront", {}, sessionId);
+    } catch {}
+  }
+
+  const destinationUrl =
+    pinned && startUrl && isFlowUrl(startUrl, true) ? startUrl : FLOW_LANDING_URL;
+  await client.send("Page.navigate", { url: destinationUrl }, sessionId);
+  await waitForPageReady(client, sessionId, signal);
+
+  return { sessionId, targetId };
+}
+
+async function evaluate(client, sessionId, expression) {
+  const result = await client.send(
+    "Runtime.evaluate",
+    { expression, returnByValue: true, awaitPromise: true, userGesture: true },
+    sessionId,
+  );
+  if (result.exceptionDetails) {
+    const description =
+      result.exceptionDetails?.exception?.description ||
+      result.exceptionDetails?.text ||
+      "Erro JavaScript na página.";
+    throw codedError("OUTPUT_VALIDATION_FAILED", description);
+  }
+  return result.result?.value;
+}
+
+const DEEP_HELPERS = String.raw`
+function cfVisible(el) {
+  if (!el || !(el instanceof Element)) return false;
+  const style = getComputedStyle(el);
+  if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+  const r = el.getBoundingClientRect();
+  return r.width > 12 && r.height > 12 && r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth;
+}
+function cfAll(selector, root = document) {
+  const out = [];
+  const walk = (node) => {
+    if (!node?.querySelectorAll) return;
+    for (const el of node.querySelectorAll(selector)) out.push(el);
+    for (const el of node.querySelectorAll('*')) if (el.shadowRoot) walk(el.shadowRoot);
+  };
+  walk(root);
+  return [...new Set(out)];
+}
+function cfText(el) {
+  return [el?.innerText, el?.textContent, el?.getAttribute?.('aria-label'), el?.getAttribute?.('title'), el?.getAttribute?.('placeholder'), el?.getAttribute?.('name'), el?.id]
+    .filter(Boolean).join(' ').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+function cfEditableSelector() {
+  return '[data-slate-editor="true"], [contenteditable="true"], [contenteditable="plaintext-only"], textarea, input[type="text"], input:not([type]), [role="textbox"]';
+}
+function cfMatchesEditable(el) {
+  if (!el || !(el instanceof Element) || !cfVisible(el) || el.disabled || el.readOnly) return false;
+  const slate = (el.getAttribute?.('data-slate-editor') || '').toLowerCase();
+  const ce = (el.getAttribute?.('contenteditable') || '').toLowerCase();
+  if (slate === 'true' || ce === 'true' || ce === 'plaintext-only') return true;
+  return el.matches?.('textarea, input[type="text"], input:not([type]), [role="textbox"]') || false;
+}
+function cfFindPromptByPlaceholder() {
+  const placeholders = cfAll('[data-slate-placeholder="true"]').filter(el => {
+    const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    return /^(o que você quer criar\?|what do you want to create\?)$/i.test(t);
+  });
+  for (const ph of placeholders) {
+    const closest = ph.closest?.('[data-slate-editor="true"], [contenteditable="true"], [contenteditable="plaintext-only"], [role="textbox"]');
+    if (cfMatchesEditable(closest)) return closest;
+    let cur = ph.parentElement;
+    for (let depth = 0; depth < 20 && cur; depth += 1, cur = cur.parentElement) {
+      if (cfMatchesEditable(cur)) return cur;
+      const slate = cur.querySelector?.('[data-slate-editor="true"]');
+      if (cfMatchesEditable(slate)) return slate;
+      const editable = cur.querySelector?.('[contenteditable="true"], [contenteditable="plaintext-only"]');
+      if (cfMatchesEditable(editable)) return editable;
+    }
+  }
+  return null;
+}
+function cfPromptCandidate(customSelector = '') {
+  if (customSelector) {
+    try {
+      const direct = cfAll(customSelector).find(el => cfMatchesEditable(el) || cfVisible(el));
+      if (cfMatchesEditable(direct)) return direct;
+      const nested = direct?.querySelector?.(cfEditableSelector());
+      if (cfMatchesEditable(nested)) return nested;
+    } catch { return null; }
+  }
+  const exact = cfFindPromptByPlaceholder();
+  if (exact) return exact;
+  const candidates = cfAll(cfEditableSelector()).filter(cfMatchesEditable);
+  let best = null;
+  let bestScore = -Infinity;
+  for (const el of candidates) {
+    const r = el.getBoundingClientRect();
+    const t = cfText(el);
+    const container = el.closest('form, section, article, div') || el.parentElement;
+    const around = container ? cfText(container).slice(0, 800) : '';
+    let score = 0;
+    if ((el.getAttribute('data-slate-editor') || '').toLowerCase() === 'true') score += 180;
+    if (el.isContentEditable) score += 60;
+    if ((el.getAttribute('contenteditable') || '').toLowerCase() === 'plaintext-only') score += 55;
+    if (el.tagName === 'TEXTAREA') score += 35;
+    if (el.getAttribute('role') === 'textbox') score += 20;
+    if (/(o que você quer criar|what do you want to create)/i.test(around)) score += 220;
+    if (/(search|buscar|pesquisar)/i.test(t)) score -= 200;
+    score += Math.min(40, (r.width * r.height) / 10000);
+    if (score > bestScore) { bestScore = score; best = el; }
+  }
+  return best;
+}
+function cfGenerateCandidate(prompt, customSelector = '', includeDisabled = false) {
+  let candidates = [];
+  if (customSelector) {
+    try { candidates = cfAll(customSelector); } catch { return null; }
+  } else {
+    const exact = cfAll('button').filter(btn => {
+      const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+      if (/iniciar gera|start genera|iniciar creaci|iniciar generaci/.test(aria)) return true;
+      return [...btn.querySelectorAll('span')]
+        .some(span => /^(criar|create|gerar|generate|arrow_forward)$/i.test((span.textContent || '').trim()));
+    });
+    candidates = exact.length ? exact : cfAll('button, [role="button"], input[type="submit"]');
+  }
+  candidates = candidates.filter(cfVisible);
+  let best = null;
+  let bestScore = -Infinity;
+  const pr = prompt?.getBoundingClientRect?.();
+  for (const el of candidates) {
+    const disabled = el.disabled || el.getAttribute('aria-disabled') === 'true';
+    if (disabled && !includeDisabled) continue;
+    const t = cfText(el);
+    const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+    const r = el.getBoundingClientRect();
+    const exactLabel = [...(el.querySelectorAll?.('span') || [])]
+      .some(span => /^(criar|create|gerar|generate)$/i.test((span.textContent || '').trim()));
+    let score = 0;
+    if (/iniciar gera|start genera|iniciar creaci|iniciar generaci/.test(aria)) score += 360;
+    if (exactLabel) score += 320;
+    if (/^(gerar|generate|criar|create)$/i.test(t)) score += 180;
+    else if (/(gerar|generate|criar|create)/i.test(t)) score += 120;
+    if (/arrow_forward/i.test(el.innerHTML || '')) score += 100;
+    if (/(novo projeto|new project|renomear|rename|excluir|delete|cancelar execução)/i.test(t)) score -= 300;
+    if (pr) {
+      const dx = Math.abs((r.left + r.width / 2) - (pr.left + pr.width / 2));
+      const dy = Math.abs((r.top + r.height / 2) - (pr.top + pr.height / 2));
+      score += Math.max(0, 80 - (dx + dy) / 14);
+      if (r.top >= pr.top - 260 && r.top <= pr.bottom + 260) score += 45;
+    }
+    if (disabled) score -= 20;
+    if (score > bestScore) { bestScore = score; best = el; }
+  }
+  return best;
+}
+`;
+
+function pageStateExpression(promptSelector) {
+  return String.raw`(() => { ${DEEP_HELPERS}
+    const prompt = cfPromptCandidate(${JSON.stringify(promptSelector || "")});
+    const iframes = cfAll('iframe').filter(cfVisible);
+    const challenge = iframes.some(f => /recaptcha|challenge/i.test((f.src || '') + ' ' + (f.title || '')));
+    const host = location.hostname;
+    const href = location.href;
+    const projectLike = /^\/project\//i.test(location.pathname) || /\/tools\/flow\/project\//i.test(location.pathname);
+    const loginLike = host === 'accounts.google.com' || /signin|login|challenge/i.test(href);
+    const links = cfAll('a[href]').filter(cfVisible).map(a => ({ href: a.href, text: cfText(a) }));
+    const projectLinks = links.filter(x => /https:\/\/(?:flow\.google\.com\/project\/|labs\.google\/.*\/tools\/flow\/project\/)/i.test(x.href)).slice(0, 10);
+    const clickables = cfAll('button, [role="button"], a[href]').filter(cfVisible).map(el => ({
+      text: cfText(el),
+      tag: el.tagName,
+      href: el.href || ''
+    }));
+    const hasNewProject = clickables.some(x => /(^|\s)(novo projeto|new project)(\s|$)/i.test(x.text));
+    const hasFlowCta = clickables.some(x => /(create with google flow|criar com o google flow|try in google flow|experimentar no google flow|começar|start creating)/i.test(x.text));
+    return { url: href, host, promptFound: !!prompt, challenge, loginLike, projectLike, projectLinks, hasNewProject, hasFlowCta };
+  })()`;
+}
+
+async function getPageState(client, sessionId, promptSelector) {
+  return evaluate(client, sessionId, pageStateExpression(promptSelector));
+}
+
+function bootstrapActionPointExpression(action) {
+  return String.raw`(() => { ${DEEP_HELPERS}
+    const candidates = cfAll('button, [role="button"], a[href]').filter(cfVisible);
+    let match = null;
+    if (${JSON.stringify(action)} === 'new-project') {
+      match = candidates.find(el => {
+        const text = cfText(el);
+        const aria = (el.getAttribute?.('aria-label') || '').toLowerCase();
+        return /(^|\s)(novo projeto|new project|criar projeto|create project)(\s|$)/i.test(text) ||
+               /(novo projeto|new project|criar projeto|create project)/i.test(aria);
+      });
+    } else if (${JSON.stringify(action)} === 'flow-cta') {
+      match = candidates.find(el => /(create with google flow|criar com o google flow|try in google flow|experimentar no google flow|começar|start creating)/i.test(cfText(el)));
+    }
+    if (!match) return { ok: false };
+    match.scrollIntoView({ block: 'center', inline: 'center' });
+    match.focus({ preventScroll: true });
+    const r = match.getBoundingClientRect();
+    match.click();
+    return {
+      ok: true,
+      text: (match.innerText || match.textContent || '').replace(/\s+/g, ' ').trim(),
+      x: r.left + r.width / 2,
+      y: r.top + r.height / 2
+    };
+  })()`;
+}
+
+async function clickBootstrapAction(client, sessionId, action) {
+  const point = await evaluate(client, sessionId, bootstrapActionPointExpression(action));
+  return point?.ok ? point : { ok: false };
+}
+
+async function ensureFlowProjectReady(
+  client,
+  sessionId,
+  settings,
+  signal,
+  shortWait = false,
+  trace,
+  createFreshProject = false,
+) {
+  const seconds = shortWait
+    ? Math.min(
+        90,
+        Number.isInteger(settings?.interactiveWaitSeconds) ? settings.interactiveWaitSeconds : 600,
+      )
+    : Number.isInteger(settings?.interactiveWaitSeconds)
+      ? settings.interactiveWaitSeconds
+      : 600;
+  const deadline = Date.now() + seconds * 1000;
+  let last = null;
+  let lastActionAt = 0;
+  let actionCount = 0;
+  let freshProjectRequested = !createFreshProject;
+  let freshProjectRequestedAt = 0;
+
+  while (Date.now() < deadline) {
+    if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+    try {
+      last = await getPageState(client, sessionId, settings?.promptSelector || "");
+      trace?.(
+        `Flow state: projectLike=${Boolean(last?.projectLike)}; promptFound=${Boolean(last?.promptFound)}; newProject=${Boolean(last?.hasNewProject)}; projectLinks=${last?.projectLinks?.length ?? 0}`,
+      );
+      if (last?.projectLike && last?.promptFound && freshProjectRequested) return last;
+
+      if (!last?.loginLike && !last?.challenge && Date.now() - lastActionAt > 2500) {
+        if (createFreshProject && !freshProjectRequested) {
+          if (settings?.autoCreateProject === false) {
+            throw codedError(
+              "INVALID_CONFIGURATION",
+              "A criação de um projeto novo por execução exige autoCreateProject ativo.",
+            );
+          }
+          const clicked = await clickBootstrapAction(client, sessionId, "new-project");
+          trace?.(
+            `Flow action fresh-project: matched=${Boolean(clicked?.ok)}; text=${String(clicked?.text ?? "").slice(0, 80)}`,
+          );
+          if (clicked?.ok) {
+            freshProjectRequested = true;
+            freshProjectRequestedAt = Date.now();
+            lastActionAt = Date.now();
+            actionCount += 1;
+          }
+        } else if (createFreshProject) {
+          if (!last?.projectLike && Date.now() - freshProjectRequestedAt >= 15_000) {
+            freshProjectRequested = false;
+          }
+        } else if (Array.isArray(last?.projectLinks) && last.projectLinks.length > 0) {
+          const candidate = last.projectLinks[0]?.href;
+          if (typeof candidate === "string" && isFlowUrl(candidate, true)) {
+            await client.send("Page.navigate", { url: candidate }, sessionId);
+            lastActionAt = Date.now();
+            actionCount += 1;
+          }
+        } else if (settings?.autoCreateProject !== false) {
+          const clicked = await clickBootstrapAction(client, sessionId, "new-project");
+          trace?.(
+            `Flow action new-project: matched=${Boolean(clicked?.ok)}; text=${String(clicked?.text ?? "").slice(0, 80)}`,
+          );
+          if (clicked?.ok) {
+            lastActionAt = Date.now();
+            actionCount += 1;
+          }
+        } else if (last?.hasFlowCta) {
+          const clicked = await clickBootstrapAction(client, sessionId, "flow-cta");
+          trace?.(
+            `Flow action flow-cta: matched=${Boolean(clicked?.ok)}; text=${String(clicked?.text ?? "").slice(0, 80)}`,
+          );
+          if (clicked?.ok) {
+            lastActionAt = Date.now();
+            actionCount += 1;
+          }
+        }
+      }
+    } catch (cause) {
+      trace?.(`Flow probe error: ${String(cause?.message ?? cause).slice(0, 240)}`);
+    }
+    await sleep(1000, signal);
+  }
+
+  if (last?.loginLike || last?.challenge) {
+    throw codedError(
+      "AUTHENTICATION_FAILED",
+      "O Google Flow ainda está aguardando login, reautenticação ou CAPTCHA. Conclua a etapa na janela do Chrome e execute novamente.",
+    );
+  }
+  if (!last?.projectLike) {
+    throw codedError(
+      "AUTHENTICATION_FAILED",
+      "Não foi possível entrar em um projeto do Google Flow. Na janela aberta, faça login e escolha/crie um projeto; depois execute novamente.",
+    );
+  }
+  throw codedError(
+    "OUTPUT_VALIDATION_FAILED",
+    `Entrei no projeto, mas não encontrei a caixa de comando do Google Flow${actionCount ? ` após ${actionCount} ação(ões) de onboarding` : ""}. Se a interface mudou, configure promptSelector.`,
+  );
+}
+
+async function waitForFlowProfile(client, sessionId, settings, signal, timeoutMs) {
+  const seconds = Number.isInteger(settings?.interactiveWaitSeconds)
+    ? settings.interactiveWaitSeconds
+    : 600;
+  const deadline =
+    timeoutMs === Number.POSITIVE_INFINITY
+      ? Number.POSITIVE_INFINITY
+      : Date.now() +
+        (Number.isFinite(timeoutMs)
+          ? Math.max(30_000, Number(timeoutMs))
+          : Math.min(900, Math.max(30, seconds)) * 1000);
+  let state;
+  while (Date.now() < deadline) {
+    if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+    try {
+      state = await getPageState(client, sessionId, settings?.promptSelector || "");
+      const authenticatedSurface =
+        state?.promptFound ||
+        state?.projectLike ||
+        state?.hasNewProject ||
+        (Array.isArray(state?.projectLinks) && state.projectLinks.length > 0);
+      if (isFlowHost(state?.host) && !state?.loginLike && !state?.challenge && authenticatedSurface)
+        return;
+    } catch {}
+    await sleep(750, signal);
+  }
+  throw codedError(
+    "AUTHENTICATION_FAILED",
+    "Conclua o login do Google Flow na janela dedicada até aparecer a lista de projetos ou o editor.",
+    true,
+  );
+}
+
+async function setBrowserWindowState(client, targetId, windowState) {
+  try {
+    const { windowId } = await client.send("Browser.getWindowForTarget", { targetId });
+    if (Number.isInteger(windowId)) {
+      await client.send("Browser.setWindowBounds", { windowId, bounds: { windowState } });
+    }
+  } catch {}
+}
+
+async function showBrowserWindow(client, sessionId, targetId) {
+  await setBrowserWindowState(client, targetId, "normal");
+  try {
+    await client.send("Target.activateTarget", { targetId });
+    await client.send("Page.bringToFront", {}, sessionId);
+  } catch {}
+}
+
+function ensureImageModeExpression(promptSelector) {
+  return String.raw`(() => { ${DEEP_HELPERS}
+    const prompt = cfPromptCandidate(${JSON.stringify(promptSelector || "")});
+    if (!prompt) return { ok: false, reason: 'prompt-not-found' };
+    const pr = prompt.getBoundingClientRect();
+    const candidates = cfAll('button, [role="button"], [role="menuitem"], [role="option"]').filter(el => cfVisible(el) && !el.disabled);
+    let best = null;
+    let bestScore = -Infinity;
+    for (const el of candidates) {
+      const t = cfText(el);
+      if (!/(^|\\s)(imagem|image)(\\s|$)/i.test(t)) continue;
+      if (/(todas as imagens|all images|biblioteca|library|filtro|filter)/i.test(t)) continue;
+      const r = el.getBoundingClientRect();
+      const dx = Math.abs((r.left + r.width / 2) - (pr.left + pr.width / 2));
+      const dy = Math.abs((r.top + r.height / 2) - (pr.top + pr.height / 2));
+      let score = 100 - (dx + dy) / 18;
+      const role = el.getAttribute('role') || '';
+      if (role === 'menuitem' || role === 'option') score += 120;
+      if (r.top >= pr.top - 250 && r.top <= pr.bottom + 250) score += 40;
+      if (score > bestScore) { bestScore = score; best = el; }
+    }
+    if (!best || bestScore < 40) return { ok: true, changed: false };
+    best.click();
+    return { ok: true, changed: true };
+  })()`;
+}
+
+async function ensureImageMode(client, sessionId, settings, signal) {
+  const first = await evaluate(
+    client,
+    sessionId,
+    ensureImageModeExpression(settings?.promptSelector || ""),
+  );
+  if (!first?.ok || !first.changed) return;
+  await sleep(300, signal);
+
+  try {
+    await evaluate(client, sessionId, ensureImageModeExpression(settings?.promptSelector || ""));
+  } catch {}
+  await sleep(250, signal);
+}
+
+function cdpNodeAttributes(node) {
+  const attributes = {};
+  const raw = Array.isArray(node?.attributes) ? node.attributes : [];
+  for (let index = 0; index + 1 < raw.length; index += 2)
+    attributes[String(raw[index]).toLowerCase()] = String(raw[index + 1]);
+  return attributes;
+}
+
+function findImageFileInputNode(node) {
+  if (!node || typeof node !== "object") return null;
+  if (String(node.nodeName || "").toLowerCase() === "input") {
+    const attributes = cdpNodeAttributes(node);
+    if (String(attributes.type || "").toLowerCase() === "file") {
+      const accept = String(attributes.accept || "").toLowerCase();
+      if (!accept || accept.includes("image") || /png|jpe?g|webp/.test(accept)) return node;
+    }
+  }
+  for (const child of [
+    ...(node.children || []),
+    ...(node.shadowRoots || []),
+    ...(node.contentDocument ? [node.contentDocument] : []),
+  ]) {
+    const found = findImageFileInputNode(child);
+    if (found) return found;
+  }
+  return null;
+}
+
+async function locateImageFileInput(client, sessionId) {
+  const documentResult = await client.send(
+    "DOM.getDocument",
+    { depth: -1, pierce: true },
+    sessionId,
+  );
+  return findImageFileInputNode(documentResult?.root);
+}
+
+async function uploadMediaActionIsVisible(client, sessionId) {
+  return Boolean(
+    await evaluate(
+      client,
+      sessionId,
+      `(() => { ${DEEP_HELPERS}
+        return cfAll('button, [role="button"], [role="menuitem"], [role="option"]')
+          .filter(cfVisible)
+          .some((element) => /(?:enviar|upload|carregar|fazer upload)(?:\\s+de)?\\s+(?:mídia|media|arquivo|file)/i.test(cfText(element)));
+      })()`,
+    ),
+  );
+}
+
+function existingReferenceSelectionExpression(referenceNames) {
+  return `(() => { ${DEEP_HELPERS}
+    const names = ${JSON.stringify(referenceNames.map((name) => name.toLowerCase()))};
+    const choices = cfAll('button, [role="button"], [role="option"]')
+      .filter(cfVisible)
+      .map((element) => cfText(element));
+    return names.length > 0 && names.every((name) => choices.some((choice) => choice.includes(name)));
+  })()`;
+}
+
+async function openReferencePicker(client, sessionId, bridge, signal) {
+  let pickerVisible = await uploadMediaActionIsVisible(client, sessionId);
+  for (let clickAttempt = 1; !pickerVisible && clickAttempt <= 3; clickAttempt += 1) {
+    await bridge.dispatch(
+      "click",
+      { selectors: ["flow-add-menu button"], preferDomActivation: true },
+      `open-reference-menu:${clickAttempt}`,
+    );
+    const menuDeadline = Date.now() + 3_000;
+    while (!pickerVisible && Date.now() < menuDeadline) {
+      await sleep(250, signal);
+      pickerVisible = await uploadMediaActionIsVisible(client, sessionId);
+    }
+  }
+  return pickerVisible;
+}
+
+async function openExistingReferencePicker(client, sessionId, bridge, signal) {
+  if (!(await openReferencePicker(client, sessionId, bridge, signal))) return false;
+  try {
+    await bridge.dispatch(
+      "click",
+      {
+        selectors: ["button", '[role="button"]', '[role="menuitem"]', '[role="option"]'],
+        preferDomActivation: true,
+        textIncludes: [
+          "do projeto",
+          "from project",
+          "add from project",
+          "adicionar do projeto",
+          "do flow",
+        ],
+      },
+      "open-existing-reference-picker",
+    );
+  } catch {
+    return false;
+  }
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const state = await evaluate(
+      client,
+      sessionId,
+      `(() => { ${DEEP_HELPERS}
+        const dialogs = cfAll('[role="dialog"]').filter(cfVisible);
+        const cards = cfAll('img, [role="option"], [role="gridcell"]').filter(cfVisible);
+        return { dialogs: dialogs.length, cards: cards.length };
+      })()`,
+    );
+    if (state?.dialogs || state?.cards > 0) return true;
+    await sleep(250, signal);
+  }
+  return false;
+}
+
+async function attachExistingReferenceImages(
+  client,
+  sessionId,
+  bridge,
+  filePaths,
+  settings,
+  signal,
+  step,
+) {
+  if (filePaths.length === 0) return true;
+  const baselineCount = await attachedReferenceCount(client, sessionId);
+  await ensureImageMode(client, sessionId, settings, signal);
+  const referenceNames = filePaths.map((filePath) => basename(filePath).replace(/\.[^.]+$/, ""));
+  const canonicalLabel = referenceNames[0];
+  const canonicalAttached = await evaluate(
+    client,
+    sessionId,
+    `(async () => {
+      const add = window.FlowAuto?.refs2?.anexarPeloMais;
+      if (typeof add !== "function") return false;
+      await add(${JSON.stringify(canonicalLabel)}, "image");
+      return true;
+    })()`,
+  ).catch(() => false);
+  if (canonicalAttached === true) {
+    const deadline = Date.now() + 8_000;
+    while (Date.now() < deadline) {
+      if ((await attachedReferenceCount(client, sessionId)) >= baselineCount + 1) {
+        step?.(`Referência existente "${canonicalLabel}" selecionada pela busca nominal do Flow.`);
+        return true;
+      }
+      await sleep(250, signal);
+    }
+  }
+  if (!(await openExistingReferencePicker(client, sessionId, bridge, signal))) return false;
+  const allVisible = await evaluate(
+    client,
+    sessionId,
+    existingReferenceSelectionExpression(referenceNames),
+  );
+  if (!allVisible) return false;
+
+  for (const [index, referenceName] of referenceNames.entries()) {
+    await bridge.dispatch(
+      "click",
+      {
+        selectors: ["button", '[role="button"]', '[role="option"]'],
+        textIncludes: [referenceName],
+      },
+      `select-existing-reference:${index}:${referenceName}`,
+    );
+    await sleep(250, signal);
+  }
+  await bridge.dispatch(
+    "click",
+    {
+      selectors: ["button", '[role="button"]'],
+      textIncludes: ["incluir", "add to prompt", "include in prompt"],
+    },
+    "include-existing-references",
+  );
+  await evaluate(
+    client,
+    sessionId,
+    `(() => { ${DEEP_HELPERS}
+      const button = cfAll('button, [role="button"]').find(el =>
+        cfVisible(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true' &&
+        /incluir no comando|add to prompt|include in prompt/i.test(cfText(el))
+      );
+      if (!button) return false;
+      button.click();
+      return true;
+    })()`,
+  ).catch(() => false);
+  const deadline = Date.now() + 8_000;
+  while (Date.now() < deadline) {
+    if ((await attachedReferenceCount(client, sessionId)) >= baselineCount + filePaths.length) {
+      step?.(`${referenceNames.length} referência(s) existente(s) reutilizada(s) no comando.`);
+      return true;
+    }
+    await sleep(250, signal);
+  }
+  return false;
+}
+
+async function findNativeReference(client, sessionId, mediaId) {
+  if (!RPC_UUID_RE.test(String(mediaId || ""))) return null;
+  return await evaluate(client, sessionId, `(async () => {
+    const find = window.FlowAuto?.refs2?.acharTile;
+    if (typeof find !== "function") return null;
+    const tile = await find({ mediaUuid: ${JSON.stringify(mediaId)} });
+    return tile?.mediaId === ${JSON.stringify(mediaId)} && tile.nome
+      ? { mediaId: tile.mediaId, name: tile.nome } : null;
+  })()`);
+}
+
+async function attachNativeReference(client, sessionId, reference, signal, step, locale) {
+  const current = await findNativeReference(client, sessionId, reference.mediaId);
+  if (!current) throw codedError("OUTPUT_VALIDATION_FAILED", referenceMessage(locale, "missing"));
+  const before = await attachedReferenceCount(client, sessionId);
+  const confirmed = await evaluate(client, sessionId, `(async () => {
+    const attach = window.FlowAuto?.refs2?.attachImageRefViaAddPanel;
+    return typeof attach === "function" && await attach(null, null, ${JSON.stringify(current.mediaId)});
+  })()`).catch(() => false);
+  if (!confirmed) throw codedError("OUTPUT_VALIDATION_FAILED", referenceMessage(locale, "unconfirmed"));
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline) {
+    if (await attachedReferenceCount(client, sessionId) === before + 1) {
+      step?.(referenceMessage(locale, "confirmed"));
+      return true;
+    }
+    await sleep(250, signal);
+  }
+  throw codedError("OUTPUT_VALIDATION_FAILED", referenceMessage(locale, "unconfirmed"));
+}
+
+async function prepareAllFlowReferences(client, sessionId, bridge, images, request, services, projectUrl, settings, step) {
+  const context = { projectUrl, accountProfile: normalizeAccountProfile(request.configuration.accountProfile) };
+  return prepareReferenceCatalog(images, async (image) => {
+    const path = (await prepareReferenceImagePaths([image], services, 1))[0];
+    const digest = createHash("sha256").update(await readFile(path)).digest("hex");
+    const saved = await recalledMedia(services, digest, context);
+    // Import an already persisted provider fact into the plugin-owned catalogue;
+    // old operational facts are preserved verbatim, without a core adapter.
+    const mediaId = saved?.mediaId || image.flowMediaId;
+    let reference = mediaId ? await findNativeReference(client, sessionId, mediaId) : null;
+    if (!await clearAttachedReferenceImages(client, sessionId, bridge, services.signal, step))
+      throw codedError("OUTPUT_VALIDATION_FAILED", referenceMessage(request.context?.locale, "clear"));
+    if (reference) {
+      await attachNativeReference(client, sessionId, reference, services.signal, step, request.context?.locale);
+    } else {
+      // Upload happens only in this barrier, never after the first prompt is submitted.
+      const extension = extensionForMime(image.mimeType) || ".png";
+      const uploadedPath = services.getWorkspacePath(`reference-${digest}${extension.startsWith(".") ? extension : "." + extension}`);
+      await copyFile(path, uploadedPath);
+      await uploadReferenceImages(client, sessionId, bridge, [uploadedPath], settings, services.signal, step);
+      const uploadedIds = await evaluate(client, sessionId, `(() => { ${DEEP_HELPERS}
+        const ids = new Set();
+        for (const chip of cfAll('flow-image-ingredient-chip, flow-ingredient-chip').filter(cfVisible))
+          for (const img of chip.querySelectorAll('img')) {
+            try { const url = new URL(img.currentSrc || img.src);
+              const id = url.searchParams.get('name') || url.pathname.match(/\\/(?:image|video)\\/([a-f0-9-]{36})/i)?.[1];
+              if (id) ids.add(id);
+            } catch {}
+          }
+        return [...ids];
+      })()`);
+      if (uploadedIds?.length === 1) reference = await findNativeReference(client, sessionId, uploadedIds[0]);
+      if (!reference) throw codedError("OUTPUT_VALIDATION_FAILED", referenceMessage(request.context?.locale, "uploaded"));
+    }
+    await rememberMedia(services, digest, context, reference);
+    if (!await clearAttachedReferenceImages(client, sessionId, bridge, services.signal, step))
+      throw codedError("OUTPUT_VALIDATION_FAILED", referenceMessage(request.context?.locale, "clear"));
+    return reference;
+  }, referenceMessage(request.context?.locale, "unavailable"));
+}
+
+async function attachReferenceImagesOneByOne(
+  client,
+  sessionId,
+  bridge,
+  filePaths,
+  settings,
+  signal,
+  step,
+  references,
+  locale,
+) {
+  for (const [index, filePath] of filePaths.entries()) {
+    const baselineCount = await attachedReferenceCount(client, sessionId);
+    const nativeReference = references?.[index];
+    if (references && !nativeReference) {
+      throw codedError("OUTPUT_VALIDATION_FAILED", referenceMessage(locale, "unavailable"));
+    }
+    const reused = nativeReference ? await attachNativeReference(client, sessionId, nativeReference, signal, step, locale) : await attachExistingReferenceImages(
+      client,
+      sessionId,
+      bridge,
+      [filePath],
+      settings,
+      signal,
+      step,
+    );
+    if (!reused) {
+      await uploadReferenceImages(client, sessionId, bridge, [filePath], settings, signal, step);
+    }
+    const deadline = Date.now() + 8_000;
+    let attachedCount = await attachedReferenceCount(client, sessionId);
+    while (attachedCount < baselineCount + 1 && Date.now() < deadline) {
+      await sleep(250, signal);
+      attachedCount = await attachedReferenceCount(client, sessionId);
+    }
+    if (attachedCount < baselineCount + 1) {
+      throw codedError(
+        "OUTPUT_VALIDATION_FAILED",
+        `O Flow não confirmou a referência ${index + 1} de ${filePaths.length}; o prompt não foi enviado.`,
+      );
+    }
+  }
+}
+
+async function clearAttachedReferenceImages(client, sessionId, bridge, signal, step) {
+  const canonicalCount = await evaluate(
+    client,
+    sessionId,
+    `(async () => {
+      if (typeof window.FlowAuto?.editor2?.limparIngredientes !== "function") return null;
+      return await window.FlowAuto.editor2.limparIngredientes();
+    })()`,
+  ).catch(() => null);
+  if (Number(canonicalCount) > 0) await sleep(500, signal);
+  const selectors = [
+    "flow-base-prompt-box flow-ingredient-chip button",
+    "flow-base-prompt-box flow-image-ingredient-chip button",
+    "flow-ingredient-bar flow-ingredient-chip button",
+    "flow-ingredient-bar flow-image-ingredient-chip button",
+    'button[aria-label*="remove" i]',
+    'button[aria-label*="remover" i]',
+    'button[aria-label*="excluir" i]',
+    'button[aria-label*="delete" i]',
+    'button[aria-label*="close" i]',
+    'button[aria-label*="fechar" i]',
+  ];
+  let count = await attachedReferenceCount(client, sessionId);
+  for (let attempt = 1; count > 0 && attempt <= 8; attempt += 1) {
+    const domRemoved = await evaluate(
+      client,
+      sessionId,
+      `(() => { ${DEEP_HELPERS}
+        const selectors = [
+          'flow-base-prompt-box flow-image-ingredient-chip',
+          'flow-base-prompt-box flow-ingredient-chip',
+          'flow-ingredient-bar flow-image-ingredient-chip',
+          'flow-ingredient-bar flow-ingredient-chip',
+        ];
+        const chips = selectors.flatMap(selector => cfAll(selector).filter(cfVisible));
+        const chip = chips[0];
+        const button = chip?.querySelector('button, [role="button"]');
+        if (!button) return false;
+        for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+          button.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+        }
+        return true;
+      })()`,
+    ).catch(() => false);
+    if (domRemoved) {
+      await sleep(350, signal);
+      const next = await attachedReferenceCount(client, sessionId);
+      if (next < count) {
+        count = next;
+        continue;
+      }
+    }
+    try {
+      await bridge.dispatch(
+        "click",
+        {
+          selectors,
+          preferDomActivation: true,
+          textIncludes: ["remove", "remover", "excluir", "delete", "fechar", "close"],
+        },
+        `clear-reference:${attempt}`,
+      );
+    } catch {
+      break;
+    }
+    await sleep(250, signal);
+    const next = await attachedReferenceCount(client, sessionId);
+    if (next >= count) break;
+    count = next;
+  }
+  if (count === 0) step?.("Referências da tentativa sem efeito removidas do compositor.");
+  return count === 0;
+}
+
+async function prepareReferenceImagePaths(referenceImages, services, maximum) {
+  if (referenceImages.length > maximum) {
+    throw codedError(
+      "INVALID_INPUT",
+      `Recebi ${referenceImages.length} imagens de referência; o limite configurado é ${maximum}.`,
+    );
+  }
+  const paths = [];
+  for (const image of referenceImages) {
+    const mimeType = String(image?.mimeType || "").toLowerCase();
+    if (mimeType && !mimeType.startsWith("image/")) {
+      throw codedError(
+        "INVALID_INPUT",
+        `A referência ${String(image?.name || "sem nome")} não é uma imagem.`,
+      );
+    }
+    const resolved = await services.resolveInputFile(image);
+    const info = await stat(resolved);
+    if (!info.isFile() || info.size < 1 || info.size > MAX_IMAGE_BYTES) {
+      throw codedError(
+        "INVALID_INPUT",
+        `A referência ${String(image?.name || "sem nome")} está vazia ou excede 25 MB.`,
+      );
+    }
+    paths.push(resolved);
+  }
+  return paths;
+}
+
+async function uploadReferenceImages(client, sessionId, bridge, filePaths, settings, signal, step) {
+  if (filePaths.length === 0) return;
+
+  await client.send("Page.setInterceptFileChooserDialog", { enabled: true }, sessionId);
+  try {
+    await uploadReferenceImagesInPage(client, sessionId, bridge, filePaths, settings, signal, step);
+  } finally {
+    await client.send("Page.setInterceptFileChooserDialog", { enabled: false }, sessionId);
+  }
+}
+
+async function uploadReferenceImagesInPage(
+  client,
+  sessionId,
+  bridge,
+  filePaths,
+  settings,
+  signal,
+  step,
+) {
+  await ensureImageMode(client, sessionId, settings, signal);
+  let input = await locateImageFileInput(client, sessionId);
+  if (!input) {
+    const uploadMenuVisible = await openReferencePicker(client, sessionId, bridge, signal);
+    if (!uploadMenuVisible) {
+      throw codedError(
+        "OUTPUT_VALIDATION_FAILED",
+        "O controle de referência do Google Flow não abriu o menu de envio de mídia.",
+      );
+    }
+    step?.("Controle de referência aberto.");
+    input = await locateImageFileInput(client, sessionId);
+    if (!input) {
+      await bridge.dispatch(
+        "click",
+        {
+          selectors: ["button", '[role="button"]', '[role="menuitem"]', '[role="option"]'],
+          preferDomActivation: true,
+          textIncludes: ["enviar mídia", "upload media", "carregar mídia", "upload file"],
+        },
+        "choose-reference-upload",
+      );
+      step?.("Opção de envio de mídia selecionada.");
+    }
+    const deadline = Date.now() + 10_000;
+    while (!input && Date.now() < deadline) {
+      await sleep(250, signal);
+      input = await locateImageFileInput(client, sessionId);
+    }
+  }
+  if (!input?.nodeId) {
+    throw codedError(
+      "OUTPUT_VALIDATION_FAILED",
+      "O Google Flow abriu o seletor de referências, mas nenhum input de imagem ficou disponível.",
+    );
+  }
+  await client.send("DOM.setFileInputFiles", { files: filePaths, nodeId: input.nodeId }, sessionId);
+  step?.(
+    `${filePaths.length} imagem(ns) de referência selecionada(s); aguardando o Flow concluir o envio.`,
+  );
+  await waitReferenceUploadReady(
+    client,
+    sessionId,
+    settings,
+    signal,
+    step,
+    90_000,
+    bridge,
+    filePaths.map((filePath) => basename(filePath)),
+  );
+  step?.("Envio da referência concluído e editor disponível.");
+}
+
+function referenceUploadStateExpression(promptSelector, referenceNames = []) {
+  return `(() => { ${DEEP_HELPERS}
+    const dialogs = cfAll('[role="dialog"]').filter(cfVisible);
+    const consent = dialogs.some(el => /direitos de uso|rights to use|usage rights/i.test(cfText(el)));
+    const prompt = cfPromptCandidate(${JSON.stringify(promptSelector || "")});
+    const editable = !!prompt && prompt.getAttribute('contenteditable') !== 'false';
+    const pickerOpen = cfAll('button, [role="button"]').filter(cfVisible)
+      .some(el => /enviar mídia|upload media/i.test(cfText(el)));
+    const includeReady = cfAll('button, [role="button"]').filter(cfVisible)
+      .some(el => !el.disabled && el.getAttribute('aria-disabled') !== 'true' && /incluir no comando|add to prompt|include in prompt/i.test(cfText(el)));
+    const names = ${JSON.stringify(referenceNames.map((name) => name.toLowerCase()))};
+    const referenceMatches = names.length > 0 && names.every(name =>
+      cfAll('button, [role="button"], [role="option"], img').filter(cfVisible).some(el =>
+        (cfText(el) + ' ' + (el.getAttribute('alt') || '').toLowerCase()).includes(name)));
+    return { consent, dialogs: dialogs.length, pickerOpen, editable, includeReady, referenceMatches };
+  })()`;
+}
+
+async function attachedReferenceCount(client, sessionId) {
+  return (
+    Number(
+      await evaluate(
+        client,
+        sessionId,
+        `(() => { ${DEEP_HELPERS}
+    // frame-trigger img is a mirrored child of the chip and is intentionally not counted separately.
+    const base = cfAll('flow-base-prompt-box flow-image-ingredient-chip, flow-base-prompt-box flow-ingredient-chip').filter(cfVisible);
+    if (base.length > 0) return base.length;
+    const bar = cfAll('flow-ingredient-bar flow-image-ingredient-chip, flow-ingredient-bar flow-ingredient-chip').filter(cfVisible);
+    if (bar.length > 0) return bar.length;
+    return cfAll('button, [role="button"]').filter(cfVisible).filter(el =>
+      /^(elemento|element|ingredient)$/i.test((el.getAttribute('aria-label') || '').trim()) &&
+      !!el.querySelector('img')).length;
+  })()`,
+      ),
+    ) || 0
+  );
+}
+
+async function waitReferenceUploadReady(
+  client,
+  sessionId,
+  settings,
+  signal,
+  step,
+  timeoutMs = 90_000,
+  bridge,
+  referenceNames = [],
+) {
+  const deadline = Date.now() + timeoutMs;
+  let state;
+  let consentReported = false;
+  let included = false;
+  let includeAttempts = 0;
+  while (Date.now() < deadline) {
+    state = await evaluate(
+      client,
+      sessionId,
+      referenceUploadStateExpression(settings?.promptSelector, referenceNames),
+    );
+    if (state?.consent && !consentReported) {
+      step?.(
+        "O Flow solicita confirmação dos direitos da imagem. Confirme na janela do Flow para continuar.",
+      );
+      consentReported = true;
+    }
+    // The editor can become editable before Flow has finished materializing
+    // the uploaded media. When names were supplied, that state is not enough:
+    // submitting now makes Flow fall back to the most recent image. Wait for
+    // the uploaded asset itself to be visible (or for an attached chip) before
+    // allowing the caller to type/send the prompt.
+    const referenceReady =
+      referenceNames.length === 0 ||
+      state?.referenceMatches === true ||
+      (await attachedReferenceCount(client, sessionId)) > 0;
+    if (state?.editable && !state.dialogs && !state.pickerOpen && referenceReady) return;
+    if (!state?.consent && state?.includeReady && state?.referenceMatches && !included && bridge) {
+      includeAttempts += 1;
+      try {
+        const domClicked = await evaluate(
+          client,
+          sessionId,
+          `(() => { ${DEEP_HELPERS}
+            const button = cfAll('button, [role="button"]').find(el =>
+              cfVisible(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true' &&
+              /incluir no comando|add to prompt|include in prompt/i.test(cfText(el))
+            );
+            if (!button) return false;
+            button.click();
+            return true;
+          })()`,
+        ).catch(() => false);
+        if (domClicked === true) {
+          included = true;
+          step?.("Referência enviada incluída no comando do Flow.");
+          await sleep(250, signal);
+          continue;
+        }
+        await bridge.dispatch(
+          "click",
+          {
+            selectors: ["button", '[role="button"]'],
+            textIncludes: ["incluir", "add to prompt", "include in prompt"],
+          },
+          `include-uploaded-reference:${includeAttempts}`,
+        );
+        included = true;
+        step?.("Referência enviada incluída no comando do Flow.");
+      } catch (error) {
+        if (includeAttempts >= 3 || !/Controle não encontrado/.test(error?.message || ""))
+          throw error;
+      }
+    }
+    await sleep(500, signal);
+  }
+  throw codedError(
+    state?.consent ? "HUMAN_INTERVENTION_REQUIRED" : "OUTPUT_VALIDATION_FAILED",
+    state?.consent
+      ? "O Flow aguarda sua confirmação dos direitos de uso da referência. Confirme na janela do Flow e retome a etapa."
+      : `O envio da referência não liberou o editor do Flow. Estado: ${JSON.stringify(state)}.`,
+  );
+}
+
+async function setPromptWithExtension(
+  bridge,
+  prompt,
+  customSelector,
+  operationKey,
+  signal,
+  client,
+  sessionId,
+  locale = "pt-BR",
+) {
+  if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+  if (client && sessionId && !customSelector) {
+    const engineFill = await evaluate(client, sessionId, `(async () => {
+      const adapter = window.FlowAuto?.adapter;
+      if (typeof adapter?.setPrompt !== "function") return { available: false };
+      const expectedPrompt = ${JSON.stringify(prompt)};
+      const applied = await adapter.setPrompt(expectedPrompt);
+      return { available: true, applied: applied === true,
+        matches: String(adapter.getPromptText?.() || "").trim() === expectedPrompt.trim() };
+    })()`);
+    if (engineFill?.available) {
+      if (engineFill.applied && engineFill.matches) {
+        return { readbackLength: prompt.length, mechanism: "flow-engine" };
+      }
+      throw codedError("OUTPUT_VALIDATION_FAILED", referenceMessage(locale, "promptMismatch"));
+    }
+  }
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      if (client && sessionId) {
+        await evaluate(
+          client,
+          sessionId,
+          `(() => {
+            const editor = document.querySelector('.ProseMirror, [contenteditable="true"], [data-slate-editor="true"]');
+            if (editor) {
+              editor.focus();
+              try {
+                const sel = window.getSelection();
+                const range = document.createRange();
+                range.selectNodeContents(editor);
+                sel.removeAllRanges();
+                sel.addRange(range);
+              } catch {}
+              try { document.execCommand('delete'); } catch {}
+              if (editor.textContent.trim()) {
+                editor.innerHTML = '<p><br></p>';
+                editor.dispatchEvent(new Event('input', { bubbles: true }));
+              }
+            }
+          })()`,
+        ).catch(() => undefined);
+      }
+      const res = await bridge.dispatch(
+        "setPrompt",
+        {
+          text: prompt,
+          promptSelector: customSelector || "",
+          selectors: customSelector
+            ? [customSelector]
+            : [
+                ".ProseMirror",
+                '[data-slate-editor="true"]',
+                '[contenteditable="true"]',
+                '[contenteditable="plaintext-only"]',
+                '[role="textbox"]',
+              ],
+        },
+        `${operationKey}:${attempt}`,
+      );
+      if (client && sessionId) {
+        await evaluate(
+          client,
+          sessionId,
+          `(() => {
+            const editor = document.querySelector('.ProseMirror, [contenteditable="true"], [data-slate-editor="true"]');
+            if (editor) {
+              editor.focus();
+              if (!editor.textContent.trim() || editor.textContent.includes('O que você quer criar?')) {
+                try {
+                  const sel = window.getSelection();
+                  const range = document.createRange();
+                  range.selectNodeContents(editor);
+                  sel.removeAllRanges();
+                  sel.addRange(range);
+                } catch {}
+                try { document.execCommand('delete'); } catch {}
+                editor.innerHTML = '<p><br></p>';
+                document.execCommand('insertText', false, ${JSON.stringify(prompt)});
+              }
+              editor.dispatchEvent(new Event('input', { bubbles: true }));
+              editor.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'a' }));
+              editor.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+          })()`,
+        ).catch(() => undefined);
+      }
+      return res;
+    } catch (error) {
+      lastError = error;
+      if (error?.code === "BRIDGE_PAGE_UNAVAILABLE" && client && sessionId) {
+        const verified = await evaluate(client, sessionId, `(() => { ${DEEP_HELPERS}
+          const editor = cfPromptCandidate(${JSON.stringify(customSelector || "")});
+          const expectedPrompt = ${JSON.stringify(prompt)};
+          return !!editor?.isConnected && cfVisible(editor) &&
+            cfAll('[role="dialog"]').filter(cfVisible).length === 0 &&
+            String(editor.innerText || editor.textContent || '').trim() === expectedPrompt.trim();
+        })()`).catch(() => false);
+        if (verified) return { readbackLength: prompt.length, reconciledFromEditor: true };
+      }
+      if (error?.code !== "OUTPUT_VALIDATION_FAILED" || attempt === 3) {
+        const state = await evaluate(
+          client,
+          sessionId,
+          `(() => { ${DEEP_HELPERS}
+          const editor = cfPromptCandidate(${JSON.stringify(customSelector || "")});
+          const focused = document.activeElement;
+          return { editorFound: !!editor, editorCharacters: (editor?.innerText || '').length,
+            focusedTag: focused?.tagName, focusedRole: focused?.getAttribute('role'),
+            editorFocused: editor === focused || !!editor?.contains(focused),
+            visibleDialogs: cfAll('[role="dialog"]').filter(cfVisible).length };
+        })()`,
+        ).catch(() => undefined);
+        error.message += ` Diagnóstico do editor: ${JSON.stringify(state)}.`;
+        throw error;
+      }
+      await sleep(750 * attempt, signal);
+    }
+  }
+  throw lastError;
+}
+
+async function waitForPromptEditorStable(client, sessionId, customSelector, signal) {
+  const deadline = Date.now() + 12_000;
+  let stableReadings = 0;
+  let previousSignature = "";
+  while (Date.now() < deadline) {
+    const state = await evaluate(
+      client,
+      sessionId,
+      `(() => { ${DEEP_HELPERS}
+        const editor = cfPromptCandidate(${JSON.stringify(customSelector || "")});
+        const rect = editor?.getBoundingClientRect?.();
+        return {
+          found: Boolean(editor),
+          connected: Boolean(editor?.isConnected),
+          dialogs: cfAll('[role="dialog"]').filter(cfVisible).length,
+          signature: editor && rect
+            ? [editor.tagName, Math.round(rect.left), Math.round(rect.top), Math.round(rect.width), Math.round(rect.height)].join(':')
+            : '',
+        };
+      })()`,
+    );
+    if (state?.found && state?.connected && state.dialogs === 0 && state.signature) {
+      stableReadings = state.signature === previousSignature ? stableReadings + 1 : 1;
+      previousSignature = state.signature;
+      if (stableReadings >= 3) return state;
+    } else {
+      stableReadings = 0;
+      previousSignature = "";
+    }
+    await sleep(500, signal);
+  }
+  throw codedError(
+    "OUTPUT_VALIDATION_FAILED",
+    "O editor do Flow não estabilizou antes do preenchimento; o prompt não foi enviado.",
+  );
+}
+
+async function waitGenerateEnabled(client, sessionId, settings, signal, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await evaluate(
+      client,
+      sessionId,
+      `(() => { ${DEEP_HELPERS}
+      const prompt = cfPromptCandidate(${JSON.stringify(settings?.promptSelector || "")});
+      const btn = cfGenerateCandidate(prompt, ${JSON.stringify(settings?.generateSelector || "")}, true);
+      return {
+        found: !!btn,
+        disabled: btn ? (btn.disabled || btn.getAttribute('aria-disabled') === 'true') : null,
+        text: btn ? cfText(btn) : '',
+        ariaDisabled: btn ? (btn.getAttribute('aria-disabled') || '') : ''
+      };
+    })()`,
+    );
+    if (last?.found && !last?.disabled) return last;
+    await sleep(250, signal);
+  }
+  if (!last?.found)
+    throw codedError(
+      "OUTPUT_VALIDATION_FAILED",
+      "Não encontrei o botão Criar/Gerar do Google Flow.",
+    );
+  throw codedError(
+    "OUTPUT_VALIDATION_FAILED",
+    "O botão Criar foi encontrado, mas continuou com aria-disabled=true após preencher o prompt.",
+  );
+}
+
+async function clickGenerateWithExtension(bridge, settings, operationKey) {
+  const customSelector = String(settings?.generateSelector || "").trim();
+  try {
+    return await bridge.dispatch(
+      "click",
+      {
+        selectors: customSelector ? [customSelector] : ["flow-generate-icon-button button"],
+      },
+      operationKey,
+    );
+  } catch (cause) {
+    if (cause?.code !== "CONTROL_NOT_FOUND") throw cause;
+  }
+  return await bridge.dispatch(
+    "clickGenerate",
+    {
+      selectors: [
+        'button[aria-label*="iniciar geração" i]',
+        'button[aria-label*="start generation" i]',
+        'button[aria-label*="iniciar creaci" i]',
+        'button[aria-label*="iniciar generaci" i]',
+        'button[type="submit"]',
+      ],
+      promptSelector: settings?.promptSelector || "",
+      generateSelector: customSelector,
+      textIncludes: [
+        "iniciar geração",
+        "iniciar geracao",
+        "start generation",
+        "iniciar creación",
+        "iniciar generacion",
+        "iniciar generación",
+      ],
+    },
+    `${operationKey}:fallback`,
+  );
+}
+
+async function clickGenerateAndConfirm(
+  client,
+  sessionId,
+  bridge,
+  settings,
+  operationKey,
+  signal,
+  locale,
+) {
+  const readState = () =>
+    evaluate(
+      client,
+      sessionId,
+      `(() => { ${DEEP_HELPERS}
+        const prompt = cfPromptCandidate(${JSON.stringify(settings?.promptSelector || "")});
+        const button = cfGenerateCandidate(prompt, ${JSON.stringify(settings?.generateSelector || "")}, true);
+        const promptText = (prompt?.innerText || prompt?.textContent || prompt?.value || '').replace(/\s+/g, ' ').trim();
+        const pending = cfAll('flow-pending-tile, [aria-busy="true"], [role="progressbar"], [class*="loading" i], [class*="spinner" i]')
+          .filter(cfVisible).length;
+        return {
+          promptText,
+          disabled: Boolean(button && (button.disabled || button.getAttribute('aria-disabled') === 'true')),
+          pending,
+        };
+      })()`,
+    );
+  const before = await readState();
+  const waitForEffect = async (timeoutMs) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+      const after = await readState();
+      if (
+        after?.promptText !== before?.promptText ||
+        (!before?.disabled && after?.disabled) ||
+        Number(after?.pending || 0) > Number(before?.pending || 0)
+      ) {
+        return true;
+      }
+      await sleep(250, signal);
+    }
+    return false;
+  };
+  const directFirst = await evaluate(
+    client,
+    sessionId,
+    `(() => {
+      const button = window.FlowAuto?.editor2?.findSubmitButton?.() ||
+        document.querySelector('flow-generate-icon-button button');
+      if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') return false;
+      button.click();
+      return true;
+    })()`,
+  ).catch(() => false);
+  if (directFirst === true && (await waitForEffect(8_000))) {
+    return { ok: true, confirmed: true, mechanism: "flow-dom-submit" };
+  }
+  const canonicalFirst = await evaluate(
+    client,
+    sessionId,
+    `(async () => {
+      if (typeof window.FlowAuto?.editor2?.clickSubmit !== "function") return false;
+      return (await window.FlowAuto.editor2.clickSubmit()) === true;
+    })()`,
+  ).catch(() => false);
+  if (canonicalFirst === true && (await waitForEffect(15_000))) {
+    return { ok: true, confirmed: true, mechanism: "flowauto-editor2-clickSubmit" };
+  }
+  let click;
+  try {
+    click = await clickGenerateWithExtension(bridge, settings, operationKey);
+  } catch (cause) {
+    if (cause?.code === "COMMAND_OUTCOME_UNKNOWN") cause.externalEffectUncertain = true;
+    if (!/controle não encontrado|control not found/i.test(String(cause?.message || "")))
+      throw cause;
+    click = { ok: false, mechanism: "control-not-found" };
+  }
+  if (click.ok !== false && (await waitForEffect(5_000))) {
+    return { ...click, confirmed: true, mechanism: click.mechanism };
+  }
+  const canonicalSubmit = await evaluate(
+    client,
+    sessionId,
+    `(async () => {
+      if (typeof window.FlowAuto?.editor2?.clickSubmit !== "function") return false;
+      return (await window.FlowAuto.editor2.clickSubmit()) === true;
+    })()`,
+  ).catch(() => false);
+  if (canonicalSubmit === true && (await waitForEffect(15_000))) {
+    return { ok: true, confirmed: true, mechanism: "flowauto-editor2-clickSubmit" };
+  }
+  let semanticClick = { ok: false };
+  try {
+    semanticClick = await bridge.dispatch(
+      "clickGenerate",
+      {
+        selectors: [
+          "flow-generate-icon-button button",
+          'button[aria-label*="iniciar geração" i]',
+          'button[aria-label*="start generation" i]',
+          'button[type="submit"]',
+        ],
+        promptSelector: settings?.promptSelector || "",
+        generateSelector: settings?.generateSelector || "",
+      },
+      `${operationKey}:semantic-fallback`,
+    );
+  } catch (cause) {
+    if (
+      !/controle não encontrado|control not found|desabilitado|disabled/i.test(
+        String(cause?.message || ""),
+      )
+    )
+      throw cause;
+  }
+  if (await waitForEffect(8_000)) {
+    return { ...semanticClick, confirmed: true, mechanism: "bridge-clickGenerate" };
+  }
+  const enter = await bridge.dispatch(
+    "pressEnter",
+    {
+      selectors: [
+        '[data-slate-editor="true"]',
+        '[contenteditable="true"][role="textbox"]',
+        '[contenteditable="true"]',
+      ],
+    },
+    `${operationKey}:enter`,
+  );
+  if (await waitForEffect(5_000)) {
+    return { ...enter, confirmed: true, mechanism: enter.mechanism };
+  }
+  throw codedError("OUTPUT_VALIDATION_FAILED", flowMediaMessage(locale, "generationNotConfirmed"));
+}
+
+async function getActiveFlowProjectUrl(client, sessionId) {
+  try {
+    const url = await evaluate(client, sessionId, "location.href");
+    const match = String(url || "").match(
+      /https?:\/\/(?:flow\.google\.com|labs\.google)\/(?:tools\/flow\/)?project\/([a-zA-Z0-9_-]+)/i,
+    );
+    return match ? match[0] : isFlowUrl(url, true) ? String(url) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function ensureFlowModelAndRatio(
+  client,
+  sessionId,
+  bridge,
+  {
+    modelName,
+    ratioLabel,
+    resolutionLabel,
+    videoMode,
+    durationSeconds,
+    outputCount,
+    forceImageMode = false,
+    settings = {},
+    signal,
+    locale,
+  },
+  step,
+) {
+  const settingsPanelIsOpen = () =>
+    evaluate(
+      client,
+      sessionId,
+      `(() => { ${DEEP_HELPERS}
+        return cfAll('[role="radio"]')
+          .filter(cfVisible)
+          .some(el => /^(?:image|imagem|video|vídeo|frames|x[1-4]|\\d+:\\d+)$/i.test(cfText(el).replace(/^(?:image|videocam|crop_[^ ]+)\s+/i, '')));
+      })()`,
+    );
+  if (videoMode || durationSeconds) {
+    const configured = await evaluate(
+      client,
+      sessionId,
+      `(async () => window.FlowAuto?.adapter?.configureGeneration
+        ? await window.FlowAuto.adapter.configureGeneration({
+            type: "video",
+            videoMode: ${JSON.stringify(videoMode || null)},
+            duration: ${JSON.stringify(durationSeconds || null)}
+          })
+        : null)()`,
+    );
+    if (!configured?.ok) {
+      throw codedError(
+        "OUTPUT_VALIDATION_FAILED",
+        flowMediaMessage(locale, "videoModeNotConfirmed"),
+      );
+    }
+    step?.(
+      flowMediaMessage(locale, "videoModeConfirmed", {
+        mode: videoMode,
+        duration: durationSeconds,
+      }),
+    );
+  }
+  if (modelName) {
+    step?.(`Configurando modelo no Google Flow: ${modelName}...`);
+    try {
+      let current = await evaluate(
+        client,
+        sessionId,
+        `(() => { ${DEEP_HELPERS}
+          const btn = cfAll('button[aria-label], [role="button"][aria-label]')
+            .filter(cfVisible)
+            .find(el => /(gatilho de configura|settings trigger|generation settings)/i.test(el.getAttribute('aria-label') || ''));
+          return btn ? cfText(btn) : '';
+        })()`,
+      );
+      if (
+        forceImageMode &&
+        !/(?:imagem|image|nano\s+banana|gem[_\s-]*pix)/i.test(String(current || ""))
+      ) {
+        let modeSelectionError;
+        for (let modeAttempt = 1; modeAttempt <= 3; modeAttempt += 1) {
+          if (!(await settingsPanelIsOpen())) {
+            await bridge.dispatch(
+              "click",
+              {
+                selectors: [
+                  'button[aria-label*="gatilho de configura" i]',
+                  'button[aria-label*="settings trigger" i]',
+                  'button[aria-label*="generation settings" i]',
+                ],
+              },
+              `image-mode:open-settings:${modeAttempt}`,
+            );
+            await sleep(800, signal);
+          }
+          let imageModeSelector = "";
+          for (let controlWait = 0; controlWait < 12; controlWait += 1) {
+            imageModeSelector = await evaluate(
+              client,
+              sessionId,
+              `(() => { ${DEEP_HELPERS}
+                const control = cfAll('button[role="radio"], [role="radio"]')
+                  .filter(cfVisible)
+                  .find(el => /(?:^|\\s)(?:imagem|image)(?:\\s|$)/i.test(cfText(el)));
+                if (!control) return '';
+                const id = String(control.id || '').trim();
+                return id && /^[a-zA-Z][a-zA-Z0-9_-]*$/.test(id) ? '#' + id : '';
+              })()`,
+            );
+            if (imageModeSelector) break;
+            await sleep(250, signal);
+          }
+          try {
+            await bridge.dispatch(
+              "click",
+              {
+                selectors: [
+                  ...(imageModeSelector ? [imageModeSelector] : []),
+                  'button[role="radio"]',
+                  '[role="radio"]',
+                ],
+                textIncludes: ["Imagem", "Image"],
+              },
+              `image-mode:select-image:${modeAttempt}`,
+            );
+            await sleep(1_200, signal);
+            current = await evaluate(
+              client,
+              sessionId,
+              `(() => { ${DEEP_HELPERS}
+                const btn = cfAll('button[aria-label], [role="button"][aria-label]')
+                  .filter(cfVisible)
+                  .find(el => /(gatilho de configura|settings trigger|generation settings)/i.test(el.getAttribute('aria-label') || ''));
+                return btn ? cfText(btn) : '';
+              })()`,
+            );
+            if (/(?:imagem|image|nano\s+banana|gem[_\s-]*pix)/i.test(String(current || ""))) {
+              modeSelectionError = undefined;
+              break;
+            }
+          } catch (cause) {
+            modeSelectionError = cause;
+          }
+          await sleep(500, signal);
+        }
+        if (!/(?:imagem|image|nano\s+banana|gem[_\s-]*pix)/i.test(String(current || ""))) {
+          throw codedError(
+            "OUTPUT_VALIDATION_FAILED",
+            `O Flow não confirmou a troca de Vídeo para Imagem${modeSelectionError?.message ? ` (${modeSelectionError.message})` : ""}; o prompt não será enviado.`,
+          );
+        }
+        step?.(`Modo Imagem confirmado (${current}).`);
+      }
+      if (
+        !String(current || "")
+          .toLowerCase()
+          .includes(modelName.toLowerCase())
+      ) {
+        let setViaEngine = false;
+        try {
+          setViaEngine = await evaluate(
+            client,
+            sessionId,
+            `(async () => Boolean(window.FlowAuto?.adapter?.setModel && await window.FlowAuto.adapter.setModel(${JSON.stringify(modelName)})))()`,
+          );
+        } catch {}
+
+        if (setViaEngine) {
+          step?.(`Modelo de imagem confirmado via engine: ${modelName}.`);
+        } else {
+          await bridge.dispatch("click", {
+            selectors: [
+              'button[aria-label*="gatilho de configura" i]',
+              'button[aria-label*="settings trigger" i]',
+              'button[aria-label*="generation settings" i]',
+            ],
+          });
+          await sleep(700);
+          await bridge.dispatch("click", {
+            selectors: [
+              'button[aria-label*="família de modelos" i]',
+              'button[aria-label*="model family" i]',
+              'button[aria-label*="familia de modelos" i]',
+            ],
+          });
+          await sleep(500);
+          await bridge.dispatch("click", {
+            selectors: ['[role="menuitem"]', '[role="option"]', "button"],
+            textIncludes: [modelName],
+          });
+          await sleep(1_000);
+
+          const confirmed = await evaluate(
+            client,
+            sessionId,
+            `(() => { ${DEEP_HELPERS}
+              const btn = cfAll('button[aria-label], [role="button"][aria-label]')
+                .filter(cfVisible)
+                .find(el => /(gatilho de configura|settings trigger|generation settings)/i.test(el.getAttribute('aria-label') || ''));
+              return btn ? cfText(btn) : '';
+            })()`,
+          );
+          if (
+            !String(confirmed || "")
+              .toLowerCase()
+              .includes(modelName.toLowerCase())
+          ) {
+            throw codedError(
+              "OUTPUT_VALIDATION_FAILED",
+              `O Flow não confirmou o modelo de imagem ${modelName}; o prompt não será enviado.`,
+            );
+          }
+          step?.(`Modelo de imagem confirmado: ${modelName}.`);
+        }
+      } else {
+        step?.(`Modelo de imagem já confirmado: ${modelName}.`);
+      }
+    } catch (err) {
+      if (err?.code === "OUTPUT_VALIDATION_FAILED") throw err;
+      throw codedError(
+        "OUTPUT_VALIDATION_FAILED",
+        `Não foi possível confirmar o modelo de imagem ${modelName}: ${err?.message || err}. O prompt não foi enviado.`,
+      );
+    }
+  }
+
+  if (ratioLabel) {
+    step?.(`Configurando proporção no Google Flow: ${ratioLabel}...`);
+    try {
+      if (!(await settingsPanelIsOpen())) {
+        await bridge.dispatch("click", {
+          selectors: [
+            'button[aria-label*="configura" i]',
+            'button[aria-label*="setting" i]',
+            'button[aria-label*="ajuste" i]',
+          ],
+        });
+        await sleep(500, signal);
+      }
+      await bridge.dispatch("click", {
+        selectors: ['button[role="radio"]', '[role="radio"]'],
+        textIncludes: [ratioLabel, `crop_${ratioLabel.replace(":", "_")}`],
+      });
+      await sleep(600, signal);
+      step?.(`Proporção selecionada: ${ratioLabel}.`);
+    } catch (err) {
+      step?.(`Aviso ao aplicar proporção (${err?.message || err}). Continuando.`);
+    }
+  }
+
+  if (Number.isInteger(outputCount) && outputCount >= 1 && outputCount <= 4) {
+    const targetCount = `x${outputCount}`;
+    const readCountState = () =>
+      evaluate(
+        client,
+        sessionId,
+        `(() => { ${DEEP_HELPERS}
+          const btn = cfAll('button[aria-label], [role="button"][aria-label]')
+            .filter(cfVisible)
+            .find(el => /(gatilho de configura|settings trigger|generation settings)/i.test(el.getAttribute('aria-label') || ''));
+          return btn ? cfText(btn) : '';
+        })()`,
+      );
+    let current = await readCountState();
+    if (!new RegExp(`(?:^|\\s)${targetCount}(?:\\s|$)`, "i").test(String(current || ""))) {
+      step?.(`Configurando quantidade por prompt no Google Flow: ${targetCount}...`);
+      let selectionError;
+      for (let countAttempt = 1; countAttempt <= 3; countAttempt += 1) {
+        if (!(await settingsPanelIsOpen())) {
+          await bridge.dispatch(
+            "click",
+            {
+              selectors: [
+                'button[aria-label*="gatilho de configura" i]',
+                'button[aria-label*="settings trigger" i]',
+                'button[aria-label*="generation settings" i]',
+              ],
+            },
+            `image-count:open-settings:${countAttempt}`,
+          );
+          await sleep(700, signal);
+        }
+        try {
+          await bridge.dispatch(
+            "click",
+            {
+              selectors: ['button[role="radio"]', '[role="radio"]'],
+              textIncludes: [targetCount],
+            },
+            `image-count:select:${targetCount}:${countAttempt}`,
+          );
+          await sleep(1_000, signal);
+          current = await readCountState();
+          if (new RegExp(`(?:^|\\s)${targetCount}(?:\\s|$)`, "i").test(String(current || ""))) {
+            selectionError = undefined;
+            break;
+          }
+        } catch (cause) {
+          selectionError = cause;
+        }
+        await sleep(500, signal);
+      }
+      if (!new RegExp(`(?:^|\\s)${targetCount}(?:\\s|$)`, "i").test(String(current || ""))) {
+        throw codedError(
+          "OUTPUT_VALIDATION_FAILED",
+          `O Flow não confirmou ${targetCount}${selectionError?.message ? ` (${selectionError.message})` : ""}; o prompt não será enviado.`,
+        );
+      }
+    }
+    step?.(`Quantidade por prompt confirmada: ${targetCount}.`);
+    if (await settingsPanelIsOpen()) {
+      await bridge.dispatch(
+        "click",
+        {
+          selectors: [
+            'button[aria-label*="gatilho de configura" i]',
+            'button[aria-label*="settings trigger" i]',
+            'button[aria-label*="generation settings" i]',
+          ],
+        },
+        "image-settings:close",
+      );
+      await sleep(500, signal);
+    }
+  } else if (ratioLabel && (await settingsPanelIsOpen())) {
+    await bridge.dispatch("click", {
+      selectors: [
+        'button[aria-label*="gatilho de configura" i]',
+        'button[aria-label*="settings trigger" i]',
+        'button[aria-label*="generation settings" i]',
+      ],
+    });
+    await sleep(500, signal);
+  }
+
+  if (resolutionLabel) {
+    try {
+      await bridge.dispatch("click", {
+        textIncludes: [resolutionLabel],
+      });
+      step?.(`Resolução selecionada: ${resolutionLabel}.`);
+    } catch {}
+  }
+}
+
+function animationPrompts(request, prompts) {
+  const instruction = String(request.resolvedInstruction ?? request.context?.block?.instructions ?? "").trim();
+  return prompts.length ? prompts.map(prompt => instruction && !prompt.includes(instruction)
+    ? `${instruction}\n\n${prompt}` : prompt) : instruction ? [instruction] : [];
+}
+
+async function attachSelectedFlowFrame(client, sessionId, mediaUuid, step) {
+  if (!mediaUuid) return false;
+  const attached = await evaluate(
+    client,
+    sessionId,
+    `(async () => {
+      const attach = window.FlowAuto?.refs2?.attachFrameByWorkflowId;
+      return typeof attach === "function"
+        ? await attach(null, "inicial", null, ${JSON.stringify(mediaUuid)})
+        : false;
+    })()`,
+  );
+  if (attached !== true) {
+    throw codedError(
+      "OUTPUT_VALIDATION_FAILED",
+      `O Flow não confirmou a imagem selecionada como frame inicial (${mediaUuid}).`,
+    );
+  }
+  step?.(`Frame inicial selecionado nominalmente no Flow (${mediaUuid}).`);
+  return true;
+}
+
+function createBatchResponseTracker(client, sessionId, signal) {
+  const waiting = [];
+  const byRequestId = new Map();
+  let stopped = false;
+
+  const removeWaiting = (reservation) => {
+    const index = waiting.indexOf(reservation);
+    if (index >= 0) waiting.splice(index, 1);
+  };
+  const settle = (reservation, ok, value) => {
+    if (!reservation || reservation.settled) return;
+    reservation.settled = true;
+    clearTimeout(reservation.timer);
+    removeWaiting(reservation);
+    if (reservation.requestId) byRequestId.delete(reservation.requestId);
+    if (ok) reservation.resolve(value);
+    else reservation.reject(value);
+    if (!reservation.requestId) reservation.rejectSubmission(value);
+  };
+
+  const offRequest = client.on("Network.requestWillBeSent", (params, eventSessionId) => {
+    if (stopped || eventSessionId !== sessionId) return;
+    if (params?.request?.method !== "POST") return;
+    const reqUrl = String(params?.request?.url || "");
+    const postData = String(params?.request?.postData || "");
+    const isOldGen = reqUrl.includes(GENERATION_SUFFIX);
+    const isRpcGen =
+      reqUrl.includes("batchexecute") &&
+      (reqUrl.includes("ogiZ0b") ||
+        reqUrl.includes("eb1hJf") ||
+        reqUrl.includes("MZZa6b") ||
+        postData.includes("ogiZ0b") ||
+        postData.includes("eb1hJf") ||
+        postData.includes("MZZa6b"));
+    if (!isOldGen && !isRpcGen) return;
+
+    const reservation = waiting.find((item) => !item.requestId && !item.settled);
+    if (!reservation) return;
+    reservation.requestId = params.requestId;
+    byRequestId.set(params.requestId, reservation);
+    reservation.resolveSubmission(params.requestId);
+  });
+
+  const offResponse = client.on("Network.responseReceived", (params, eventSessionId) => {
+    if (stopped || eventSessionId !== sessionId) return;
+    const reservation = byRequestId.get(params.requestId);
+    if (reservation) reservation.responseStatus = params?.response?.status;
+  });
+
+  const offFinished = client.on("Network.loadingFinished", (params, eventSessionId) => {
+    if (stopped || eventSessionId !== sessionId) return;
+    const reservation = byRequestId.get(params.requestId);
+    if (!reservation || reservation.readingBody) return;
+    reservation.readingBody = true;
+    void (async () => {
+      try {
+        const bodyResult = await client.send(
+          "Network.getResponseBody",
+          { requestId: params.requestId },
+          sessionId,
+        );
+        const bodyText = bodyResult.base64Encoded
+          ? Buffer.from(bodyResult.body || "", "base64").toString("utf8")
+          : String(bodyResult.body || "");
+        if (bodyText.includes("wrb.fr") || bodyText.startsWith(")]}'")) {
+          const rpcs = decodificarBatchExecute(bodyText);
+          const hasError = rpcs.some((r) => r.erro);
+          const hasMedia = rpcs.some((r) => extrairMidiasRpc(r.payload).length > 0);
+          if (!hasError && !hasMedia) {
+            reservation.readingBody = false;
+            return;
+          }
+        }
+        settle(reservation, true, { status: reservation.responseStatus, bodyText });
+      } catch (cause) {
+        settle(
+          reservation,
+          false,
+          codedError(
+            "OUTPUT_VALIDATION_FAILED",
+            `Não consegui ler a resposta da geração no Chrome: ${cause.message}`,
+          ),
+        );
+      }
+    })();
+  });
+
+  const offFailed = client.on("Network.loadingFailed", (params, eventSessionId) => {
+    if (stopped || eventSessionId !== sessionId) return;
+    const reservation = byRequestId.get(params.requestId);
+    if (reservation) {
+      settle(
+        reservation,
+        false,
+        codedError(
+          "UPSTREAM_UNAVAILABLE",
+          `A requisição de geração falhou no Chrome: ${params.errorText || "erro de rede"}`,
+          true,
+        ),
+      );
+    }
+  });
+
+  const abortError = () => codedError("CANCELLED", "Execução cancelada.");
+  const onAbort = () => {
+    for (const reservation of [...waiting, ...byRequestId.values()])
+      settle(reservation, false, abortError());
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+
+  return {
+    reserve(timeoutMs) {
+      if (stopped)
+        throw codedError("UPSTREAM_UNAVAILABLE", "Rastreador de gerações já foi encerrado.");
+      let resolve;
+      let reject;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise;
+        reject = rejectPromise;
+      });
+      let resolveSubmission;
+      let rejectSubmission;
+      const submitted = new Promise((resolve, reject) => {
+        resolveSubmission = resolve;
+        rejectSubmission = reject;
+      });
+      // Both promises can fail before a caller starts waiting for the result.
+      void promise.catch(() => undefined);
+      void submitted.catch(() => undefined);
+      const reservation = {
+        resolve,
+        reject,
+        promise,
+        resolveSubmission,
+        rejectSubmission,
+        requestId: null,
+        responseStatus: null,
+        settled: false,
+        readingBody: false,
+        timer: null,
+      };
+      reservation.timer = setTimeout(() => {
+        settle(
+          reservation,
+          false,
+          codedError(
+            "TIMEOUT",
+            "Nenhuma resposta de geração chegou a tempo. Como o envio pode ter sido aceito pelo Flow, o plugin não repetirá automaticamente esta imagem. Verifique a janela do Chrome para login, CAPTCHA/reautenticação ou erro da interface.",
+            false,
+          ),
+        );
+      }, timeoutMs);
+      waiting.push(reservation);
+      return {
+        promise,
+        submitted,
+        cancel(error) {
+          settle(reservation, false, error);
+        },
+      };
+    },
+    close() {
+      if (stopped) return;
+      stopped = true;
+      offRequest();
+      offResponse();
+      offFinished();
+      offFailed();
+      signal?.removeEventListener("abort", onAbort);
+      const error = codedError(
+        "UPSTREAM_UNAVAILABLE",
+        "Rastreador de gerações encerrado antes da conclusão.",
+        true,
+      );
+      for (const reservation of [...waiting, ...byRequestId.values()])
+        settle(reservation, false, error);
+    },
+  };
+}
+
+function createAdaptiveConcurrencyController(maxConcurrency = 1, baseIntervalMs = 6000) {
+  const targetConcurrency = Math.max(1, maxConcurrency);
+  let effConcurrency = targetConcurrency;
+  const baseInterval = Array.isArray(baseIntervalMs)
+    ? baseIntervalMs
+    : [baseIntervalMs, Math.round(baseIntervalMs * 1.5)];
+  let effInterval = [...baseInterval];
+  let successStreak = 0;
+  const THROTTLE_MULT = 1.5;
+  const MAX_INTERVAL = 45000;
+  const RESTORE_AFTER = 2;
+
+  function throttleDown() {
+    effConcurrency = Math.max(1, effConcurrency - 1);
+    effInterval = [
+      Math.min(MAX_INTERVAL, Math.round(effInterval[0] * THROTTLE_MULT)),
+      Math.min(MAX_INTERVAL, Math.round(effInterval[1] * THROTTLE_MULT)),
+    ];
+  }
+
+  function maybeRestore() {
+    if (successStreak <= 0 || successStreak % RESTORE_AFTER !== 0) return;
+    if (effConcurrency < targetConcurrency) effConcurrency += 1;
+    if (effInterval[0] > baseInterval[0] || effInterval[1] > baseInterval[1]) {
+      effInterval = [
+        Math.max(baseInterval[0], Math.round(effInterval[0] / THROTTLE_MULT)),
+        Math.max(baseInterval[1], Math.round(effInterval[1] / THROTTLE_MULT)),
+      ];
+    }
+  }
+
+  return {
+    getLimit() {
+      return effConcurrency;
+    },
+    getDelayMs() {
+      const [min, max] = effInterval;
+      return Math.round(min + Math.random() * Math.max(0, max - min));
+    },
+    success() {
+      successStreak += 1;
+      maybeRestore();
+    },
+    failure(error) {
+      successStreak = 0;
+      const isRate =
+        error?.code === "RATE_LIMIT" ||
+        error?.isUnusualActivity === true ||
+        error?.httpStatus === 403;
+      if (isRate) {
+        effConcurrency = 1;
+        throttleDown();
+        return { activated: true, delayMs: error?.retryAfterMs || 45000 };
+      }
+      return { activated: false };
+    },
+  };
+}
+
+async function runSubmissionRound(tasks, maxInFlight, submit, onState, options = {}) {
+  const pending = [...tasks];
+  const active = new Map();
+  const succeeded = [];
+  const failed = [];
+  const minDelayMs = Math.max(0, Number(options.minDelayMs) || 0);
+  const wait = options.wait ?? ((ms) => sleep(ms, options.signal));
+  let nextSubmissionAt = 0;
+
+  const currentLimit = () => {
+    const value = typeof maxInFlight === "function" ? maxInFlight() : maxInFlight;
+    return Math.max(1, Number(value) || 1);
+  };
+  const recordOutcome = (outcome) => {
+    active.delete(outcome.task.index);
+    if (outcome.ok) succeeded.push({ task: outcome.task, value: outcome.value });
+    else failed.push({ task: outcome.task, error: outcome.error });
+    onState?.({
+      type: outcome.ok ? "succeeded" : "failed",
+      task: outcome.task,
+      error: outcome.error,
+      active: active.size,
+      pending: pending.length,
+    });
+    if (!outcome.ok && options.failFast === true) pending.length = 0;
+  };
+
+  while (pending.length > 0 || active.size > 0) {
+    const canSubmit = pending.length > 0 && active.size < currentLimit();
+    if (canSubmit && Date.now() >= nextSubmissionAt) {
+      const task = pending.shift();
+      try {
+        const submission = await submit(task);
+        const settled = Promise.resolve(submission.completion).then(
+          (value) => ({ ok: true, task, value }),
+          (error) => ({ ok: false, task, error }),
+        );
+        active.set(task.index, settled);
+        nextSubmissionAt = Date.now() + minDelayMs;
+        onState?.({ type: "submitted", task, active: active.size, pending: pending.length });
+      } catch (error) {
+        failed.push({ task, error });
+        onState?.({ type: "failed", task, error, active: active.size, pending: pending.length });
+        if (options.failFast === true) pending.length = 0;
+      }
+      continue;
+    }
+
+    if (active.size > 0) {
+      const delayRemaining = canSubmit ? Math.max(0, nextSubmissionAt - Date.now()) : Infinity;
+      if (Number.isFinite(delayRemaining) && delayRemaining > 0) {
+        const event = await Promise.race([
+          Promise.race(active.values()).then((outcome) => ({ type: "settled", outcome })),
+          wait(delayRemaining).then(() => ({ type: "ready" })),
+        ]);
+        if (event.type === "settled") recordOutcome(event.outcome);
+      } else {
+        recordOutcome(await Promise.race(active.values()));
+      }
+      continue;
+    }
+
+    const delayRemaining = Math.max(0, nextSubmissionAt - Date.now());
+    if (delayRemaining > 0) await wait(delayRemaining);
+  }
+
+  return { succeeded, failed };
+}
+
+async function runGenerationPlan({
+  prompts,
+  maxInFlight = 1,
+  retryAttempts = 1,
+  rateLimitRetryAttempts = 8,
+  failFast = false,
+  minDelayMs = 0,
+  submit,
+  reconcile,
+  onState,
+  onItemCompleted,
+  wait = sleep,
+  signal,
+}) {
+  const results = new Array(prompts.length);
+  const errors = new Array(prompts.length);
+  const controller = createAdaptiveConcurrencyController(maxInFlight, minDelayMs);
+  const reconcileFailure = async (task, error) => {
+    if (typeof reconcile !== "function") {
+      return error?.externalEffectUncertain === true
+        ? { status: "uncertain" }
+        : { status: "safe_to_retry" };
+    }
+    const outcome = await reconcile({ task, error });
+    if (
+      outcome?.status === "recovered" ||
+      outcome?.status === "safe_to_retry" ||
+      outcome?.status === "uncertain"
+    ) {
+      return outcome;
+    }
+    return { status: "uncertain" };
+  };
+
+  if (maxInFlight === 1) {
+    for (let index = 0; index < prompts.length; index += 1) {
+      if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+      const prompt = prompts[index];
+      let task = { index, prompt, attempt: 1 };
+      let completed = false;
+      let rateRetries = 0;
+
+      while (!completed) {
+        if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+        try {
+          const submission = await submit(task);
+          results[index] = await submission.completion;
+          errors[index] = undefined;
+          completed = true;
+          controller.success();
+          await onItemCompleted?.({ task, value: results[index] });
+        } catch (error) {
+          errors[index] = error;
+          const reconciliation = await reconcileFailure(task, error);
+          if (reconciliation.status === "recovered") {
+            results[index] = reconciliation.value;
+            errors[index] = undefined;
+            completed = true;
+            controller.success();
+            await onItemCompleted?.({ task, value: results[index], reconciled: true });
+            continue;
+          }
+          if (reconciliation.status === "uncertain") break;
+          const isRate = error?.code === "RATE_LIMIT";
+          if (isRate && rateRetries < rateLimitRetryAttempts) {
+            rateRetries += 1;
+            const throttle = controller.failure(error);
+            const waitMs = error?.retryAfterMs || throttle.delayMs || 45000;
+            onState?.({ type: "rate-limit-backoff", task, waitMs, attempt: rateRetries });
+            await wait(waitMs, signal);
+            continue;
+          }
+          if (failFast) throw error;
+          if (task.attempt > retryAttempts || !shouldRetryGenerationError(error)) {
+            break;
+          }
+          task = { ...task, attempt: task.attempt + 1 };
+          onState?.({ type: "retry-round", attempt: task.attempt, tasks: [task] });
+        }
+      }
+      if (!completed && failFast) {
+        throw errors[index] ?? codedError("JOB_FAILED", "A geração não foi concluída.");
+      }
+      if (completed && index + 1 < prompts.length) {
+        const nextDelay = controller.getDelayMs();
+        if (nextDelay > 0) {
+          await wait(nextDelay, signal);
+        }
+      }
+    }
+    return {
+      results,
+      failures: prompts
+        .map((prompt, index) => ({ task: { index, prompt, attempt: 1 }, error: errors[index] }))
+        .filter((item) => item.error !== undefined),
+    };
+  }
+
+  let tasks = prompts.map((prompt, index) => ({ index, prompt, attempt: 1 }));
+  const terminalFailures = [];
+  for (let round = 0; round <= retryAttempts && tasks.length > 0; round += 1) {
+    const outcome = await runSubmissionRound(tasks, controller.getLimit(), submit, onState, {
+      minDelayMs: controller.getDelayMs(),
+      signal,
+      failFast,
+    });
+    for (const success of outcome.succeeded) {
+      results[success.task.index] = success.value;
+      errors[success.task.index] = undefined;
+      controller.success();
+      await onItemCompleted?.(success);
+    }
+    for (const failure of outcome.failed) {
+      errors[failure.task.index] = failure.error;
+      controller.failure(failure.error);
+    }
+    if (failFast && outcome.failed.length > 0) throw outcome.failed[0].error;
+    const retryableTasks = [];
+    for (const failure of outcome.failed.sort(
+      (left, right) => left.task.index - right.task.index,
+    )) {
+      const reconciliation = await reconcileFailure(failure.task, failure.error);
+      if (reconciliation.status === "recovered") {
+        results[failure.task.index] = reconciliation.value;
+        errors[failure.task.index] = undefined;
+        controller.success();
+        await onItemCompleted?.({
+          task: failure.task,
+          value: reconciliation.value,
+          reconciled: true,
+        });
+      } else if (reconciliation.status === "safe_to_retry") {
+        retryableTasks.push({ ...failure.task, attempt: failure.task.attempt + 1 });
+      } else {
+        terminalFailures.push(failure);
+      }
+    }
+    tasks = retryableTasks;
+    if (tasks.length > 0 && round < retryAttempts) {
+      onState?.({ type: "retry-round", attempt: round + 2, tasks: [...tasks] });
+    }
+  }
+
+  return {
+    results,
+    failures: [
+      ...terminalFailures,
+      ...tasks.map((task) => ({
+        task: { ...task, attempt: task.attempt - 1 },
+        error: errors[task.index],
+      })),
+    ],
+  };
+}
+
+function shouldRetryGenerationError(error) {
+  return (
+    error?.retryable !== false &&
+    ["UPSTREAM_UNAVAILABLE", "TIMEOUT", "JOB_FAILED", "RATE_LIMIT"].includes(error?.code)
+  );
+}
+
+function classifyGenerationHttpError(status, bodyText) {
+  let providerStatus = "";
+  let providerMessage = "";
+  try {
+    const body = JSON.parse(String(bodyText || ""));
+    providerStatus = typeof body?.error?.status === "string" ? body.error.status.slice(0, 80) : "";
+    providerMessage =
+      typeof body?.error?.message === "string" ? body.error.message.slice(0, 500) : "";
+  } catch {}
+
+  const hint = `${providerStatus} ${providerMessage}`.toLowerCase();
+  let error;
+  const modelSpecificLimit =
+    /(daily|di.rio|quota|limit).{0,120}(model|nano banana|gem.pix)|(?:model|nano banana|gem.pix).{0,120}(daily|di.rio|quota|limit)/i.test(
+      hint,
+    );
+  if (/atividade incomum|unusual activity|unusual traffic|suspicious activity/i.test(hint)) {
+    error = codedError(
+      "PROVIDER_SECURITY_CHALLENGE",
+      "O Google Flow detectou atividade incomum na rede ou conta.",
+      false,
+    );
+    error.isUnusualActivity = true;
+    error.retryAfterMs = 45000;
+  } else if (/pol[íi]tica|viol|policy|policies|guidelines/i.test(hint)) {
+    error = codedError(
+      "OUTPUT_VALIDATION_FAILED",
+      "O prompt viola as políticas de segurança de conteúdo do Google Flow.",
+      false,
+    );
+    error.isPolicyViolation = true;
+  } else if (status === 401 || /unauthenticated|login|credential|session expired/.test(hint)) {
+    error = codedError(
+      "AUTHENTICATION_FAILED",
+      "O Google Flow exige login ou reautenticação na janela do Chrome.",
+      true,
+    );
+  } else if (/recaptcha|captcha|challenge/.test(hint)) {
+    error = codedError(
+      "AUTHENTICATION_FAILED",
+      "O Google Flow recusou o CAPTCHA/reCAPTCHA desta geração. Conclua a verificação na janela do Chrome e execute novamente.",
+      false,
+    );
+  } else if (modelSpecificLimit) {
+    error = codedError(
+      "MODEL_LIMIT",
+      "O limite diário do modelo de imagem selecionado foi atingido.",
+      false,
+    );
+  } else if (status === 429 || /quota|credit|resource_exhausted|rate.?limit|too many/.test(hint)) {
+    const creditsExhausted = /credit|saldo|cota|esgotad|exhausted/.test(hint);
+    error = codedError(
+      "RATE_LIMIT",
+      "O Google Flow recusou a geração por limite, cota ou créditos disponíveis.",
+      !creditsExhausted,
+    );
+    if (!creditsExhausted) {
+      error.retryAfterMs = 60_000;
+    }
+  } else if (status === 403) {
+    error = codedError(
+      "PERMISSION_DENIED",
+      `O Google Flow recusou a geração (HTTP 403${providerStatus ? `, ${providerStatus}` : ""}). Verifique a janela do Chrome.`,
+      false,
+    );
+  } else if (Number.isFinite(status) && status >= 500) {
+    error = codedError("UPSTREAM_UNAVAILABLE", `Google Flow indisponível (HTTP ${status}).`, true);
+  } else {
+    error = codedError("JOB_FAILED", `Google Flow recusou a geração (HTTP ${status}).`);
+  }
+  error.httpStatus = status;
+  error.providerStatus = providerStatus;
+  return error;
+}
+
+function parseGenerationResponse(captured) {
+  const status = Number(captured?.status);
+  if (Number.isFinite(status) && status >= 400) {
+    throw classifyGenerationHttpError(status, captured?.bodyText);
+  }
+
+  const raw = String(captured?.bodyText || "");
+  if (raw.includes("wrb.fr") || raw.startsWith(")]}'")) {
+    const rpcs = decodificarBatchExecute(raw);
+    for (const r of rpcs) {
+      if (r.erro) {
+        const errStr = String(r.erro);
+        if (
+          /UNUSUAL_ACTIVITY|atividade incomum|unusual activity|suspicious activity/i.test(errStr)
+        ) {
+          const err = codedError(
+            "PROVIDER_SECURITY_CHALLENGE",
+            "O Google Flow detectou atividade incomum na rede ou conta.",
+            false,
+          );
+          err.isUnusualActivity = true;
+          err.retryAfterMs = 45000;
+          throw err;
+        }
+        if (/muito r[áa]pido|rate.?limit|slow down|too many|RESOURCE_EXHAUSTED/i.test(errStr)) {
+          const err = codedError(
+            "RATE_LIMIT",
+            "Você está solicitando gerações muito rápido.",
+            true,
+          );
+          err.retryAfterMs = 45000;
+          throw err;
+        }
+        if (/pol[íi]tica|viol|policy|policies|guidelines/i.test(errStr)) {
+          const err = codedError(
+            "OUTPUT_VALIDATION_FAILED",
+            "O comando viola as políticas de segurança de conteúdo do Google Flow.",
+            false,
+          );
+          err.isPolicyViolation = true;
+          throw err;
+        }
+        throw codedError("JOB_FAILED", `Erro RPC retornado pelo Flow: ${r.erro}`, true);
+      }
+    }
+    const allExtracted = [];
+    for (const r of rpcs) {
+      if (r.payload) {
+        const found = extrairMidiasRpc(r.payload);
+        for (const m of found) allExtracted.push(m);
+      }
+    }
+    if (allExtracted.length === 0) {
+      throw codedError("JOB_FAILED", "Nenhuma mídia encontrada na resposta batchexecute.", true);
+    }
+    return {
+      media: allExtracted.map((m) => ({
+        image: {
+          generatedImage: {
+            fifeUrl: m.url,
+            mediaId: m.mediaId,
+          },
+        },
+      })),
+    };
+  }
+
+  let body;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    throw codedError(
+      "OUTPUT_VALIDATION_FAILED",
+      "A resposta de geração capturada não é JSON válido.",
+    );
+  }
+
+  if (!Array.isArray(body?.media) || body.media.length === 0) {
+    throw codedError("OUTPUT_VALIDATION_FAILED", "A resposta do Google Flow não contém media[].");
+  }
+  if (
+    body.media.some(
+      (item) =>
+        typeof item?.image?.generatedImage?.fifeUrl !== "string" ||
+        !item.image.generatedImage.fifeUrl,
+    )
+  ) {
+    throw codedError(
+      "OUTPUT_VALIDATION_FAILED",
+      "O Google Flow retornou mídia que não é imagem; poster ou frame de vídeo não será aceito.",
+    );
+  }
+  return body;
+}
+
+function mediaItemsFromImageUrls(urls) {
+  const seen = new Set();
+  const media = [];
+  for (const raw of Array.isArray(urls) ? urls : []) {
+    try {
+      const parsed = new URL(String(raw || ""));
+      if (
+        parsed.protocol !== "https:" ||
+        parsed.hostname !== MEDIA_HOST ||
+        !/^\/image\/[^/]+\/?$/i.test(parsed.pathname) ||
+        seen.has(parsed.href)
+      ) {
+        continue;
+      }
+      seen.add(parsed.href);
+      const mediaId =
+        parsed.pathname.split("/").filter(Boolean).at(-1) || `image-${media.length + 1}`;
+      media.push({ image: { generatedImage: { fifeUrl: parsed.href, mediaId } } });
+    } catch {}
+  }
+  return media;
+}
+
+function mediaItemsFromImageCandidates(candidates) {
+  return mediaItemsFromImageUrls(
+    (Array.isArray(candidates) ? candidates : [])
+      .filter((candidate) => candidate?.cardType === "image")
+      .map((candidate) => candidate.url),
+  );
+}
+
+function imageMediaIdentity(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname === MEDIA_HOST ? parsed.pathname : url;
+  } catch { return url; }
+}
+
+async function generatedMediaOnPage(client, sessionId) {
+  const candidates = await evaluate(
+    client,
+    sessionId,
+    `(async () => { ${DEEP_HELPERS}
+      if (typeof window.FlowAuto?.refs2?.listProjectMedia === "function") {
+        return (await window.FlowAuto.refs2.listProjectMedia())
+          .map(tile => ({ url: tile.url, cardType: tile.kind }));
+      }
+      return cfAll('img')
+        .filter(cfVisible)
+        .map(img => {
+          const url = img.currentSrc || img.src || '';
+          if (!String(url).toLowerCase().startsWith('https://flow-content.google/image/')) return null;
+          let node = img;
+          for (let depth = 0; node && depth < 10; depth += 1, node = node.parentElement) {
+            const videoHotbar = node.querySelector?.('flow-video-hotbar');
+            const imageHotbar = node.querySelector?.('flow-image-hotbar');
+            if (videoHotbar) return { url, cardType: 'video' };
+            if (imageHotbar) return { url, cardType: 'image' };
+          }
+          return { url, cardType: 'unknown' };
+        })
+        .filter(Boolean);
+    })()`,
+  );
+  return mediaItemsFromImageCandidates(candidates);
+}
+
+async function recoverMediaByLabel(client, sessionId, label) {
+  const urls = await evaluate(
+    client,
+    sessionId,
+    `(() => { ${DEEP_HELPERS}
+    const label = ${JSON.stringify(label.toLowerCase())};
+    const candidates = cfAll('img, [alt], [aria-label], [title], [role="group"], span, div')
+      .filter(el => [el.getAttribute('alt'), el.getAttribute('aria-label'), el.getAttribute('title'), el.textContent,
+        (el.getAttribute('aria-labelledby') || '').split(/\s+/).map(id => document.getElementById(id)?.textContent || '').join(' ')]
+        .some(value => String(value || '').trim().toLowerCase() === label));
+    const urls = new Set();
+    for (const candidate of candidates) {
+      if (candidate instanceof HTMLImageElement && cfVisible(candidate)) {
+        urls.add(candidate.currentSrc || candidate.src);
+        continue;
+      }
+      let node = candidate;
+      for (let depth = 0; node && depth < 6; depth++, node = node.parentElement) {
+        const images = [...node.querySelectorAll('img')].filter(cfVisible);
+        if (images.length === 1) { urls.add(images[0].currentSrc || images[0].src); break; }
+        if (images.length > 1) break;
+      }
+    }
+    return [...urls];
+  })()`,
+  );
+  const media = mediaItemsFromImageUrls(urls);
+  if (media.length !== 1)
+    throw codedError(
+      "OUTPUT_VALIDATION_FAILED",
+      "Não foi possível identificar uma única imagem para a recuperação solicitada. Nenhuma geração foi disparada.",
+    );
+  return media[0];
+}
+
+async function waitForGeneratedMediaOnPage(
+  client,
+  sessionId,
+  baselineUrls,
+  signal,
+  timeoutMs,
+  isCancelled = () => false,
+) {
+  const baseline = new Set(baselineUrls.map(imageMediaIdentity));
+  const deadline = Date.now() + timeoutMs;
+  let initialErrorCount = 0;
+  try {
+    const rawCount = await evaluate(
+      client,
+      sessionId,
+      `document.querySelectorAll('.error-tile, flow-image-tile .error-tile-content').length`,
+    );
+    initialErrorCount = Number(rawCount) || 0;
+  } catch {}
+  while (Date.now() < deadline && !isCancelled()) {
+    if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+    try {
+      const tileErr = await evaluate(
+        client,
+        sessionId,
+        `(() => {
+          const currentCount = document.querySelectorAll('.error-tile, flow-image-tile .error-tile-content').length;
+          if (currentCount <= ${initialErrorCount}) {
+            const banners = Array.from(document.querySelectorAll('flow-banner, [role="alert"], .banner'));
+            for (const b of banners) {
+              const txt = (b.textContent || "").toLowerCase();
+              if (/notamos uma atividade incomum|unusual activity/i.test(txt)) return { type: "unusual_activity", text: b.textContent };
+              if (/muito r[áa]pido|aguarde um instante/i.test(txt)) return { type: "rate_limit", text: b.textContent };
+              if (/high demand|alta demanda|experiencing high demand/i.test(txt)) return { type: "high_demand", text: b.textContent };
+            }
+            return null;
+          }
+          const tiles = Array.from(document.querySelectorAll('[data-tile-id], [role="group"], flow-video-tile, flow-image-tile, [class*="tile"]'));
+          for (const t of tiles) {
+            const txt = (t.textContent || "").toLowerCase();
+            if (/notamos uma atividade incomum|unusual activity|unusual traffic|suspicious activity/i.test(txt)) return { type: "unusual_activity", text: t.textContent };
+            if (/muito r[áa]pido|aguarde um instante|too quickly|too fast|rate limit|slow down/i.test(txt)) return { type: "rate_limit", text: t.textContent };
+            if (/pol[íi]tica|viol|policy|policies|guidelines/i.test(txt)) return { type: "policy", text: t.textContent };
+            if (/falha|warning|error/i.test(txt) && /atividade incomum/i.test(txt)) return { type: "unusual_activity", text: t.textContent };
+          }
+          return null;
+        })()`,
+      );
+      if (tileErr) {
+        if (tileErr.type === "unusual_activity") {
+          const err = codedError(
+            "PROVIDER_SECURITY_CHALLENGE",
+            "Notamos uma atividade incomum na sua conta ou rede.",
+            false,
+          );
+          err.isUnusualActivity = true;
+          err.retryAfterMs = 45000;
+          throw err;
+        }
+        if (tileErr.type === "rate_limit") {
+          const err = codedError(
+            "RATE_LIMIT",
+            "Você está solicitando gerações muito rápido.",
+            true,
+          );
+          err.retryAfterMs = 45000;
+          throw err;
+        }
+        if (tileErr.type === "policy") {
+          const err = codedError(
+            "OUTPUT_VALIDATION_FAILED",
+            "O comando viola as políticas de conteúdo do Google Flow.",
+            false,
+          );
+          err.isPolicyViolation = true;
+          throw err;
+        }
+        if (tileErr.type === "high_demand") {
+          const err = codedError("RATE_LIMIT", "Alta demanda no Google Flow no momento.", true);
+          err.retryAfterMs = 60000;
+          throw err;
+        }
+      }
+      const fresh = (await generatedMediaOnPage(client, sessionId)).filter(
+        (item) => !baseline.has(imageMediaIdentity(item.image.generatedImage.fifeUrl)),
+      );
+      if (fresh.length > 0) return { media: fresh };
+    } catch (err) {
+      if (
+        err?.code === "RATE_LIMIT" ||
+        err?.code === "PROVIDER_SECURITY_CHALLENGE" ||
+        err?.code === "OUTPUT_VALIDATION_FAILED" ||
+        err?.code === "CANCELLED"
+      ) {
+        throw err;
+      }
+    }
+    await sleep(750, signal);
+  }
+  throw codedError(
+    "TIMEOUT",
+    "Nenhuma imagem nova apareceu no projeto do Google Flow dentro do tempo limite.",
+  );
+}
+
+function extensionForMime(mimeType) {
+  const mime = String(mimeType).toLowerCase();
+  if (mime.includes("png")) return ".png";
+  if (mime.includes("webp")) return ".webp";
+  if (mime.includes("jpeg") || mime.includes("jpg")) return ".jpg";
+  return ".img";
+}
+
+function validateImageArtifactBytes(bytes, mimeType, declaredSize, locale) {
+  if (!["image/jpeg", "image/png", "image/webp"].includes(mimeType)) {
+    throw codedError("OUTPUT_VALIDATION_FAILED", flowMediaMessage(locale, "imageMime", mimeType));
+  }
+  if (Number.isFinite(declaredSize) && declaredSize > MAX_IMAGE_BYTES) {
+    throw codedError("OUTPUT_VALIDATION_FAILED", flowMediaMessage(locale, "imageTooLarge"));
+  }
+  if (bytes.byteLength < 1 || bytes.byteLength > MAX_IMAGE_BYTES) {
+    throw codedError("OUTPUT_VALIDATION_FAILED", flowMediaMessage(locale, "imageInvalidSize"));
+  }
+  if (Number.isFinite(declaredSize) && declaredSize >= 0 && declaredSize !== bytes.byteLength) {
+    throw codedError("OUTPUT_VALIDATION_FAILED", flowMediaMessage(locale, "imageLengthMismatch"));
+  }
+  const isJpeg = bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+  const isPng =
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a;
+  const isWebp =
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50;
+  if (!isJpeg && !isPng && !isWebp) {
+    throw codedError("OUTPUT_VALIDATION_FAILED", flowMediaMessage(locale, "imageInvalidSignature"));
+  }
+  if (
+    (mimeType === "image/jpeg" && !isJpeg) ||
+    (mimeType === "image/png" && !isPng) ||
+    (mimeType === "image/webp" && !isWebp)
+  ) {
+    throw codedError(
+      "OUTPUT_VALIDATION_FAILED",
+      flowMediaMessage(locale, "imageMimeMismatch", mimeType),
+    );
+  }
+}
+
+async function downloadGeneratedImage(
+  item,
+  prompt,
+  promptOrdinal,
+  variantOrdinal,
+  services,
+  namespace = "image",
+  locale,
+  externalContext,
+) {
+  const generated = item?.image?.generatedImage;
+  const mediaUrl = generated?.fifeUrl;
+  const mediaId = generated?.mediaId || item?.name || `image-${promptOrdinal}-${variantOrdinal}`;
+  if (typeof mediaUrl !== "string" || !mediaUrl)
+    throw codedError("OUTPUT_VALIDATION_FAILED", "Imagem gerada sem fifeUrl.");
+
+  const parsed = new URL(mediaUrl);
+  if (parsed.protocol !== "https:" || parsed.hostname !== MEDIA_HOST) {
+    throw codedError("OUTPUT_VALIDATION_FAILED", `Host de mídia inesperado: ${parsed.hostname}`);
+  }
+  if (!/^\/image\/[^/]+\/?$/i.test(parsed.pathname)) {
+    throw codedError(
+      "OUTPUT_VALIDATION_FAILED",
+      `A mídia não usa o endpoint original de imagem do Flow: ${parsed.pathname}`,
+    );
+  }
+  const urlMediaId = parsed.pathname.split("/").filter(Boolean).at(-1);
+  if (generated?.mediaId && urlMediaId && String(generated.mediaId) !== urlMediaId) {
+    throw codedError(
+      "OUTPUT_VALIDATION_FAILED",
+      "O mediaId retornado pelo Flow não corresponde ao arquivo de imagem solicitado.",
+    );
+  }
+
+  let response;
+  try {
+    response = await fetch(mediaUrl, { signal: services.signal, redirect: "error" });
+  } catch (cause) {
+    if (services.signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+    throw codedError(
+      "UPSTREAM_UNAVAILABLE",
+      `Falha ao baixar imagem gerada: ${cause?.message ?? cause}`,
+      true,
+    );
+  }
+  if (!response.ok)
+    throw codedError(
+      "UPSTREAM_UNAVAILABLE",
+      `Falha ao baixar imagem gerada (HTTP ${response.status}).`,
+      response.status >= 500,
+    );
+
+  const declaredHeader = response.headers.get("content-length");
+  const declared = declaredHeader === null ? Number.NaN : Number(declaredHeader);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  const mimeType = (response.headers.get("content-type") || "image/jpeg")
+    .split(";")[0]
+    .trim()
+    .toLowerCase();
+  validateImageArtifactBytes(bytes, mimeType, declared, locale);
+
+  const ext = extensionForMime(mimeType);
+  const promptPart = String(promptOrdinal).padStart(3, "0");
+  const variantPart = String(variantOrdinal).padStart(2, "0");
+  const normalizedNamespace = artifactNamespace(namespace, "image");
+  const namespacePrefix = normalizedNamespace === "image" ? "" : `${normalizedNamespace}_`;
+  const filename = `${namespacePrefix}${promptPart}_v${variantPart}_${safeFilename(prompt, String(mediaId))}${ext}`;
+  const artifactId = `google-flow-${normalizedNamespace}-${promptPart}-v${variantPart}`;
+  const outputPath =
+    typeof services?.getOutputPath === "function"
+      ? services.getOutputPath(filename)
+      : services?.getWorkspacePath
+        ? services.getWorkspacePath(filename)
+        : filename;
+  await writeFile(outputPath, bytes);
+  if (externalContext) await rememberMedia(services, createHash("sha256").update(bytes).digest("hex"), externalContext, { mediaId: String(mediaId) });
+
+  return {
+    file: {
+      id: artifactId,
+      name: filename,
+      mimeType,
+      size: bytes.byteLength,
+      url: `artifact://${artifactId}`,
+    },
+    artifact: {
+      id: artifactId,
+      name: filename,
+      mimeType,
+      size: bytes.byteLength,
+      source: { kind: "path", path: filename },
+    },
+  };
+}
+
+function mediaItemsFromVideoUrls(urls) {
+  const seen = new Set();
+  const media = [];
+  for (const raw of Array.isArray(urls) ? urls : []) {
+    try {
+      const parsed = new URL(String(raw || ""));
+      if (parsed.protocol !== "https:" || parsed.hostname !== MEDIA_HOST || seen.has(imageMediaIdentity(parsed.href))) {
+        continue;
+      }
+      if (!parsed.pathname.includes("/video/")) continue;
+      seen.add(imageMediaIdentity(parsed.href));
+      const mediaId =
+        parsed.pathname.split("/").filter(Boolean).at(-1) || `video-${media.length + 1}`;
+      media.push({ video: { fifeUrl: parsed.href, mediaId } });
+    } catch {}
+  }
+  return media;
+}
+
+async function generatedVideosOnPage(client, sessionId) {
+  const urls = await evaluate(
+    client,
+    sessionId,
+    `(() => { ${DEEP_HELPERS}
+      const list = cfAll('video, video source')
+        .map(el => el.currentSrc || el.src || '')
+        .filter(src => String(src).toLowerCase().includes('flow-content.google/video/'));
+      return Array.from(new Set(list));
+    })()`,
+  );
+  return mediaItemsFromVideoUrls(urls);
+}
+
+async function waitForGeneratedVideosOnPage(
+  client,
+  sessionId,
+  baselineUrls,
+  signal,
+  timeoutMs,
+  isCancelled = () => false,
+) {
+  const baseline = new Set(baselineUrls.map(imageMediaIdentity));
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && !isCancelled()) {
+    if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+    try {
+      const tileErr = await evaluate(
+        client,
+        sessionId,
+        `(() => {
+          const tiles = Array.from(document.querySelectorAll('[data-tile-id], [role="group"], flow-video-tile, flow-image-tile, [class*="tile"]'));
+          for (const t of tiles) {
+            const txt = (t.textContent || "").toLowerCase();
+            if (/notamos uma atividade incomum|unusual activity|unusual traffic|suspicious activity/i.test(txt)) return { type: "unusual_activity", text: t.textContent };
+            if (/muito r[áa]pido|aguarde um instante|too quickly|too fast|rate limit|slow down/i.test(txt)) return { type: "rate_limit", text: t.textContent };
+            if (/pol[íi]tica|viol|policy|policies|guidelines/i.test(txt)) return { type: "policy", text: t.textContent };
+            if (/falha|warning|error/i.test(txt) && /atividade incomum/i.test(txt)) return { type: "unusual_activity", text: t.textContent };
+          }
+          const banners = Array.from(document.querySelectorAll('flow-banner, [role="alert"], .banner'));
+          for (const b of banners) {
+            const txt = (b.textContent || "").toLowerCase();
+            if (/notamos uma atividade incomum|unusual activity/i.test(txt)) return { type: "unusual_activity", text: b.textContent };
+            if (/muito r[áa]pido|aguarde um instante/i.test(txt)) return { type: "rate_limit", text: b.textContent };
+            if (/high demand|alta demanda|experiencing high demand/i.test(txt)) return { type: "high_demand", text: b.textContent };
+          }
+          return null;
+        })()`,
+      );
+      if (tileErr) {
+        if (tileErr.type === "unusual_activity") {
+          const err = codedError(
+            "PROVIDER_SECURITY_CHALLENGE",
+            "Notamos uma atividade incomum na sua conta ou rede.",
+            false,
+          );
+          err.isUnusualActivity = true;
+          err.retryAfterMs = 45000;
+          throw err;
+        }
+        if (tileErr.type === "rate_limit") {
+          const err = codedError(
+            "RATE_LIMIT",
+            "Você está solicitando gerações muito rápido.",
+            true,
+          );
+          err.retryAfterMs = 45000;
+          throw err;
+        }
+        if (tileErr.type === "policy") {
+          const err = codedError(
+            "OUTPUT_VALIDATION_FAILED",
+            "O comando viola as políticas de conteúdo do Google Flow.",
+            false,
+          );
+          err.isPolicyViolation = true;
+          throw err;
+        }
+        if (tileErr.type === "high_demand") {
+          const err = codedError("RATE_LIMIT", "Alta demanda no Google Flow no momento.", true);
+          err.retryAfterMs = 60000;
+          throw err;
+        }
+      }
+      const fresh = (await generatedVideosOnPage(client, sessionId)).filter(
+        (item) => !baseline.has(imageMediaIdentity(item.video.fifeUrl)),
+      );
+      if (fresh.length > 0) return { media: fresh };
+    } catch (err) {
+      if (
+        err?.code === "RATE_LIMIT" ||
+        err?.code === "PROVIDER_SECURITY_CHALLENGE" ||
+        err?.code === "OUTPUT_VALIDATION_FAILED" ||
+        err?.code === "CANCELLED"
+      ) {
+        throw err;
+      }
+    }
+    await sleep(1000, signal);
+  }
+  throw codedError(
+    "TIMEOUT",
+    "Nenhum vídeo novo apareceu no projeto do Google Flow dentro do tempo limite.",
+  );
+}
+
+function validateVideoArtifactBytes(bytes, mimeType, declaredSize, locale) {
+  if (mimeType !== "video/mp4") {
+    throw codedError("OUTPUT_VALIDATION_FAILED", flowMediaMessage(locale, "videoMime", mimeType));
+  }
+  if (Number.isFinite(declaredSize) && declaredSize > MAX_VIDEO_BYTES) {
+    throw codedError("OUTPUT_VALIDATION_FAILED", flowMediaMessage(locale, "videoTooLarge"));
+  }
+  if (bytes.byteLength < 12 || bytes.byteLength > MAX_VIDEO_BYTES) {
+    throw codedError("OUTPUT_VALIDATION_FAILED", flowMediaMessage(locale, "videoInvalidSize"));
+  }
+  if (Number.isFinite(declaredSize) && declaredSize >= 0 && declaredSize !== bytes.byteLength) {
+    throw codedError("OUTPUT_VALIDATION_FAILED", flowMediaMessage(locale, "videoLengthMismatch"));
+  }
+  const hasFtyp = bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70;
+  if (!hasFtyp) {
+    throw codedError("OUTPUT_VALIDATION_FAILED", flowMediaMessage(locale, "videoInvalidSignature"));
+  }
+}
+
+async function downloadGeneratedVideo(
+  item,
+  prompt,
+  promptOrdinal,
+  services,
+  namespace = "video",
+  locale,
+) {
+  const mediaUrl = item?.video?.fifeUrl;
+  const mediaId = item?.video?.mediaId || `video-${promptOrdinal}`;
+  if (typeof mediaUrl !== "string" || !mediaUrl) {
+    throw codedError("OUTPUT_VALIDATION_FAILED", "Vídeo gerado sem fifeUrl.");
+  }
+
+  const parsed = new URL(mediaUrl);
+  if (parsed.protocol !== "https:" || parsed.hostname !== MEDIA_HOST) {
+    throw codedError("OUTPUT_VALIDATION_FAILED", `Host de mídia inesperado: ${parsed.hostname}`);
+  }
+
+  let response;
+  try {
+    response = await fetch(mediaUrl, { signal: services.signal, redirect: "error" });
+  } catch (cause) {
+    if (services.signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+    throw codedError(
+      "UPSTREAM_UNAVAILABLE",
+      `Falha ao baixar vídeo gerado: ${cause?.message ?? cause}`,
+      true,
+    );
+  }
+  if (!response.ok) {
+    throw codedError(
+      "UPSTREAM_UNAVAILABLE",
+      `Falha ao baixar vídeo gerado (HTTP ${response.status}).`,
+      response.status >= 500,
+    );
+  }
+
+  const mimeType = (response.headers.get("content-type") || "video/mp4")
+    .split(";")[0]
+    .trim()
+    .toLowerCase();
+  const declaredHeader = response.headers.get("content-length");
+  const declared = declaredHeader === null ? Number.NaN : Number(declaredHeader);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  validateVideoArtifactBytes(bytes, mimeType, declared, locale);
+
+  const promptPart = String(promptOrdinal).padStart(3, "0");
+  const normalizedNamespace = artifactNamespace(namespace, "video");
+  const namespacePrefix = normalizedNamespace === "video" ? "" : `${normalizedNamespace}_`;
+  const filename = `${namespacePrefix}${promptPart}_video_${safeFilename(prompt, String(mediaId))}.mp4`;
+  const artifactId = `google-flow-${normalizedNamespace}-${promptPart}`;
+  const outputPath =
+    typeof services?.getOutputPath === "function"
+      ? services.getOutputPath(filename)
+      : services?.getWorkspacePath
+        ? services.getWorkspacePath(filename)
+        : filename;
+  await writeFile(outputPath, bytes);
+
+  return {
+    file: {
+      id: artifactId,
+      name: filename,
+      mimeType,
+      size: bytes.byteLength,
+      url: `artifact://${artifactId}`,
+    },
+    artifact: {
+      id: artifactId,
+      name: filename,
+      mimeType,
+      size: bytes.byteLength,
+      source: { kind: "path", path: filename },
+    },
+  };
+}
+
+async function maybeCloseBrowser(client, browserInfo, keepBrowserOpen) {
+  client?.close();
+}
+
+async function configureProfile(request, services) {
+  const settings = request?.settings ?? {};
+  let runtime;
+  try {
+    runtime = resolveProfileRuntime(request, services);
+    assertDedicatedProfilePath(runtime.profilePath);
+  } catch (error) {
+    return resultError(
+      error?.code || "INVALID_CONFIGURATION",
+      error?.message || "Perfil inválido.",
+    );
+  }
+  if (request?.invocation?.action === "status") {
+    return {
+      status: "success",
+      values: { ready: await profileIsPrepared(runtime, runtime.accountProfile) },
+    };
+  }
+  if (request?.invocation?.action !== "prepare") {
+    return resultError("INVALID_CONFIGURATION", "Ação de configuração de perfil inválida.");
+  }
+
+  let client, extensionBridge, browserInfo;
+  try {
+    const launched = await launchOrReuseChrome({
+      profilePath: runtime.profilePath,
+      port: runtime.port,
+      coreSession: settings.__contentFlowBrowserSession,
+      startMinimized: false,
+      keepBrowserOpen: false,
+      startUrl: FLOW_LANDING_URL,
+      signal: services.signal,
+    });
+    browserInfo = launched;
+    client = await new CdpClient(launched.version.webSocketDebuggerUrl).connect(services.signal);
+    const page = await attachFlowPage(client, FLOW_LANDING_URL, true, services.signal, true);
+    const extensionWaitMs = PROFILE_SETUP_WAIT_MS;
+    [extensionBridge] = await Promise.all([
+      attachExtensionBridge(client, page.sessionId, {
+        signal: services.signal,
+        request,
+        profileId: runtime.accountProfile,
+        waitMs: extensionWaitMs,
+      }),
+      waitForFlowProfile(client, page.sessionId, settings, services.signal, PROFILE_SETUP_WAIT_MS),
+    ]);
+    await markProfilePrepared(runtime, runtime.accountProfile, extensionBridge.identity);
+    return {
+      status: "success",
+      values: {
+        ready: true,
+        message: `Perfil ${runtime.accountProfile} validado no Google Flow.`,
+      },
+    };
+  } catch (error) {
+    return resultError(
+      error?.code || "AUTHENTICATION_FAILED",
+      error?.message || "Não foi possível validar o login do Google Flow.",
+      Boolean(error?.retryable),
+    );
+  } finally {
+    await extensionBridge?.dispose();
+    if (browserInfo?.startedByCore) client?.close();
+    else await closeBrowserGracefully(client);
+  }
+}
+
+function normalizeItemActionRequest(request) {
+  if (request?.invocation?.mode !== "item_action") return request;
+  if (request.invocation.action !== "regenerate") return null;
+  const itemInput = request?.itemAction?.input;
+  const capabilityId = String(request?.capabilityId ?? "");
+  const outputPort = actionableOutputPort(capabilityId);
+  if (!outputPort || request?.invocation?.outputPort !== outputPort) {
+    return null;
+  }
+  const inputs = { ...(request?.inputs ?? {}) };
+  if (["generate-images-in-browser", "generate-video-in-browser"].includes(capabilityId)) {
+    inputs.prompts = itemInput;
+  } else if (capabilityId === "animate-image-in-browser" && typeof itemInput === "string") {
+    inputs.prompts = itemInput;
+  }
+  return {
+    ...request,
+    invocation: { mode: "start" },
+    __flowItemAction: {
+      itemId: request?.invocation?.itemId,
+      outputPort,
+      key: request?.itemAction?.key,
+      variantKey: request?.itemAction?.variantKey,
+      attempt: request?.itemAction?.attempt,
+    },
+    inputs,
+    configuration:
+      capabilityId === "generate-images-in-browser"
+        ? { ...(request?.configuration ?? {}), maxImagesPerPrompt: 1 }
+        : request?.configuration,
+  };
+}
+
+async function executeHandler(request, services) {
+  if (request?.invocation?.mode === "configure") {
+    if (request?.invocation?.action === "options") {
+      return resultError("INVALID_CONFIGURATION", "Os modelos do Flow são opções fixas do plugin.");
+    }
+    return await configureProfile(request, services);
+  }
+  request = normalizeItemActionRequest(request);
+  if (!request) {
+    return resultError("INVALID_CONFIGURATION", "A ação de item solicitada não é suportada.");
+  }
+  if (request?.invocation?.mode !== "start") {
+    return resultError(
+      "INVALID_CONFIGURATION",
+      "Esta capability suporta somente invocation.mode=start.",
+    );
+  }
+
+  const capabilityId = String(request?.capabilityId ?? "generate-images-in-browser");
+  const internalContext = invocationMediaContext(request);
+  const outputArtifactNamespace = artifactNamespace(
+    internalContext.artifactNamespace,
+    capabilityId === "generate-images-in-browser" ? "image" : "video",
+  );
+  if (isFreshRetryRequest(request)) {
+    // A nova tentativa precisa refletir o Método e as entradas atuais. Os
+    // checkpoints do plugin são somente uma otimização operacional e nunca
+    // podem reaplicar efeitos de uma tentativa anterior.
+    await clearGenerationCheckpoint(request, services);
+    await clearVisualProductionCheckpoint(request, services);
+    await clearCaptchaRetryNavigation(request, services);
+    request = { ...request, resume: undefined };
+  }
+  if (capabilityId === "produce-visual-assets-in-browser") {
+    return executeVisualProductionBatch(request, services);
+  }
+  const isVideoGeneration = capabilityId === "generate-video-in-browser";
+  const isImageAnimation = capabilityId === "animate-image-in-browser";
+  const isVideoCapability = isVideoGeneration || isImageAnimation;
+
+  if (
+    ![
+      "generate-images-in-browser",
+      "animate-image-in-browser",
+      "generate-video-in-browser",
+    ].includes(capabilityId)
+  ) {
+    return resultError("INVALID_CONFIGURATION", `Capability não suportada: ${capabilityId}`);
+  }
+
+  const continuousClaims = await claimFlowContinuousItems(request, services);
+  if (continuousClaims && continuousClaims.length === 0) {
+    return {
+      status: "success",
+      values:
+        request?.capabilityId === "generate-video-in-browser" ? { video: [] } : { images: [] },
+      artifacts: [],
+      usage: { provider: "Google Labs / Flow", outputUnits: 0, unit: "visual_asset" },
+      logs: ["Nenhuma unidade pendente para esta sessão contínua."],
+    };
+  }
+  const continuousItems = continuousClaims
+    ? createFlowContinuousItemState(continuousClaims, request?.context?.locale)
+    : undefined;
+  let prompts = continuousClaims
+    ? continuousClaims.map(
+        (claim) =>
+          normalizePrompts(
+            claim.input,
+            request?.configuration?.promptFormat,
+            request?.context?.locale,
+          )[0],
+      )
+    : normalizePrompts(
+        request?.inputs?.prompts ?? request?.inputs?.prompt ?? request?.inputs?.prompt_records,
+        request?.configuration?.promptFormat,
+        request?.context?.locale,
+      );
+  const singleImageOutput = requestsSingleImage(request);
+  // Em uma invocação orquestrada por item, o núcleo precisa receber o valor
+  // escalar daquela unidade para consolidar a coleção sem criar arrays aninhados.
+  const singleVideoOutput = requestsSingleVideo(request) || isCoreItemInvocation(request);
+
+  if (capabilityId === "generate-images-in-browser") {
+    if (prompts.length === 0) return resultError("INVALID_INPUT", "Informe pelo menos um prompt.");
+    if (singleImageOutput && prompts.length !== 1) {
+      return resultError(
+        "INVALID_INPUT",
+        "Um output image exige exatamente um prompt. Use files para gerar um lote.",
+      );
+    }
+  } else if (isVideoGeneration) {
+    if (prompts.length === 0)
+      return resultError("INVALID_INPUT", "Informe pelo menos um prompt de vídeo.");
+  } else if (isImageAnimation) {
+    prompts = animationPrompts(request, prompts);
+    if (!prompts.length) return resultError("INVALID_INPUT", referenceMessage(request.context?.locale, "animationInstruction"));
+  }
+
+  if (request?.configuration?.referenceMode === "per_prompt") {
+    if (request?.configuration?.promptFormat !== "json")
+      return resultError(
+        "INVALID_CONFIGURATION",
+        flowTextMessage(request?.context?.locale, "Per-prompt references require JSON prompts."),
+      );
+    const sourceIds = continuousClaims
+      ? continuousClaims.map((claim) => claim.sourceItemId)
+      : request.batch
+        ? [request.batch.sourceItemId]
+        : (request.inputDeliveries ?? [])
+            .filter((delivery) => ["prompts", "prompt"].includes(delivery.portKey))
+            .flatMap((delivery) => (delivery.items ?? []).map((item) => item.id));
+    if (!sourceIds.length)
+      return resultError(
+        "INVALID_INPUT",
+        flowTextMessage(
+          request?.context?.locale,
+          "Per-prompt references require canonical prompt items.",
+        ),
+      );
+    for (const id of sourceIds) {
+      const selected = referenceImagesForSourceItem(request, id);
+      if (selected.length > (request.configuration.maxReferenceImages ?? 10))
+        return resultError(
+          "INVALID_INPUT",
+          flowTextMessage(
+            request?.context?.locale,
+            "The scene exceeds the configured reference limit.",
+          ),
+        );
+    }
+  }
+  let rawReferences = referenceImagesForCurrentItem(request);
+  if (!isVideoCapability && (continuousClaims || !request.batch)) {
+    rawReferences = request?.inputs?.reference_images ?? request?.inputs?.reference_image ?? rawReferences;
+  }
+  if (isImageAnimation && !rawReferences) {
+    rawReferences = request?.inputs?.images ?? request?.inputs?.image;
+  }
+  const referenceImages = normalizeReferenceImages(rawReferences);
+  const coreBatchIndex = Number.isInteger(request?.batch?.index) ? request.batch.index : undefined;
+  const coreBatchTotal = Number.isInteger(request?.batch?.total) ? request.batch.total : continuousClaims?.[0]?.total;
+
+  const settings = request?.settings ?? {};
+  const keepBrowserOpen = keepBrowserForCurrentItem(request);
+  const startMinimized =
+    typeof request?.configuration?.startMinimized === "boolean"
+      ? request.configuration.startMinimized
+      : settings.startMinimized !== false;
+  const requestTimeoutSeconds = Number.isInteger(settings.requestTimeoutSeconds)
+    ? settings.requestTimeoutSeconds
+    : isVideoCapability
+      ? 450
+      : 240;
+  const delayBetweenPromptsMs = Number.isInteger(request?.configuration?.delayBetweenPromptsMs)
+    ? request.configuration.delayBetweenPromptsMs
+    : 6000;
+  const requestedConcurrentGenerations = Number.isInteger(
+    request?.configuration?.maxConcurrentGenerations,
+  )
+    ? request.configuration.maxConcurrentGenerations
+    : 3;
+  const retryAttempts = Number.isInteger(request?.configuration?.retryAttempts)
+    ? request.configuration.retryAttempts
+    : 1;
+  const rateLimitRetryAttempts =
+    coreBatchIndex !== undefined
+      ? 0
+      : Number.isInteger(request?.configuration?.rateLimitRetryAttempts)
+        ? request.configuration.rateLimitRetryAttempts
+        : 8;
+  const maxReferenceImages = Number.isInteger(request?.configuration?.maxReferenceImages)
+    ? request.configuration.maxReferenceImages
+    : isImageAnimation
+      ? 1
+      : 10;
+  const requestedMaxImagesPerPrompt = Number.isInteger(request?.configuration?.maxImagesPerPrompt)
+    ? request.configuration.maxImagesPerPrompt
+    : 1;
+  if (requestedConcurrentGenerations < 1 || requestedConcurrentGenerations > 5) {
+    return resultError("INVALID_CONFIGURATION", "maxConcurrentGenerations deve ficar entre 1 e 5.");
+  }
+  if (retryAttempts < 0 || retryAttempts > 2) {
+    return resultError("INVALID_CONFIGURATION", "retryAttempts deve ficar entre 0 e 2.");
+  }
+  if (maxReferenceImages < 0 || maxReferenceImages > 10) {
+    return resultError("INVALID_CONFIGURATION", "maxReferenceImages deve ficar entre 0 e 10.");
+  }
+  if (requestedMaxImagesPerPrompt < 1 || requestedMaxImagesPerPrompt > 4) {
+    return resultError("INVALID_CONFIGURATION", "maxImagesPerPrompt deve ficar entre 1 e 4.");
+  }
+  const maxImagesPerPrompt = singleImageOutput ? 1 : requestedMaxImagesPerPrompt;
+  const stepLogs = [];
+  const diagnosticLogs = [];
+  const diagnosticFile =
+    settings.diagnosticTrace === false || typeof services?.getWorkspacePath !== "function"
+      ? null
+      : services.getWorkspacePath(
+          `diagnostics/${String(request?.executionId || "execution")}-${String(request?.blockId || "block")}-attempt-${Number(request?.attempt || 1)}-${randomUUID()}.json`,
+        );
+  const step = (message) => {
+    stepLogs.push(message);
+    if (stepLogs.length > 240) stepLogs.shift();
+    try {
+      console.error(`[Google Flow] ${message}`);
+    } catch {}
+  };
+  const trace = (message) => {
+    if (settings.diagnosticTrace === false) return;
+    diagnosticLogs.push(message);
+    if (diagnosticLogs.length > 5_000) diagnosticLogs.shift();
+  };
+  step(
+    settings.diagnosticTrace === false
+      ? "Depuração contínua desativada explicitamente na configuração do plugin."
+      : "Depuração contínua ativa durante o job inteiro.",
+  );
+
+  const localGenerationCheckpoint =
+    (capabilityId === "generate-images-in-browser" ||
+      capabilityId === "generate-video-in-browser") &&
+    coreBatchIndex === undefined &&
+    continuousClaims === undefined
+      ? await readGenerationCheckpoint(request, services, prompts)
+      : undefined;
+  const durableGenerationFiles =
+    coreBatchIndex === undefined &&
+    continuousClaims === undefined &&
+    (capabilityId === "generate-images-in-browser" || capabilityId === "generate-video-in-browser")
+      ? durableResumeFiles(
+          request,
+          capabilityId === "generate-video-in-browser" ? "video" : "image",
+        ).filter((file) => {
+          const index = promptIndexFromGeneratedFile(
+            file,
+            capabilityId === "generate-video-in-browser" ? "video" : "image",
+          );
+          return Number.isInteger(index) && index >= 0 && index < prompts.length;
+        })
+      : [];
+  const generationCheckpoint =
+    durableGenerationFiles.length > 0
+      ? {
+          ...(localGenerationCheckpoint ?? {}),
+          completedPromptIndexes: durableGenerationFiles
+            .map((file) =>
+              promptIndexFromGeneratedFile(
+                file,
+                capabilityId === "generate-video-in-browser" ? "video" : "image",
+              ),
+            )
+            .filter(Number.isInteger),
+          files: durableGenerationFiles,
+        }
+      : localGenerationCheckpoint;
+  const completedPromptIndexes = new Set(
+    (generationCheckpoint?.completedPromptIndexes ?? []).filter(
+      (index) => Number.isInteger(index) && index >= 0 && index < prompts.length,
+    ),
+  );
+  const publishingPromptIndexes = new Set();
+  if (completedPromptIndexes.size > 0) {
+    step(
+      `Retomando a fila interna com ${completedPromptIndexes.size} prompt(s) já concluído(s), sem reenviá-los.`,
+    );
+  }
+
+  let navigation;
+  let profileRuntime;
+  let generationPreferences;
+  let videoPreferences;
+  let referencePaths;
+  let preparedReferences = new Map();
+  try {
+    profileRuntime = resolveProfileRuntime(request, services);
+    if (isVideoCapability) {
+      videoPreferences = resolveVideoPreferences(request?.configuration ?? {});
+    } else {
+      generationPreferences = resolveGenerationPreferences(request?.configuration ?? {});
+    }
+    assertDedicatedProfilePath(profileRuntime.profilePath);
+    if (!(await profileIsPrepared(profileRuntime, profileRuntime.accountProfile))) {
+      throw codedError(
+        "AUTHENTICATION_FAILED",
+        `O perfil ${profileRuntime.accountProfile} ainda não foi salvo. Abra a configuração do Método e use Salvar perfil antes de executar.`,
+      );
+    }
+    const continuousProjectUrl =
+      continuousClaims !== undefined ? await visualBatchProjectUrl(request, services) : undefined;
+    const checkpointNavigation =
+      generationCheckpoint?.accountProfile === profileRuntime.accountProfile &&
+      generationCheckpoint?.projectUrl &&
+      isFlowUrl(generationCheckpoint.projectUrl, true)
+        ? { url: validateFlowUrl(generationCheckpoint.projectUrl), pinned: true }
+        : continuousProjectUrl
+          ? { url: continuousProjectUrl, pinned: true }
+          : undefined;
+    navigation =
+      (await readCaptchaRetryNavigation(request, services)) ??
+      checkpointNavigation ??
+      resolveNavigationTarget(request);
+    if (navigation.captchaRetry) {
+      step("Retomando o projeto recém-verificado após CAPTCHA.");
+    }
+    referencePaths = continuousClaims
+      ? []
+      : await prepareReferenceImagePaths(referenceImages, services, maxReferenceImages);
+    step("Sessão de navegador reservada pelo ContentFlow.");
+    step(`Perfil de conta selecionado: ${profileRuntime.accountProfile}.`);
+    if (diagnosticFile) step(`Captura integral deste job: ${diagnosticFile}.`);
+  } catch (cause) {
+    return resultError(
+      cause?.code ?? "INVALID_CONFIGURATION",
+      cause?.message ?? String(cause),
+      Boolean(cause?.retryable),
+    );
+  }
+
+  let browserInfo;
+  let client;
+  let responseTracker;
+  let extensionBridge;
+  let activeProjectUrl;
+  let failureCode;
+  let referencesAttached = navigation.referencesAttached === true;
+  let activeReferenceKey = null;
+  let generationSubmitted = false;
+  const files = Array.isArray(generationCheckpoint?.files)
+    ? structuredClone(generationCheckpoint.files)
+    : [];
+  const durableGenerationArtifactIds = new Set(
+    durableGenerationFiles.map((file) => file?.id).filter(Boolean),
+  );
+  const artifacts = generationCheckpoint
+    ? (await restoreCheckpointArtifacts(request, services, files)).filter(
+        (artifact) => !durableGenerationArtifactIds.has(artifact?.id),
+      )
+    : [];
+  const launchMinimized = startMinimized && referencePaths.length === 0;
+  try {
+    browserInfo = await launchOrReuseChrome({
+      profilePath: profileRuntime.profilePath,
+      port: profileRuntime.port,
+      coreSession: settings.__contentFlowBrowserSession,
+      startMinimized: launchMinimized,
+      keepBrowserOpen,
+      startUrl: FLOW_LANDING_URL,
+      signal: services.signal,
+    });
+    step(
+      browserInfo.startedByPlugin
+        ? "Chrome iniciado pelo plugin."
+        : "Chrome existente reutilizado.",
+    );
+
+    client = await new CdpClient(browserInfo.version.webSocketDebuggerUrl, trace).connect(
+      services.signal,
+    );
+    step(`CDP conectado em 127.0.0.1:${profileRuntime.port}.`);
+    const page = await attachFlowPage(
+      client,
+      navigation.url,
+      navigation.pinned,
+      services.signal,
+      false,
+    );
+    const sessionId = page.sessionId;
+    step("Página do Google Flow anexada ao CDP.");
+    extensionBridge = await attachExtensionBridge(client, sessionId, {
+      signal: services.signal,
+      request,
+      profileId: profileRuntime.accountProfile,
+      waitMs: 10000,
+    });
+    step("ContentFlow Browser Bridge conectada; teclado e mouse permanecem isolados.");
+
+    let activePreferences = { ...generationPreferences };
+    if (!isVideoCapability) {
+      step(
+        activePreferences.modelKey || activePreferences.aspectRatioKey
+          ? `Preferências explícitas serão aplicadas pelos controles visíveis do Flow (modelo=${MODEL_LABELS[activePreferences.modelKey] || "Flow"}; proporção=${ASPECT_RATIO_LABELS[activePreferences.aspectRatioKey] || "Flow"}).`
+          : "Modo Automático do Flow ativo: modelo e proporção não serão alterados pelo plugin.",
+      );
+    }
+    const credentialsTracker = createCredentialsTracker(client, sessionId, services.signal);
+    responseTracker = createBatchResponseTracker(client, sessionId, services.signal);
+
+    if (!launchMinimized) {
+      await showBrowserWindow(client, sessionId, page.targetId);
+      step(flowMediaMessage(request?.context?.locale, "browserVisible"));
+    }
+    const initialProjectState = await ensureFlowProjectReady(
+      client,
+      sessionId,
+      settings,
+      services.signal,
+      false,
+      trace,
+      !navigation.pinned,
+    );
+    activeProjectUrl =
+      (await getActiveFlowProjectUrl(client, sessionId)) || initialProjectState?.url;
+    if (continuousClaims !== undefined && activeProjectUrl) {
+      await saveVisualBatchProjectUrl(request, services, activeProjectUrl);
+    }
+    step(`Projeto do Google Flow pronto: ${activeProjectUrl || "URL não detectada"}.`);
+    if (navigation.captureLabel) {
+      await sleep(3_000, services.signal);
+      const media = await recoverMediaByLabel(client, sessionId, navigation.captureLabel);
+      const recovered = await downloadGeneratedImage(
+        media,
+        prompts[0],
+        internalContext.promptOrdinal ?? 1,
+        1,
+        services,
+        outputArtifactNamespace,
+        request?.context?.locale,
+      );
+      responseTracker?.close();
+      responseTracker = null;
+      await extensionBridge.dispose();
+      extensionBridge = null;
+      await maybeCloseBrowser(client, browserInfo, keepBrowserOpen);
+      client = null;
+      await clearCaptchaRetryNavigation(request, services);
+      return {
+        status: "success",
+        values: imageOutputValues(request, [recovered.file], activeProjectUrl),
+        artifacts: [recovered.artifact],
+        logs: [
+          ...stepLogs,
+          "Resultado existente recuperado por seleção explícita do operador; nenhuma nova geração foi enviada.",
+        ],
+      };
+    }
+
+    if (isImageAnimation) {
+      const receiptContext = { accountProfile: profileRuntime.accountProfile, projectUrl: activeProjectUrl };
+      const receiptItemId = isCoreItemInvocation(request) ? request.batch.itemId : null;
+      const promptText = prompts[0] || "";
+      const promptDigest = createHash("sha256").update(promptText).digest("hex");
+      const animationReceipt = await readAnimationReceipt(services, request, receiptItemId, receiptContext);
+      if (animationReceipt && (animationReceipt.promptDigest !== promptDigest || !animationReceipt.video)) {
+        throw Object.assign(codedError("OUTPUT_VALIDATION_FAILED", referenceMessage(request.context?.locale, "animationPending")), { externalEffectUncertain: true });
+      }
+      let selectedVideo = animationReceipt?.video;
+      if (animationReceipt) generationSubmitted = true;
+      if (!selectedVideo) {
+      step("Iniciando fluxo de animação de imagem no Google Flow...");
+      const imageMode = await evaluate(client, sessionId,
+        `(async () => window.FlowAuto?.adapter?.configureGeneration
+          ? await window.FlowAuto.adapter.configureGeneration({ type: "image" }) : null)()`);
+      if (!imageMode?.ok) throw codedError("OUTPUT_VALIDATION_FAILED", referenceMessage(request.context?.locale, "unavailable"));
+      preparedReferences = await prepareAllFlowReferences(client, sessionId, extensionBridge,
+        referenceImages, request, services, activeProjectUrl, settings, step);
+
+      if (videoPreferences) {
+        await ensureFlowModelAndRatio(
+          client,
+          sessionId,
+          extensionBridge,
+          {
+            modelName: videoPreferences.videoModelName,
+            ratioLabel: ASPECT_RATIO_LABELS[videoPreferences.aspectRatioKey] || null,
+            resolutionLabel: videoPreferences.videoResolutionLabel,
+            videoMode: videoPreferences.videoReferenceMode,
+            durationSeconds: videoPreferences.durationSeconds,
+            locale: request?.context?.locale,
+          },
+          step,
+        );
+      }
+
+      const selectedReferencePath = referencePaths[0];
+      const selectedReferenceDigest = selectedReferencePath ? createHash("sha256").update(await readFile(selectedReferencePath)).digest("hex") : null;
+      const selectedFlowMediaId = preparedReferences.get(referenceImages[0]?.id)?.mediaId
+        || (await recalledMedia(services, selectedReferenceDigest, { projectUrl: activeProjectUrl, accountProfile: profileRuntime.accountProfile }))?.mediaId;
+      if (!selectedFlowMediaId) throw codedError("OUTPUT_VALIDATION_FAILED", referenceMessage(request.context?.locale, "unavailable"));
+      if (videoPreferences.videoReferenceMode === "frames") {
+        await attachSelectedFlowFrame(client, sessionId, selectedFlowMediaId, step);
+      } else {
+        await attachNativeReference(client, sessionId, preparedReferences.get(referenceImages[0]?.id),
+          services.signal, step, request.context?.locale);
+      }
+
+      if (promptText) {
+        await waitForPromptEditorStable(
+          client,
+          sessionId,
+          settings.promptSelector || "",
+          services.signal,
+        );
+        await setPromptWithExtension(
+          extensionBridge,
+          promptText,
+          settings.promptSelector || "",
+          "animate:0:prompt",
+          services.signal,
+          client,
+          sessionId,
+          request?.context?.locale,
+        );
+        step(`Instrução de animação preenchida (${promptText.length} caracteres).`);
+      }
+
+      await waitGenerateEnabled(client, sessionId, settings, services.signal, 15000);
+      const baselineMedia = await generatedVideosOnPage(client, sessionId);
+      const baselineUrls = baselineMedia.map((item) => item.video.fifeUrl);
+
+      await saveAnimationReceipt(services, request, receiptItemId, receiptContext, { promptDigest, baselineUrls });
+      // Persist uncertainty before clicking: a lost acknowledgement must never enable replay.
+      generationSubmitted = true;
+
+      await clickGenerateAndConfirm(
+        client,
+        sessionId,
+        extensionBridge,
+        settings,
+        "animate:0:submit",
+        services.signal,
+        request?.context?.locale,
+      );
+      generationSubmitted = true;
+      step("Geração de animação confirmada. Aguardando conclusão do vídeo...");
+
+      const responseTimeoutMs = requestTimeoutSeconds * 1000;
+      let videoResult;
+      try {
+        videoResult = await waitForGeneratedVideosOnPage(
+          client,
+          sessionId,
+          baselineUrls,
+          services.signal,
+          responseTimeoutMs,
+        );
+      } catch (cause) {
+        if (cause?.code === "TIMEOUT") cause.externalEffectUncertain = true;
+        throw cause;
+      }
+      if (videoResult.media?.length !== 1) {
+        await saveAnimationReceipt(services, request, receiptItemId, receiptContext,
+          { promptDigest, baselineUrls, candidates: videoResult.media });
+      }
+      selectedVideo = singleAnimationResult(videoResult.media, request.context?.locale);
+      await saveAnimationReceipt(services, request, receiptItemId, receiptContext, { promptDigest, video: selectedVideo });
+      }
+      const result = await downloadGeneratedVideo(
+        selectedVideo,
+        promptText || "animacao",
+        internalContext.promptOrdinal ?? 1,
+        services,
+        outputArtifactNamespace,
+        request?.context?.locale,
+      );
+      files.push(result.file);
+      artifacts.push(result.artifact);
+      step(`Vídeo animado salvo (${result.file.name}).`);
+      await services.publishPartial?.({
+        values: {
+          video: singleVideoOutput ? files[0] : files,
+          ...(activeProjectUrl ? { project_url: activeProjectUrl } : {}),
+        },
+        artifacts,
+        itemUpdates: mediaItemUpdatesForInvocation(request, [
+          mediaItemUpdate({
+            key: "animation:0",
+            variantKey: "video:0",
+            outputPort: "video",
+            input: promptText,
+            value: result.file,
+          }),
+        ]),
+        progress: 1,
+        message: "Vídeo animado capturado.",
+      });
+
+      activeProjectUrl = (await getActiveFlowProjectUrl(client, sessionId)) || activeProjectUrl;
+      if (settings.minimizeWhenReady === true)
+        await setBrowserWindowState(client, page.targetId, "minimized");
+      responseTracker?.close();
+      responseTracker = null;
+      await extensionBridge.dispose();
+      extensionBridge = null;
+      await maybeCloseBrowser(client, browserInfo, keepBrowserOpen);
+      client = null;
+      await clearCaptchaRetryNavigation(request, services);
+      if (continuousClaims !== undefined) await clearVisualBatchSession(request, services);
+
+      return {
+        status: "success",
+        values: {
+          video: singleVideoOutput ? files[0] : files,
+          project_url: activeProjectUrl,
+        },
+        artifacts,
+        usage: { provider: "Google Labs / Flow", outputUnits: files.length, unit: "video" },
+        logs: [
+          ...stepLogs,
+          ...diagnosticLogs,
+          `${files.length} vídeo(s) animado(s) do Google Flow finalizado(s).`,
+        ],
+      };
+    }
+
+    if (isVideoGeneration) {
+      step("Iniciando fluxo de geração de vídeo no Google Flow...");
+      if (videoPreferences) {
+        await ensureFlowModelAndRatio(
+          client,
+          sessionId,
+          extensionBridge,
+          {
+            modelName: videoPreferences.videoModelName,
+            ratioLabel: ASPECT_RATIO_LABELS[videoPreferences.aspectRatioKey] || null,
+            resolutionLabel: videoPreferences.videoResolutionLabel,
+            videoMode: videoPreferences.videoReferenceMode,
+            durationSeconds: videoPreferences.durationSeconds,
+            locale: request?.context?.locale,
+          },
+          step,
+        );
+      }
+
+      for (let index = 0; index < prompts.length; index += 1) {
+        if (services.signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+        const currentPrompt = prompts[index];
+        const label = `Vídeo ${index + 1}/${prompts.length}`;
+        const responseTimeoutMs = requestTimeoutSeconds * 1000;
+        let videoResult;
+        const continuousClaim = continuousClaims?.[index];
+        const continuousCurrent = continuousClaim
+          ? continuousItems?.get(continuousClaim.itemId)
+          : undefined;
+        if (continuousCurrent?.state === "awaiting_human") {
+          throw codedError(
+            "AUTHENTICATION_FAILED",
+            flowMediaMessage(request?.context?.locale, "continuousAwaitHuman", "video"),
+            false,
+          );
+        }
+        if (
+          continuousCurrent?.state === "submitted" ||
+          continuousCurrent?.state === "awaiting_result"
+        ) {
+          const baselineUrls = await visualBatchItemBaseline(
+            request,
+            services,
+            continuousClaim.itemId,
+            "video",
+          );
+          if (!baselineUrls) {
+            const uncertain = codedError(
+              "UPSTREAM_UNAVAILABLE",
+              flowMediaMessage(request?.context?.locale, "continuousReceiptMissing", "video"),
+              false,
+            );
+            uncertain.externalEffectUncertain = true;
+            throw uncertain;
+          }
+          step(
+            flowMediaMessage(request?.context?.locale, "continuousReconciling", {
+              position: continuousClaim.index + 1,
+              kind: "video",
+            }),
+          );
+          try {
+            videoResult = await waitForGeneratedVideosOnPage(
+              client,
+              sessionId,
+              baselineUrls,
+              services.signal,
+              responseTimeoutMs,
+            );
+          } catch (cause) {
+            cause.externalEffectUncertain = true;
+            throw cause;
+          }
+        } else {
+          step(`${label}: preparando prompt.`);
+          await waitForPromptEditorStable(
+            client,
+            sessionId,
+            settings.promptSelector || "",
+            services.signal,
+          );
+          await setPromptWithExtension(
+            extensionBridge,
+            currentPrompt,
+            settings.promptSelector || "",
+            `video:${index}:prompt`,
+            services.signal,
+            client,
+            sessionId,
+            request?.context?.locale,
+          );
+          step(`${label}: prompt preenchido (${currentPrompt.length} caracteres).`);
+
+          await waitGenerateEnabled(client, sessionId, settings, services.signal, 15000);
+          const baselineMedia = await generatedVideosOnPage(client, sessionId);
+          const baselineUrls = baselineMedia.map((item) => item.video.fifeUrl);
+          if (continuousClaim) {
+            await saveVisualBatchItemBaseline(
+              request,
+              services,
+              continuousClaim.itemId,
+              "video",
+              baselineUrls,
+            );
+          }
+
+          await clickGenerateAndConfirm(
+            client,
+            sessionId,
+            extensionBridge,
+            settings,
+            `video:${index}:submit`,
+            services.signal,
+            request?.context?.locale,
+          );
+          generationSubmitted = true;
+          if (continuousClaim) {
+            await continuousItems.publish(services, continuousClaim.itemId, "submitted", {
+              externalReceipt: `flow:video:${continuousClaim.itemId}`,
+            });
+            await continuousItems.publish(services, continuousClaim.itemId, "awaiting_result");
+          }
+          step(`${label}: envio confirmado. Aguardando vídeo...`);
+
+          try {
+            videoResult = await waitForGeneratedVideosOnPage(
+              client,
+              sessionId,
+              baselineUrls,
+              services.signal,
+              responseTimeoutMs,
+            );
+          } catch (cause) {
+            if (cause?.code === "TIMEOUT") cause.externalEffectUncertain = true;
+            if (continuousClaim && cause?.externalEffectUncertain !== true) {
+              const itemState = continuousItems.get(continuousClaim.itemId)?.state;
+              if (itemState === "submitted" || itemState === "awaiting_result") {
+                await continuousItems.publish(services, continuousClaim.itemId, "failed", {
+                  message: cause?.message,
+                  errorCode: cause?.code || "JOB_FAILED",
+                  retryable: cause?.retryable !== false,
+                });
+              }
+            }
+            throw cause;
+          }
+        }
+        const selectedVideo = videoResult.media[0];
+        const result = await downloadGeneratedVideo(
+          selectedVideo,
+          currentPrompt,
+          internalContext.promptOrdinal ?? index + 1,
+          services,
+          outputArtifactNamespace,
+          request?.context?.locale,
+        );
+        files.push(result.file);
+        artifacts.push(result.artifact);
+        if (continuousClaim) {
+          await continuousItems.publish(services, continuousClaim.itemId, "completed", {
+            outputPort: "video",
+            value: result.file,
+            artifacts: [result.artifact],
+            message: flowMediaMessage(request?.context?.locale, "continuousCompleted", {
+              position: continuousClaim.index + 1,
+              kind: "video",
+            }),
+          });
+          await clearVisualBatchItemBaseline(request, services, continuousClaim.itemId);
+        }
+        step(`${label}: salvo (${result.file.name}).`);
+        await services.publishPartial?.({
+          values: {
+            video: singleVideoOutput ? files[0] : files,
+            ...(activeProjectUrl ? { project_url: activeProjectUrl } : {}),
+          },
+          artifacts,
+          itemUpdates: continuousClaim ? undefined : mediaItemUpdatesForInvocation(request, [
+            mediaItemUpdate({
+              key: `prompt:${index}`,
+              variantKey: "video:0",
+              outputPort: "video",
+              input: currentPrompt,
+              value: result.file,
+            }),
+          ]),
+          progress: (index + 1) / prompts.length,
+          message: `${label}: vídeo capturado.`,
+        });
+
+        if (index + 1 < prompts.length && delayBetweenPromptsMs > 0) {
+          await sleep(delayBetweenPromptsMs, services.signal);
+        }
+      }
+
+      activeProjectUrl = (await getActiveFlowProjectUrl(client, sessionId)) || activeProjectUrl;
+      if (settings.minimizeWhenReady === true)
+        await setBrowserWindowState(client, page.targetId, "minimized");
+      responseTracker?.close();
+      responseTracker = null;
+      await extensionBridge.dispose();
+      extensionBridge = null;
+      await maybeCloseBrowser(client, browserInfo, keepBrowserOpen);
+      client = null;
+      await clearCaptchaRetryNavigation(request, services);
+      if (continuousClaims !== undefined) await clearVisualBatchSession(request, services);
+
+      return {
+        status: "success",
+        values: {
+          video: singleVideoOutput ? files[0] : files,
+          project_url: activeProjectUrl,
+        },
+        artifacts,
+        usage: { provider: "Google Labs / Flow", outputUnits: files.length, unit: "video" },
+        logs: [
+          ...stepLogs,
+          ...diagnosticLogs,
+          `${files.length} vídeo(s) do Google Flow finalizado(s).`,
+        ],
+      };
+    }
+
+    let targetModelLabel = MODEL_LABELS[activePreferences.modelKey] || null;
+    const targetRatioLabel = ASPECT_RATIO_LABELS[activePreferences.aspectRatioKey] || null;
+    if (targetModelLabel || targetRatioLabel) {
+      try {
+        await ensureFlowModelAndRatio(
+          client,
+          sessionId,
+          extensionBridge,
+          {
+            modelName: targetModelLabel,
+            ratioLabel: targetRatioLabel,
+            outputCount: maxImagesPerPrompt,
+            forceImageMode: true,
+            settings,
+            signal: services.signal,
+            locale: request?.context?.locale,
+          },
+          step,
+        );
+      } catch (err) {
+        if (activePreferences.fallbackOnModelLimit) {
+          const fallbackModelKey = nextImageModelFallback(activePreferences.modelKey);
+          if (fallbackModelKey) {
+            activePreferences = {
+              ...activePreferences,
+              modelKey: fallbackModelKey,
+              imageModelName: IMAGE_MODELS[fallbackModelKey],
+            };
+            targetModelLabel = MODEL_LABELS[fallbackModelKey];
+            step(`Modelo inicial não disponível; acionando fallback para ${targetModelLabel}.`);
+            await ensureFlowModelAndRatio(
+              client,
+              sessionId,
+              extensionBridge,
+              {
+                modelName: targetModelLabel,
+                ratioLabel: targetRatioLabel,
+                outputCount: maxImagesPerPrompt,
+                forceImageMode: true,
+                settings,
+                signal: services.signal,
+                locale: request?.context?.locale,
+              },
+              step,
+            );
+          } else {
+            throw err;
+          }
+        } else {
+          throw err;
+        }
+      }
+    }
+
+    step("Editor Slate detectado.");
+    if (referenceImages.length) {
+      preparedReferences = await prepareAllFlowReferences(client, sessionId, extensionBridge, referenceImages, request, services, activeProjectUrl, settings, step);
+    }
+    referencesAttached = false;
+
+    const pendingPromptEntries = prompts
+      .map((prompt, index) => ({ prompt, index }))
+      .filter((entry) => !completedPromptIndexes.has(entry.index));
+    const pendingPrompts = pendingPromptEntries.map((entry) => entry.prompt);
+    const originalPromptIndex = (queueIndex) =>
+      continuousClaims?.[queueIndex]?.index ??
+      pendingPromptEntries[queueIndex]?.index ??
+      queueIndex;
+    const publishContinuousTaskState = async (task, state, extra = {}) => {
+      if (!continuousItems) return undefined;
+      const claim =
+        (typeof task?.continuousItemId === "string"
+          ? continuousItems.get(task.continuousItemId)?.claim
+          : undefined) ?? continuousClaims?.[task.index];
+      if (!claim) return undefined;
+      return await continuousItems.publish(services, claim.itemId, state, extra);
+    };
+    // Serialize composer changes and request binding, not provider generation.
+    // Each in-flight result belongs to the request reserved by its work unit.
+    const maxConcurrentGenerations = requestedConcurrentGenerations;
+    let submissionLock = Promise.resolve();
+    const acquireSubmissionLock = async () => {
+      let unlock;
+      const current = new Promise((resolve) => {
+        unlock = resolve;
+      });
+      const prior = submissionLock;
+      submissionLock = prior.then(() => current);
+      await prior;
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        unlock();
+      };
+    };
+    const submissionBaselines = new Map();
+    const materializeImageResults = async (task, selectedMedia) => {
+      await rememberResult(services, request, task.continuousItemId,
+        { projectUrl: activeProjectUrl, accountProfile: profileRuntime.accountProfile }, task.prompt, selectedMedia);
+      const absolutePromptIndex = coreBatchIndex ?? task.index;
+      const label = `Prompt ${absolutePromptIndex + 1}/${coreBatchTotal ?? prompts.length}`;
+      const results = [];
+      for (let variantIndex = 0; variantIndex < selectedMedia.length; variantIndex += 1) {
+        const result = await downloadGeneratedImage(
+          selectedMedia[variantIndex],
+          task.prompt,
+          absolutePromptIndex + 1,
+          variantIndex + 1,
+          services,
+          outputArtifactNamespace,
+          request?.context?.locale,
+          { projectUrl: activeProjectUrl, accountProfile: profileRuntime.accountProfile },
+        );
+        results.push(result);
+        step(`${label}: artifact salvo (${result.file.name}).`);
+      }
+      return results;
+    };
+    const submit = async (task) => {
+      if (services.signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+      const continuousClaim = continuousClaims?.[task.index];
+      task = {
+        ...task,
+        index: originalPromptIndex(task.index),
+        ...(continuousClaim ? { continuousItemId: continuousClaim.itemId } : {}),
+      };
+      const absolutePromptIndex = coreBatchIndex ?? task.index;
+      const promptTotal = coreBatchTotal ?? prompts.length;
+      const label = `Prompt ${absolutePromptIndex + 1}/${promptTotal} (tentativa ${task.attempt}/${retryAttempts + 1})`;
+      return {
+        completion: (async () => {
+          const continuousCurrent = task.continuousItemId
+            ? continuousItems?.get(task.continuousItemId)
+            : undefined;
+          const capturedMedia = await recalledResult(services, request, task.continuousItemId,
+            { projectUrl: activeProjectUrl, accountProfile: profileRuntime.accountProfile }, task.prompt,
+            ["submitted", "awaiting_result"].includes(continuousCurrent?.state));
+          if (capturedMedia) return materializeImageResults(task, capturedMedia);
+          if (continuousCurrent?.state === "awaiting_human") {
+            throw codedError(
+              "AUTHENTICATION_FAILED",
+              flowMediaMessage(request?.context?.locale, "continuousAwaitHuman", "image"),
+              false,
+            );
+          }
+          if (
+            continuousCurrent?.state === "submitted" ||
+            continuousCurrent?.state === "awaiting_result" ||
+            (task.continuousItemId && await visualBatchItemBaseline(request, services, task.continuousItemId, "image"))
+          ) {
+            if (maxConcurrentGenerations > 1) {
+              const uncertain = codedError(
+                "UPSTREAM_UNAVAILABLE",
+                flowMediaMessage(request?.context?.locale, "continuousReceiptMissing", "image"),
+                false,
+              );
+              uncertain.externalEffectUncertain = true;
+              throw uncertain;
+            }
+            const baselineUrls = await visualBatchItemBaseline(
+              request,
+              services,
+              task.continuousItemId,
+              "image",
+            );
+            if (!baselineUrls) {
+              const uncertain = codedError(
+                "UPSTREAM_UNAVAILABLE",
+                flowMediaMessage(request?.context?.locale, "continuousReceiptMissing", "image"),
+                false,
+              );
+              uncertain.externalEffectUncertain = true;
+              throw uncertain;
+            }
+            step(
+              flowMediaMessage(request?.context?.locale, "continuousReconciling", {
+                position: absolutePromptIndex + 1,
+                kind: "image",
+              }),
+            );
+            try {
+              const recovered = await waitForGeneratedMediaOnPage(
+                client,
+                sessionId,
+                baselineUrls,
+                services.signal,
+                requestTimeoutSeconds * 1000,
+              );
+              return await materializeImageResults(
+                task,
+                recovered.media.slice(0, maxImagesPerPrompt),
+              );
+            } catch (cause) {
+              cause.externalEffectUncertain = true;
+              throw cause;
+            }
+          }
+          const taskReferenceImages = continuousClaim
+            ? referenceImagesForSourceItem(request, continuousClaim.sourceItemId)
+            : request?.configuration?.referenceMode === "per_prompt" && !request.batch
+              ? referenceImagesForSourceItem(
+                  request,
+                  (request.inputDeliveries ?? [])
+                    .filter((delivery) => ["prompts", "prompt"].includes(delivery.portKey))
+                    .flatMap((delivery) => delivery.items ?? [])[task.index]?.id,
+                )
+              : referenceImages;
+          const taskReferencePaths = await prepareReferenceImagePaths(taskReferenceImages, services, maxReferenceImages);
+          if (taskReferencePaths.length > 0) {
+            const referenceNames = taskReferencePaths.map((filePath) =>
+              basename(filePath).replace(/\.[^.]+$/, ""),
+            );
+            step(
+              `${label}: ${taskReferencePaths.length} referência(s) nominais preparadas (${referenceNames.join(", ")}).`,
+            );
+          }
+          const fallbackModelsTried = new Set();
+          const switchToNextImageModel = async (reason, composerLocked = false) => {
+            const releaseModelChange = composerLocked
+              ? () => undefined
+              : await acquireSubmissionLock();
+            try {
+              const fallbackModelKey = nextImageModelFallback(activePreferences.modelKey);
+              if (
+                !activePreferences.fallbackOnModelLimit ||
+                !fallbackModelKey ||
+                fallbackModelsTried.has(fallbackModelKey)
+              ) {
+                return false;
+              }
+              activePreferences = {
+                ...activePreferences,
+                modelKey: fallbackModelKey,
+                imageModelName: IMAGE_MODELS[fallbackModelKey],
+              };
+              fallbackModelsTried.add(fallbackModelKey);
+              step(
+                `${label}: ${reason}; repetindo com ${MODEL_LABELS[fallbackModelKey]} na mesma conta.`,
+              );
+              try {
+                await evaluate(
+                  client,
+                  sessionId,
+                  `window.FlowAuto?.adapter?.setModel ? window.FlowAuto.adapter.setModel(${JSON.stringify(MODEL_LABELS[fallbackModelKey])}) : null`,
+                );
+              } catch {}
+              await ensureFlowModelAndRatio(
+                client,
+                sessionId,
+                extensionBridge,
+                {
+                  modelName: MODEL_LABELS[fallbackModelKey],
+                  forceImageMode: true,
+                  outputCount: maxImagesPerPrompt,
+                  settings,
+                  signal: services.signal,
+                  locale: request?.context?.locale,
+                },
+                step,
+              );
+              await sleep(2_000, services.signal);
+              return true;
+            } finally {
+              releaseModelChange();
+            }
+          };
+          while (true) {
+            const releaseSubmission = await acquireSubmissionLock();
+            try {
+              step(`${label}: preparando interface na sessão compartilhada.`);
+              await ensureFlowProjectReady(
+                client,
+                sessionId,
+                settings,
+                services.signal,
+                true,
+                trace,
+              );
+              const referenceKey = taskReferencePaths
+                .map((filePath) => String(filePath))
+                .join("\n");
+              const staleReferenceCount = await attachedReferenceCount(client, sessionId);
+              const referencesNeedRefresh =
+                activeReferenceKey !== referenceKey ||
+                (taskReferencePaths.length > 0 && staleReferenceCount === 0);
+              if (referencesNeedRefresh && staleReferenceCount !== 0) {
+                const cleared = await clearAttachedReferenceImages(
+                  client,
+                  sessionId,
+                  extensionBridge,
+                  services.signal,
+                  step,
+                );
+                if (!cleared) {
+                  throw codedError(
+                    "OUTPUT_VALIDATION_FAILED",
+                    `O editor do Flow reteve ${staleReferenceCount} referência(s) da unidade anterior e não permitiu removê-las com segurança; o próximo prompt foi bloqueado.`,
+                  );
+                }
+              }
+              if (referencesNeedRefresh && taskReferencePaths.length > 0) {
+                await attachReferenceImagesOneByOne(
+                  client,
+                  sessionId,
+                  extensionBridge,
+                  taskReferencePaths,
+                  settings,
+                  services.signal,
+                  step,
+                  taskReferenceImages.map((image) => preparedReferences.get(image.id)),
+                  request.context?.locale,
+                );
+                referencesAttached = true;
+                activeReferenceKey = referenceKey;
+                step(`${label}: referências específicas da unidade anexadas ao comando.`);
+              } else if (referencesNeedRefresh) {
+                activeReferenceKey = referenceKey;
+              }
+
+              let selectedMedia = null;
+              const hasEngine = await evaluate(
+                client,
+                sessionId,
+                "Boolean(window.FlowAuto?.adapter?.generate)",
+              ).catch(() => false);
+              if (hasEngine && taskReferencePaths.length === 0 && maxConcurrentGenerations === 1) {
+                step(`${label}: gerando via FlowAuto adapter.`);
+                const baselineMedia = await generatedMediaOnPage(client, sessionId);
+                submissionBaselines.set(
+                  task.index,
+                  baselineMedia.map((item) => item.image.generatedImage.fifeUrl),
+                );
+                if (task.continuousItemId) {
+                  await saveVisualBatchItemBaseline(
+                    request,
+                    services,
+                    task.continuousItemId,
+                    "image",
+                    submissionBaselines.get(task.index),
+                  );
+                }
+                let ticketInfo;
+                await waitForPromptEditorStable(
+                  client,
+                  sessionId,
+                  settings.promptSelector || "",
+                  services.signal,
+                );
+                const promptResult = await setPromptWithExtension(
+                  extensionBridge,
+                  task.prompt,
+                  settings.promptSelector || "",
+                  `${task.index}:${task.attempt}:engine-prompt`,
+                  services.signal,
+                  client,
+                  sessionId,
+                  request?.context?.locale,
+                );
+                step(
+                  `${label}: Slate preenchido pela Browser Bridge (${promptResult?.readbackLength || task.prompt.length} caracteres).`,
+                );
+                await waitGenerateEnabled(client, sessionId, settings, services.signal, 20_000);
+                const submitDiagnostics = await evaluate(
+                  client,
+                  sessionId,
+                  `(() => ({
+                    readyState: document.readyState,
+                    flowAutoKeys: Object.keys(window.FlowAuto || {}).sort(),
+                    editor2Keys: Object.keys(window.FlowAuto?.editor2 || {}).sort(),
+                    canonicalButton: Boolean(window.FlowAuto?.editor2?.findSubmitButton?.()),
+                    selectorButtons: document.querySelectorAll('flow-generate-icon-button button').length,
+                    enabledSelectorButtons: [...document.querySelectorAll('flow-generate-icon-button button')].filter((button) => !button.disabled && button.getAttribute('aria-disabled') !== 'true').length,
+                  }))()`,
+                ).catch(() => undefined);
+                step(`${label}: diagnóstico do envio ${JSON.stringify(submitDiagnostics)}.`);
+                ticketInfo = {
+                  bilhete: await evaluate(
+                    client,
+                    sessionId,
+                    `window.FlowAuto.media2.novoBilhete(
+                      ${JSON.stringify(task.prompt)},
+                      ${JSON.stringify(maxImagesPerPrompt)},
+                      "image"
+                    )`,
+                  ),
+                };
+                try {
+                  await clickGenerateAndConfirm(
+                    client,
+                    sessionId,
+                    extensionBridge,
+                    settings,
+                    `${task.index}:${task.attempt}:engine-submit`,
+                    services.signal,
+                    request?.context?.locale,
+                  );
+                  generationSubmitted = true;
+                  await publishContinuousTaskState(task, "submitted", {
+                    externalReceipt: `flow:image:${task.continuousItemId}`,
+                  });
+                  await publishContinuousTaskState(task, "awaiting_result");
+                  step(`${label}: envio real confirmado pela Browser Bridge.`);
+                } catch (cause) {
+                  await evaluate(
+                    client,
+                    sessionId,
+                    `window.FlowAuto?.media2?._bilhetes?.delete(${JSON.stringify(ticketInfo.bilhete)})`,
+                  ).catch(() => undefined);
+                  throw cause;
+                }
+                releaseSubmission();
+
+                let engineRes;
+                try {
+                  engineRes = await evaluate(
+                    client,
+                    sessionId,
+                    `window.FlowAuto.adapter.waitForResults({
+                    slots: ${JSON.stringify(maxImagesPerPrompt)},
+                    bilhete: ${JSON.stringify(ticketInfo?.bilhete)}
+                  })`,
+                  );
+                } catch (cause) {
+                  cause.externalEffectUncertain = true;
+                  throw cause;
+                }
+
+                if (engineRes?.results && Array.isArray(engineRes.results)) {
+                  const okResults = engineRes.results.filter((r) => !r.failed && r.url);
+                  if (okResults.length > 0) {
+                    selectedMedia = okResults.map((r) => ({
+                      image: {
+                        generatedImage: {
+                          fifeUrl: r.url,
+                          mediaId: r.mediaUuid || r.tileId,
+                        },
+                      },
+                    }));
+                  } else {
+                    const firstFail = engineRes.results.find((r) => r.failed);
+                    const reason = firstFail?.failedReason || "Falha na geração pelo FlowAuto.";
+                    const isModelLimit =
+                      firstFail?.errorType === "model_limit" ||
+                      /limite de uso|cota|quota|daily limit|limite di[áa]rio|n[ãa]o houve cobran[çc]a|voc[êe] chegou ao limite/i.test(
+                        reason,
+                      );
+                    if (isModelLimit) {
+                      const switched = await switchToNextImageModel("limite do modelo atingido");
+                      if (switched) {
+                        continue;
+                      }
+                      throw codedError("MODEL_LIMIT", reason);
+                    }
+                    if (
+                      firstFail?.errorType === "unusual_activity" ||
+                      /incomum|unusual/i.test(reason)
+                    ) {
+                      const err = codedError("PROVIDER_SECURITY_CHALLENGE", reason, false);
+                      err.isUnusualActivity = true;
+                      err.retryAfterMs = 45000;
+                      throw err;
+                    }
+                    if (firstFail?.errorType === "rate_limit" || /rate/i.test(reason)) {
+                      const err = codedError("RATE_LIMIT", reason, true);
+                      err.retryAfterMs = 45000;
+                      throw err;
+                    }
+                    throw codedError("JOB_FAILED", reason);
+                  }
+                }
+              }
+
+              if (!selectedMedia) {
+                await ensureAgentOff(client, sessionId, services.signal);
+                await ensureFlowModelAndRatio(
+                  client,
+                  sessionId,
+                  extensionBridge,
+                  {
+                    modelName: MODEL_LABELS[activePreferences.modelKey],
+                    outputCount: maxImagesPerPrompt,
+                    forceImageMode: true,
+                    settings,
+                    signal: services.signal,
+                    locale: request?.context?.locale,
+                  },
+                  step,
+                );
+                await waitForPromptEditorStable(
+                  client,
+                  sessionId,
+                  settings.promptSelector || "",
+                  services.signal,
+                );
+                await dynamicSleep(TIMING.HUMAN_PAUSE, services.signal);
+                const promptResult = await setPromptWithExtension(
+                  extensionBridge,
+                  task.prompt,
+                  settings.promptSelector || "",
+                  `${task.index}:${task.attempt}:prompt`,
+                  services.signal,
+                  client,
+                  sessionId,
+                  request?.context?.locale,
+                );
+                step(
+                  `${label}: Slate preenchido (${promptResult?.readbackLength || 0} caracteres).`,
+                );
+                await dynamicSleep(TIMING.HUMAN_READ, services.signal);
+                let generateState;
+                try {
+                  generateState = await waitGenerateEnabled(
+                    client,
+                    sessionId,
+                    settings,
+                    services.signal,
+                    20_000,
+                  );
+                } catch (cause) {
+                  const disabledAfterPrompt =
+                    cause?.code === "OUTPUT_VALIDATION_FAILED" &&
+                    /aria-disabled=true/i.test(String(cause?.message || ""));
+                  if (
+                    disabledAfterPrompt &&
+                    (await switchToNextImageModel("o modelo não habilitou a geração", true))
+                  ) {
+                    continue;
+                  }
+                  throw cause;
+                }
+                if (
+                  referencesNeedRefresh &&
+                  taskReferencePaths.length > 0 &&
+                  (await attachedReferenceCount(client, sessionId)) !== taskReferencePaths.length
+                ) {
+                  throw codedError(
+                    "OUTPUT_VALIDATION_FAILED",
+                    `O Flow não confirmou todas as ${taskReferencePaths.length} referências da unidade. O prompt não foi enviado.`,
+                  );
+                }
+                step(`${label}: botão habilitado (${generateState?.text || "Criar"}).`);
+
+                const baselineMedia = await generatedMediaOnPage(client, sessionId);
+                const baselineUrls = baselineMedia.map((item) => item.image.generatedImage.fifeUrl);
+                submissionBaselines.set(task.index, baselineUrls);
+                if (task.continuousItemId) {
+                  await saveVisualBatchItemBaseline(
+                    request,
+                    services,
+                    task.continuousItemId,
+                    "image",
+                    baselineUrls,
+                  );
+                }
+                const responseTimeoutMs = requestTimeoutSeconds * 1000;
+                const reservation = responseTracker.reserve(responseTimeoutMs);
+                const submissionPublished = reservation.submitted.then(async (requestId) => {
+                  generationSubmitted = true;
+                  await publishContinuousTaskState(task, "submitted", {
+                    externalReceipt: `flow:image:${requestId}`,
+                  });
+                });
+                void submissionPublished.catch(() => undefined);
+                const capturedPublished = reservation.promise.then(async (captured) => {
+                  const result = parseGenerationResponse(captured);
+                  await rememberResult(services, request, task.continuousItemId,
+                    { projectUrl: activeProjectUrl, accountProfile: profileRuntime.accountProfile },
+                    task.prompt, result.media.slice(0, maxImagesPerPrompt));
+                  return captured;
+                });
+                void capturedPublished.catch(() => undefined);
+                let stopPageFallback = false;
+                let pageFallback;
+                try {
+                  try {
+                    await clickGenerateAndConfirm(
+                      client,
+                      sessionId,
+                      extensionBridge,
+                      settings,
+                      `${task.index}:${task.attempt}:submit`,
+                      services.signal,
+                      request?.context?.locale,
+                    );
+                  } catch (cause) {
+                    if (
+                      cause?.externalEffectUncertain !== true &&
+                      taskReferencePaths.length === 0
+                    ) {
+                      await clearAttachedReferenceImages(
+                        client,
+                        sessionId,
+                        extensionBridge,
+                        services.signal,
+                        step,
+                      );
+                    }
+                    throw cause;
+                  }
+                  await submissionPublished;
+                  await publishContinuousTaskState(task, "awaiting_result");
+                  step(`${label}: envio real confirmado pela Browser Bridge.`);
+                  pageFallback =
+                    maxConcurrentGenerations === 1
+                      ? waitForGeneratedMediaOnPage(
+                          client,
+                          sessionId,
+                          baselineUrls,
+                          services.signal,
+                          responseTimeoutMs,
+                          () => stopPageFallback,
+                        )
+                      : null;
+                  releaseSubmission();
+                } catch (cause) {
+                  stopPageFallback = true;
+                  reservation.cancel(cause);
+                  await submissionPublished.catch(() => undefined);
+                  await capturedPublished.catch(() => undefined);
+                  throw cause;
+                }
+
+                let completed;
+                try {
+                  const networkResult = capturedPublished.then((captured) => ({
+                    source: "network",
+                    captured,
+                  }));
+                  completed = pageFallback
+                    ? await Promise.race([
+                        networkResult,
+                        pageFallback.then((body) => ({
+                          source: "page",
+                          captured: { status: 200, bodyText: JSON.stringify(body) },
+                        })),
+                      ])
+                    : await networkResult;
+                } catch (cause) {
+                  if (cause?.code === "TIMEOUT" || cause?.code === "UPSTREAM_UNAVAILABLE") {
+                    cause.externalEffectUncertain = true;
+                  }
+                  throw cause;
+                }
+                stopPageFallback = true;
+                if (completed.source === "page") {
+                  reservation.cancel(codedError("CANCELLED", "Fallback visual concluiu primeiro."));
+                  await reservation.promise.catch(() => undefined);
+                  step(`${label}: imagem nova detectada no projeto do Flow.`);
+                } else {
+                  step(`${label}: resposta HTTP ${completed.captured?.status ?? "?"} capturada.`);
+                }
+                const captured = completed.captured;
+                let generation;
+                try {
+                  generation = parseGenerationResponse(captured);
+                } catch (cause) {
+                  if (
+                    cause?.code === "MODEL_LIMIT" &&
+                    (await switchToNextImageModel("limite do modelo atingido"))
+                  )
+                    continue;
+                  throw cause;
+                }
+
+                selectedMedia = generation.media.slice(0, maxImagesPerPrompt);
+                if (generation.media.length > selectedMedia.length) {
+                  step(
+                    `${label}: ${generation.media.length} mídias recebidas; ${selectedMedia.length} preservada(s) conforme maxImagesPerPrompt.`,
+                  );
+                }
+              }
+              return materializeImageResults(task, selectedMedia);
+            } finally {
+              releaseSubmission();
+            }
+          }
+        })(),
+      };
+    };
+
+    step(
+      `Gerenciador iniciado: ${pendingPrompts.length} prompt(s) pendente(s) de ${prompts.length}, até ${maxConcurrentGenerations} geração(ões) simultânea(s), ${retryAttempts} nova(s) tentativa(s) após a fila inicial.`,
+    );
+    const generationPlan = await runGenerationPlan({
+      prompts: pendingPrompts,
+      maxInFlight: maxConcurrentGenerations,
+      retryAttempts,
+      rateLimitRetryAttempts,
+      submit,
+      minDelayMs: delayBetweenPromptsMs,
+      signal: services.signal,
+      failFast: coreBatchIndex !== undefined,
+      async reconcile({ task, error }) {
+        const continuousClaim = continuousClaims?.[task.index];
+        const recoveredTask = { ...task, index: originalPromptIndex(task.index), continuousItemId: continuousClaim?.itemId };
+        const capturedMedia = await recalledResult(services, request, continuousClaim?.itemId,
+          { projectUrl: activeProjectUrl, accountProfile: profileRuntime.accountProfile }, recoveredTask.prompt);
+        if (capturedMedia) return { status: "recovered", value: await materializeImageResults(recoveredTask, capturedMedia) };
+        let continuousState = continuousClaim
+          ? continuousItems?.get(continuousClaim.itemId)?.state
+          : undefined;
+        if (error?.externalEffectUncertain !== true) {
+          if (
+            continuousClaim &&
+            (continuousState === "submitted" || continuousState === "awaiting_result")
+          ) {
+            await continuousItems.publish(services, continuousClaim.itemId, "failed", {
+              message: error?.message,
+              errorCode: error?.code || "JOB_FAILED",
+              retryable: error?.retryable !== false,
+            });
+            continuousState = "failed";
+          }
+          if (
+            continuousClaim &&
+            maxConcurrentGenerations === 1 &&
+            flowContinuousStateCanRefresh(continuousState) &&
+            ["UPSTREAM_UNAVAILABLE", "TIMEOUT"].includes(error?.code) &&
+            typeof extensionBridge?.dispatch === "function"
+          ) {
+            await extensionBridge.dispatch(
+              "reload",
+              { reconciliationState: "safe", bypassCache: true },
+              `continuous-recovery:${continuousClaim.itemId}:${task.attempt}`,
+            );
+            await extensionBridge.dispatch(
+              "ping",
+              {},
+              `continuous-recovery-ping:${continuousClaim.itemId}:${task.attempt}`,
+            );
+            step(
+              flowMediaMessage(
+                request?.context?.locale,
+                "continuousSafeRefresh",
+                continuousClaim.index + 1,
+              ),
+            );
+          }
+          return { status: "safe_to_retry" };
+        }
+        if (maxConcurrentGenerations !== 1) return { status: "uncertain" };
+        const reconciledTask = { ...task, index: originalPromptIndex(task.index) };
+        const baselineUrls = submissionBaselines.get(reconciledTask.index);
+        if (!Array.isArray(baselineUrls)) return { status: "uncertain" };
+        const baseline = new Set(baselineUrls.map(imageMediaIdentity));
+        const recoveredMedia = (await generatedMediaOnPage(client, sessionId)).filter(
+          (item) => !baseline.has(imageMediaIdentity(item.image.generatedImage.fifeUrl)),
+        );
+        if (recoveredMedia.length === 0) return { status: "uncertain" };
+        step(
+          flowMediaMessage(
+            request?.context?.locale,
+            "reconciled",
+            (coreBatchIndex ?? reconciledTask.index) + 1,
+          ),
+        );
+        return {
+          status: "recovered",
+          value: await materializeImageResults(
+            reconciledTask,
+            recoveredMedia.slice(0, maxImagesPerPrompt),
+          ),
+        };
+      },
+      async onItemCompleted({ task, value }) {
+        const index = originalPromptIndex(task.index);
+        if (completedPromptIndexes.has(index) || publishingPromptIndexes.has(index)) {
+          step(
+            `Fila: conclusão duplicada do prompt ${index + 1} ignorada após a primeira entrega.`,
+          );
+          return;
+        }
+        publishingPromptIndexes.add(index);
+        try {
+          if (!Array.isArray(value) || value.length === 0)
+            throw codedError(
+              "OUTPUT_VALIDATION_FAILED",
+              `A fila terminou sem resultado para o prompt ${index + 1}.`,
+            );
+          for (const result of value) {
+            if (!result?.file || !result?.artifact)
+              throw codedError(
+                "OUTPUT_VALIDATION_FAILED",
+                `A fila terminou com um artifact inválido no prompt ${index + 1}.`,
+              );
+            await cacheGenerationArtifact(request, services, result.artifact);
+            files.push(result.file);
+            artifacts.push(result.artifact);
+          }
+          await publishContinuousTaskState(task, "completed", {
+            outputPort: "images",
+            value: value.map((result) => result.file),
+            artifacts: value.map((result) => result.artifact),
+            message: flowMediaMessage(request?.context?.locale, "continuousCompleted", {
+              position: index + 1,
+              kind: "image",
+            }),
+          });
+          const completedClaim = continuousClaims?.[task.index];
+          if (completedClaim) {
+            await clearVisualBatchItemBaseline(request, services, completedClaim.itemId);
+          }
+          sortGeneratedOutputs(files, "image");
+          sortGeneratedOutputs(artifacts, "image");
+          completedPromptIndexes.add(index);
+          if (continuousClaims === undefined) {
+            await saveGenerationCheckpoint(request, services, prompts, {
+              completedPromptIndexes: [...completedPromptIndexes],
+              files,
+              projectUrl: activeProjectUrl,
+              accountProfile: profileRuntime.accountProfile,
+            });
+          }
+          step(`Fila: prompt ${index + 1} persistido localmente antes de avançar.`);
+          await services.publishPartial?.({
+            values: imageOutputValues(request, files, activeProjectUrl),
+            artifacts,
+            itemUpdates: mediaItemUpdatesForPrompt({
+              continuous: continuousClaims !== undefined || isCoreItemInvocation(request),
+              index,
+              outputPort: "images",
+              input: task.prompt,
+              value,
+            }),
+            progress: completedPromptIndexes.size / prompts.length,
+            message: `Prompt ${index + 1} de ${prompts.length} capturado.`,
+          });
+        } finally {
+          publishingPromptIndexes.delete(index);
+        }
+      },
+      onState(event) {
+        const index = originalPromptIndex(event.task?.index ?? 0);
+        if (event.type === "submitted") {
+          step(
+            `Fila: prompt ${index + 1} enviado; ${event.active}/${maxConcurrentGenerations} em andamento; ${event.pending} aguardando nesta rodada.`,
+          );
+        } else if (event.type === "succeeded") {
+          step(
+            `Fila: prompt ${index + 1} concluído; ${event.active}/${maxConcurrentGenerations} em andamento.`,
+          );
+        } else if (event.type === "failed") {
+          step(
+            `Fila: prompt ${index + 1} falhou (${event.error?.code || "JOB_FAILED"}: ${event.error?.message || "erro não detalhado"}); os demais prompts continuam.`,
+          );
+        } else if (event.type === "retry-round") {
+          step(
+            `Nova rodada de tentativas ${event.attempt}/${retryAttempts + 1}: ${event.tasks.length} prompt(s) com erro.`,
+          );
+        } else if (event.type === "rate-limit-backoff") {
+          step(
+            `Fila: desacelerando (rate-limit / atividade incomum detectada). Aguardando ${Math.round(event.waitMs / 1000)}s antes de re-tentar prompt ${index + 1} (tentativa ${event.attempt}).`,
+          );
+        }
+      },
+    });
+
+    if (generationPlan.failures.length > 0) {
+      const failedPrompts = generationPlan.failures.map(({ task, error }) => {
+        const index = originalPromptIndex(task.index);
+        return {
+          index,
+          prompt: prompts[index],
+          code: error?.code || "JOB_FAILED",
+          message: error?.message || "A geração não foi concluída.",
+          retryable: error?.retryable !== false,
+        };
+      });
+      const summary = failedPrompts
+        .map((item) => `#${item.index + 1} ${item.code}: ${item.message}`)
+        .join(" | ");
+      const partialFailure = codedError(
+        "PARTIAL_FAILURE",
+        `${failedPrompts.length} prompt(s) não foram concluídos; as imagens já geradas foram preservadas. ${summary}`,
+      );
+      partialFailure.retryable = failedPrompts.some((item) => item.retryable);
+      throw partialFailure;
+    }
+
+    activeProjectUrl = (await getActiveFlowProjectUrl(client, sessionId)) || activeProjectUrl;
+    if (settings.minimizeWhenReady === true)
+      await setBrowserWindowState(client, page.targetId, "minimized");
+    responseTracker.close();
+    responseTracker = null;
+    await extensionBridge.dispose();
+    extensionBridge = null;
+    await maybeCloseBrowser(client, browserInfo, keepBrowserOpen);
+    client = null;
+    await clearCaptchaRetryNavigation(request, services);
+    await clearGenerationCheckpoint(request, services);
+    if (continuousClaims !== undefined) await clearVisualBatchSession(request, services);
+
+    return {
+      status: "success",
+      values: imageOutputValues(request, files, activeProjectUrl),
+      artifacts,
+      usage: { provider: "Google Labs / Flow", outputUnits: files.length, unit: "image" },
+      logs: [
+        ...stepLogs,
+        ...diagnosticLogs,
+        `${files.length} imagem(ns) real(is) do Google Flow finalizada(s).`,
+      ],
+    };
+  } catch (cause) {
+    failureCode = /^[A-Z][A-Z_]+$/.test(String(cause?.code || ""))
+      ? cause.code : "UPSTREAM_UNAVAILABLE";
+    if (responseTracker) {
+      try {
+        responseTracker.close();
+      } catch {}
+    }
+    if (client) {
+      try {
+        await maybeCloseBrowser(client, browserInfo, keepBrowserOpen);
+      } catch {}
+    }
+    await extensionBridge?.dispose();
+    const recent = stepLogs.slice(-8).join(" | ");
+    const suffix = recent ? ` Etapas: ${recent}` : "";
+
+    if (cause?.code === "CANCELLED") {
+      return resultError("CANCELLED", "Execução cancelada.", false);
+    }
+
+    if (
+      cause?.code === "AUTHENTICATION_FAILED" &&
+      /recaptcha|captcha/i.test(String(cause?.message || "")) &&
+      activeProjectUrl
+    ) {
+      await saveCaptchaRetryNavigation(request, services, activeProjectUrl).catch(() => undefined);
+    }
+    if (
+      !generationSubmitted &&
+      referencesAttached &&
+      activeProjectUrl &&
+      cause?.code !== "CANCELLED"
+    ) {
+      await saveCaptchaRetryNavigation(request, services, activeProjectUrl, true).catch(
+        () => undefined,
+      );
+    }
+
+    const errorResponse = resultError(
+      cause?.code ?? "UPSTREAM_UNAVAILABLE",
+      `${cause?.message ?? "Falha na automação do Chrome."}${suffix}`,
+      Boolean(cause?.retryable),
+      cause?.retryAfterMs,
+    );
+    const generationRecovery = generationFailureRecovery(cause,
+      isImageAnimation && generationSubmitted && files.length === 0);
+    if (generationRecovery) errorResponse.recovery = generationRecovery;
+    if (cause?.code === "PROVIDER_SECURITY_CHALLENGE" && !generationRecovery) {
+      errorResponse.recovery = {
+        externalEffect: "none",
+        intervention: "provider_security_challenge",
+      };
+    }
+    if (files.length > 0) {
+      if (isVideoCapability) {
+        errorResponse.partialValues = {
+          video: singleVideoOutput ? files[0] : files,
+          ...(activeProjectUrl ? { project_url: activeProjectUrl } : {}),
+        };
+      } else {
+        errorResponse.partialValues = imageOutputValues(request, files, activeProjectUrl);
+      }
+    } else if (activeProjectUrl) {
+      errorResponse.partialValues = { project_url: activeProjectUrl };
+    }
+    if (artifacts.length > 0) {
+      errorResponse.partialArtifacts = artifacts;
+    }
+    errorResponse.logs = [...stepLogs, ...diagnosticLogs];
+    return errorResponse;
+  } finally {
+    if (diagnosticFile) {
+      await writeFile(
+        diagnosticFile,
+        JSON.stringify(
+          {
+            pluginId: PLUGIN_ID,
+            capabilityId,
+            executionId: request?.executionId,
+            blockId: request?.blockId,
+            attempt: request?.attempt,
+            startedWithProfile: request?.configuration?.accountProfile,
+            endedAt: new Date().toISOString(),
+            ...(failureCode ? { failureCode, generationSubmitted } : {}),
+            steps: stepLogs,
+            cdpTrace: diagnosticLogs,
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      ).catch(() => undefined);
+    }
+  }
+}
+export async function execute(request, services) {
+  const bridgeDiagnosticsState = await createBridgeDiagnostics(request, services);
+  let response;
+  try {
+    response = await executeHandler(
+      { ...request, __bridgeDiagnosticsState: bridgeDiagnosticsState },
+      services,
+    );
+  } catch (cause) {
+    if (!["INVALID_INPUT", "INVALID_CONFIGURATION"].includes(cause?.code)) throw cause;
+    response = resultError(cause.code, cause.message);
+  }
+  return { ...response, bridgeDiagnostics: bridgeDiagnosticsState.bridgeDiagnostics };
+}
+
+export const __test = {
+  animationPrompts,
+  describeCdpParams,
+  uploadReferenceImages,
+  waitReferenceUploadReady,
+  referenceUploadStateExpression,
+  existingReferenceSelectionExpression,
+  attachExistingReferenceImages,
+  isFlowHost,
+  normalizePrompts,
+  safeFilename,
+  validateFlowUrl,
+  resolveNavigationTarget,
+  captchaRetryStatePath,
+  readCaptchaRetryNavigation,
+  saveCaptchaRetryNavigation,
+  clearCaptchaRetryNavigation,
+  generationCheckpointPath,
+  readGenerationCheckpoint,
+  saveGenerationCheckpoint,
+  clearGenerationCheckpoint,
+  durableResumeFiles,
+  durableResumeOutputFiles,
+  isFreshRetryRequest,
+  promptIndexFromGeneratedFile,
+  sortGeneratedOutputs,
+  visualProductionCheckpointPath,
+  readVisualProductionCheckpoint,
+  saveVisualProductionCheckpoint,
+  clearVisualProductionCheckpoint,
+  checkpointProjectUrlForProfile,
+  visualProductionProjectUrlForProfile,
+  visualBatchSessionPath,
+  readVisualBatchSession,
+  saveVisualBatchProjectUrl,
+  visualBatchProjectUrl,
+  saveVisualBatchItemBaseline,
+  visualBatchItemBaseline,
+  clearVisualBatchItemBaseline,
+  clearVisualBatchSession,
+  flowContinuousStateCanRefresh,
+  createFlowContinuousItemState,
+  claimFlowContinuousItems,
+  isCoreItemInvocation,
+  invocationMediaContext,
+  keepBrowserForCurrentItem,
+  visualBatchItemSelection,
+  filesForCurrentBatchItem,
+  resumeValueForPort,
+  remapNestedFailure,
+  defaultProfilePath,
+  defaultProfilesRootPath,
+  normalizeAccountProfile,
+  resolveProfileRuntime,
+  profileIsPrepared,
+  markProfilePrepared,
+  closeBrowserGracefully,
+  resolveGenerationPreferences,
+  dynamicFlowModelLabel,
+  actionableOutputPort,
+  normalizeItemActionRequest,
+  mediaItemUpdate,
+  mediaItemUpdatesForInvocation,
+  generationFailureRecovery,
+  singleAnimationResult,
+  waitForGeneratedVideosOnPage,
+  mediaItemUpdatesForPrompt,
+  artifactNamespace,
+  flowMediaMessage,
+  validateImageArtifactBytes,
+  validateVideoArtifactBytes,
+  nextImageModelFallback,
+  normalizeReferenceImages,
+  prepareAllFlowReferences,
+  attachReferenceImagesOneByOne,
+  referenceImagesForSourceItem,
+  referenceImagesForCurrentItem,
+  requestsSingleImage,
+  requestsSingleVideo,
+  selectAnimationIndexes,
+  generatedArtifactInputPath,
+  configurationForProjectContinuation,
+  mediaItemsFromImageUrls,
+  mediaItemsFromImageCandidates,
+  imageMediaIdentity,
+  mediaItemsFromVideoUrls,
+  parseGenerationResponse,
+  waitForPromptEditorStable,
+  setPromptWithExtension,
+  downloadGeneratedImage,
+  downloadGeneratedVideo,
+  resolveVideoPreferences,
+  getActiveFlowProjectUrl,
+  assertDedicatedProfilePath,
+  extensionForMime,
+  IMAGE_MODELS,
+  MODEL_LABELS,
+  VIDEO_MODELS,
+  VIDEO_MODEL_LABELS,
+  VIDEO_RESOLUTIONS,
+  ASPECT_RATIOS,
+  ASPECT_RATIO_LABELS,
+  classifyGenerationHttpError,
+  createAdaptiveConcurrencyController,
+  runSubmissionRound,
+  runGenerationPlan,
+  shouldRetryGenerationError,
+  pageStateExpression,
+  attachFlowPage,
+  waitForPageReady,
+  maybeCloseBrowser,
+  TIMING,
+  dynamicSleep,
+  calculateJitteredDelay,
+  classifyTileErrorType,
+  RE_SOBRECARGA,
+  ensureAgentOff,
+  triggerTrustedReactClick,
+  attachedReferenceCount,
+  clickGenerateWithExtension,
+  clickGenerateAndConfirm,
+  decodificarBatchExecute,
+  extrairMidiasRpc,
+  createCredentialsTracker,
+  waitForFlowToken,
+  clickSubmit,
+  apiRenameProject,
+  applyTileMetadataPatch,
+};

@@ -1,0 +1,35 @@
+{
+  "pluginId": "local.contentflow.meta-ai-browser-studio",
+  "capabilityIds": [
+    "generate-text-in-browser",
+    "generate-image-in-browser",
+    "generate-video-in-browser"
+  ],
+  "origins": ["https://meta.ai", "https://www.meta.ai"],
+  "routes": {
+    "generate-text-in-browser": "https://www.meta.ai/",
+    "generate-image-in-browser": "https://www.meta.ai/create",
+    "generate-video-in-browser": "https://www.meta.ai/vibes"
+  },
+  "standaloneVibesOrigin": "https://vibes.ai",
+  "networkHosts": ["meta.ai", "www.meta.ai", "facebook.com", "*.fbcdn.net"],
+  "capabilities": {
+    "generate-text-in-browser": {
+      "inputPorts": ["content", "attachments"],
+      "outputPorts": ["result", "parts"]
+    },
+    "generate-image-in-browser": {
+      "inputPorts": ["prompt", "references"],
+      "outputPorts": ["image", "description"]
+    },
+    "generate-video-in-browser": {
+      "inputPorts": ["prompt", "references", "video_references"],
+      "outputPorts": ["video", "description"],
+      "requiredOutput": "video",
+      "imageReferenceShape": { "kind": "content", "family": "image", "cardinality": "many", "representation": "artifact", "formats": { "mimeTypes": ["image/*"] } },
+      "videoReferenceShape": { "kind": "content", "family": "video", "cardinality": "many", "representation": "artifact", "formats": { "mimeTypes": ["video/*"] } },
+      "videoOutputShape": { "kind": "content", "family": "video", "cardinality": "one", "representation": "artifact" },
+      "descriptionOutputShape": { "kind": "content", "family": "text", "cardinality": "one", "representation": "inline" }
+    }
+  }
+}

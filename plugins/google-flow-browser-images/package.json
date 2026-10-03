@@ -1,0 +1,10 @@
+{
+  "name": "contentflow-google-flow-browser-images",
+  "version": "3.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test.mjs reference-lifecycle.test.mjs"
+  },
+  "license": "MIT"
+}

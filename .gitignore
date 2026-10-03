@@ -1,0 +1,23 @@
+node_modules/
+release/
+dist/
+.env
+.env.*
+!.env.example
+*.log
+__pycache__/
+*.py[cod]
+.DS_Store
+.tmp/
+profiles/
+sessions/
+credentials/
+captured-flow-session.json
+windows-enterprise-install/artifacts/
+
+# Binários de terceiros são distribuídos nas releases, com suas licenças.
+*.exe
+*.dll
+*.pyd
+*.whl
+*.zip

@@ -1,0 +1,83 @@
+{
+  "executionId": "mai-fixture",
+  "traceId": "mai-fixture-trace",
+  "blockId": "mai-fixture-block",
+  "capabilityId": "generate-voice-in-browser",
+  "attempt": 1,
+  "invocation": {
+    "mode": "start"
+  },
+  "configuration": {
+    "model": "mai-voice-2",
+    "voice": "alder",
+    "style": "neutral",
+    "accountProfile": "default"
+  },
+  "settings": {
+    "diagnosticMockResponse": "Narração de teste gerada pelo modelo de mock."
+  },
+  "inputs": {
+    "text": "Este é um teste de áudio narrado pelo plugin."
+  },
+  "inputContract": [
+    {
+      "id": "input",
+      "portKey": "text",
+      "label": "Texto da narração",
+      "shape": {
+        "kind": "content",
+        "family": "text",
+        "cardinality": "one",
+        "representation": "inline"
+      }
+    }
+  ],
+  "outputContract": [
+    {
+      "portKey": "audio",
+      "label": "Áudio narrado",
+      "key": "audio",
+      "required": true,
+      "shape": {
+        "kind": "content",
+        "family": "audio",
+        "cardinality": "one",
+        "representation": "artifact"
+      }
+    },
+    {
+      "portKey": "transcript",
+      "label": "Texto falado",
+      "key": "transcript",
+      "required": false,
+      "shape": {
+        "kind": "content",
+        "family": "text",
+        "cardinality": "one",
+        "representation": "inline"
+      }
+    }
+  ],
+  "context": {
+    "locale": "pt-BR",
+    "timeZone": "America/Sao_Paulo",
+    "channel": {
+      "id": "channel",
+      "name": "Canal de Teste",
+      "language": "pt-BR",
+      "niche": "Histórias"
+    },
+    "project": {
+      "id": "project",
+      "title": "Projeto de Teste"
+    },
+    "processType": "narration",
+    "block": {
+      "type": "CRIAR",
+      "name": "Criar narração",
+      "instructions": "Narre o texto com clareza."
+    },
+    "previousProcessOutputs": [],
+    "previousBlockOutputs": []
+  }
+}

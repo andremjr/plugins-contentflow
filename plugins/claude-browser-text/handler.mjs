@@ -1,0 +1,1744 @@
+import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
+import { readFile, stat, writeFile } from "node:fs/promises";
+import { homedir, platform } from "node:os";
+import { basename, extname, join } from "node:path";
+import { attachContentFlowBridge } from "./browser-bridge-client.mjs";
+import { createBridgeDiagnostics } from "./bridge-diagnostics.mjs";
+
+const PLUGIN_ID = "local.contentflow.claude-browser-text";
+const CLAUDE_HOST = "claude.ai";
+const CLAUDE_NEW_URL = "https://claude.ai/new";
+const DEFAULT_PORT = 9444;
+const MAX_PROMPT_CHARACTERS = 500_000;
+const MAX_PARTS = 32;
+const MAX_ATTACHMENTS = 20;
+const MAX_ATTACHMENT_BYTES = 500 * 1024 * 1024;
+const PROFILE_SETUP_WAIT_MS = Number.POSITIVE_INFINITY;
+const IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
+const DOCUMENT_EXTENSIONS = new Set([
+  ".md",
+  ".pdf",
+  ".docx",
+  ".csv",
+  ".txt",
+  ".html",
+  ".htm",
+  ".odt",
+  ".rtf",
+  ".srt",
+  ".epub",
+  ".json",
+  ".xlsx",
+]);
+const SUPPORTED_UPLOAD_EXTENSIONS = new Set([...IMAGE_EXTENSIONS, ...DOCUMENT_EXTENSIONS]);
+
+function resultError(code, message, retryable = false, retryAfterMs) {
+  const value = { status: "error", code, message, retryable };
+  if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) value.retryAfterMs = retryAfterMs;
+  return value;
+}
+
+function codedError(code, message, retryable = false) {
+  const error = new Error(message);
+  error.code = code;
+  error.retryable = retryable;
+  return error;
+}
+
+function sleep(ms, signal) {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(codedError("CANCELLED", "Execução cancelada."));
+    const timer = setTimeout(done, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(codedError("CANCELLED", "Execução cancelada."));
+    };
+    function done() {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function clampInteger(value, fallback, minimum, maximum) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) ? Math.min(maximum, Math.max(minimum, parsed)) : fallback;
+}
+
+function serialize(value) {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value ?? "");
+  }
+}
+
+function serializeInputs(inputs) {
+  const entries = Object.entries(inputs ?? {});
+  if (!entries.length) return "";
+  if (entries.length === 1 && entries[0][0] === "content") return serialize(entries[0][1]);
+  return entries.map(([key, value]) => `${key}:\n${serialize(value)}`).join("\n\n");
+}
+
+function promptContextInputs(request) {
+  return request?.instructionContextInputs ?? request?.inputs;
+}
+
+function replaceAllLiteral(text, token, value) {
+  return String(text)
+    .split(token)
+    .join(String(value ?? ""));
+}
+
+function expandTemplate(template, request) {
+  const context = request?.context ?? {};
+  const replacements = {
+    "{{CONTENT}}": serializeInputs(promptContextInputs(request)),
+    "{{CHANNEL_NAME}}": context?.channel?.name ?? "",
+    "{{NICHE}}": context?.channel?.niche ?? "",
+    "{{PROJECT_TITLE}}": context?.project?.title ?? "",
+    "{{PROCESS}}": context?.processType ?? "",
+    "{{BLOCK_INSTRUCTIONS}}":
+      request?.resolvedInstruction || context?.block?.instructions || context?.block?.name || "",
+    "{{TEMA}}": serializeInputs(promptContextInputs(request)),
+    "{{NICHO}}": context?.channel?.niche ?? "",
+  };
+  let output = String(template ?? "");
+  for (const [token, value] of Object.entries(replacements)) {
+    output = replaceAllLiteral(output, token, value);
+  }
+  for (const [key, value] of Object.entries(promptContextInputs(request) ?? {})) {
+    output = replaceAllLiteral(output, `{{INPUT:${key}}}`, serialize(value));
+  }
+  return output.trim();
+}
+
+function ensureBlockInstruction(prompt, template, request) {
+  const instruction = String(
+    request?.resolvedInstruction ||
+      request?.context?.block?.instructions ||
+      request?.context?.block?.name ||
+      "",
+  ).trim();
+  const expanded = String(prompt ?? "").trim();
+  if (!instruction || String(template ?? "").includes("{{BLOCK_INSTRUCTIONS}}")) return expanded;
+  if (expanded.includes(instruction)) return expanded;
+  return `INSTRUÇÕES DO BLOCO:\n${instruction}\n\n${expanded}`.trim();
+}
+
+function ensureInputContext(prompt, template, request) {
+  const sourceTemplate = String(template ?? "");
+  if (sourceTemplate.includes("{{CONTENT}}") || sourceTemplate.includes("{{TEMA}}")) {
+    return String(prompt ?? "").trim();
+  }
+  const remainingInputs = Object.fromEntries(
+    Object.entries(promptContextInputs(request) ?? {}).filter(
+      ([key]) => !sourceTemplate.includes(`{{INPUT:${key}}}`),
+    ),
+  );
+  const context = serializeInputs(remainingInputs).trim();
+  const expanded = String(prompt ?? "").trim();
+  if (!context || expanded.includes(context)) return expanded;
+  return `${expanded}\n\nCONTEXTO DAS ENTRADAS:\n${context}`.trim();
+}
+
+function expandPrimaryTemplate(template, request) {
+  return ensureInputContext(
+    ensureBlockInstruction(expandTemplate(template, request), template, request),
+    template,
+    request,
+  );
+}
+
+function buildInstructionPrompt(request, additions = []) {
+  const instruction = String(request?.resolvedInstruction ?? "").trim();
+  if (!instruction)
+    throw codedError("INVALID_INPUT", "A instrução resolvida do bloco é obrigatória.");
+  const prompt = [expandPrimaryTemplate("", request), ...additions.map(String).filter(Boolean)]
+    .join("\n\n")
+    .trim();
+  if (prompt.length > MAX_PROMPT_CHARACTERS)
+    throw codedError("INVALID_INPUT", `O prompt ultrapassou ${MAX_PROMPT_CHARACTERS} caracteres.`);
+  return prompt;
+}
+
+function flattenRecords(value, output = []) {
+  if (Array.isArray(value)) {
+    for (const item of value) flattenRecords(item, output);
+  } else if (value && typeof value === "object") {
+    output.push(value);
+  }
+  return output;
+}
+
+function summarizeBlock(index, block) {
+  if (typeof block === "string") return block.trim() || `Bloco ${index}`;
+  const title = block?.titulo_bloco || block?.titulo || block?.nome || `Bloco ${index}`;
+  const objective = block?.objetivo || block?.objetivo_emocional || block?.descricao || "";
+  const points = block?.pontos_chave || block?.pontos || block?.conteudos_obrigatorios || [];
+  const pointText = Array.isArray(points)
+    ? points.map(String).filter(Boolean).join("; ")
+    : String(points || "");
+  return [
+    `Bloco ${index}: ${title}`,
+    objective && `Objetivo: ${objective}`,
+    pointText && `Pontos: ${pointText}`,
+  ]
+    .filter(Boolean)
+    .join(" | ");
+}
+
+function outlineItems(request) {
+  const explicit = request?.inputs?.outline;
+  if (Array.isArray(explicit) && explicit.length) return explicit.slice(0, MAX_PARTS);
+  const content = request?.inputs?.content;
+  if (Array.isArray(content) && content.some((item) => item && typeof item === "object")) {
+    return flattenRecords(content).slice(0, MAX_PARTS);
+  }
+  return [];
+}
+
+function expandOutlinePrompt(template, request, block, index, total, base) {
+  let output = expandTemplate(template, request);
+  const values = {
+    "{{PROMPT_BASE}}": base,
+    "{{BLOCK_NUMBER}}": String(index + 1),
+    "{{BLOCK_TOTAL}}": String(total),
+    "{{BLOCK}}": summarizeBlock(index + 1, block),
+    "{{BLOCK_JSON}}": serialize(block),
+    "{{IS_FIRST}}": index === 0 ? "true" : "false",
+    "{{IS_LAST}}": index === total - 1 ? "true" : "false",
+  };
+  for (const [token, value] of Object.entries(values))
+    output = replaceAllLiteral(output, token, value);
+  return output.trim();
+}
+
+function plainTextInstruction(enabled) {
+  return enabled
+    ? "INSTRUÇÃO OBRIGATÓRIA DE FORMATO: escreva apenas como texto puro. Não crie arquivos, artefatos ou código. Entregue diretamente o texto solicitado."
+    : "";
+}
+
+function parseOptionalPositiveInteger(value, label) {
+  if (value === undefined || value === null || value === "") return undefined;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw codedError("INVALID_INPUT", `${label} precisa ser um número inteiro positivo.`);
+  }
+  return parsed;
+}
+
+function targetCharacterPlan(request) {
+  const target = parseOptionalPositiveInteger(
+    request?.inputs?.target ?? request?.configuration?.targetCharacters,
+    "A meta de caracteres",
+  );
+  if (!target) return undefined;
+  if (target > 1_000_000) {
+    throw codedError("INVALID_INPUT", "A meta de caracteres não pode ultrapassar 1.000.000.");
+  }
+  const tolerancePercent = clampInteger(
+    request?.configuration?.characterTolerancePercent,
+    5,
+    0,
+    25,
+  );
+  return {
+    target,
+    tolerancePercent,
+    minimum: Math.floor(target * (1 - tolerancePercent / 100)),
+    maximum: Math.ceil(target * (1 + tolerancePercent / 100)),
+  };
+}
+
+function requestedSectionCount(request) {
+  return Math.min(
+    MAX_PARTS,
+    parseOptionalPositiveInteger(request?.inputs?.sections, "A quantidade de blocos") ?? 1,
+  );
+}
+
+function sequenceItems(request) {
+  const explicit = outlineItems(request);
+  if (explicit.length) return explicit;
+  return Array.from({ length: requestedSectionCount(request) }, (_, index) => `Bloco ${index + 1}`);
+}
+
+function buildParts(request) {
+  const base = buildInstructionPrompt(request, [plainTextInstruction(true)]);
+  const configuredMode = String(request?.configuration?.generationMode ?? "auto");
+  const items = sequenceItems(request);
+  const useSequence =
+    configuredMode === "sequence" || (configuredMode === "auto" && items.length > 1);
+  if (!useSequence) return [base];
+
+  return items.map((item, index) => {
+    const position = index + 1;
+    const description = summarizeBlock(position, item);
+    if (index === 0) {
+      return [
+        base,
+        `O roteiro será produzido em ${items.length} blocos consecutivos nesta mesma conversa.`,
+        `Escreva agora somente o bloco ${position}/${items.length}: ${description}`,
+        "Não antecipe os blocos seguintes e entregue apenas o trecho do roteiro, sem comentários sobre o processo.",
+      ].join("\n\n");
+    }
+    const ending = index === items.length - 1 ? " Conclua o roteiro neste bloco." : "";
+    return [
+      `Continue exatamente de onde o roteiro parou e escreva somente o bloco ${position}/${items.length}: ${description}.${ending}`,
+      "Preserve idioma, voz, fatos, ritmo e continuidade. Não repita trechos anteriores e entregue apenas o novo trecho do roteiro.",
+      plainTextInstruction(true),
+    ].join("\n\n");
+  });
+}
+
+function cleanCombinedResponses(responses) {
+  return responses
+    .map((response) => cleanGeneratedText(response?.text))
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+}
+
+function promptWithCharacterBudget(prompt, plan, responses, index, total) {
+  if (!plan) return prompt;
+  const accumulated = cleanCombinedResponses(responses).length;
+  const remainingCharacters = Math.max(1, plan.target - accumulated);
+  const remainingParts = Math.max(1, total - index);
+  const partTarget = Math.max(200, Math.round(remainingCharacters / remainingParts));
+  return `${prompt}\n\nMETA DE TAMANHO: o roteiro completo deve ficar próximo de ${plan.target} caracteres. Produza aproximadamente ${partTarget} caracteres nesta etapa; restam ${remainingParts} etapa(s), incluindo esta.`;
+}
+
+function lengthRepairPrompt(plan, currentLength) {
+  const missing = Math.max(1, plan.target - currentLength);
+  return [
+    `O texto acumulado tem aproximadamente ${currentLength} caracteres e a meta é ${plan.target}.`,
+    `Continue de onde parou e acrescente aproximadamente ${missing} caracteres que se integrem naturalmente ao roteiro, sem repetir conteúdo.`,
+    "Preserve idioma, voz, fatos e continuidade. Entregue somente o novo trecho do roteiro, sem comentários sobre o processo.",
+    plainTextInstruction(true),
+  ].join("\n\n");
+}
+
+function validateGeneratedLength(result, plan) {
+  if (!plan) return;
+  if (result.length < plan.minimum || result.length > plan.maximum) {
+    throw codedError(
+      "OUTPUT_VALIDATION_FAILED",
+      `O roteiro terminou com ${result.length} caracteres; a faixa aceita é de ${plan.minimum} a ${plan.maximum} para a meta de ${plan.target}.`,
+      true,
+    );
+  }
+}
+
+function markdownArtifactRequested(request) {
+  return (request?.outputContract ?? []).some(
+    (field) => field?.portKey === "document" || field?.type === "file",
+  );
+}
+
+function safeMarkdownName(request) {
+  const base = String(request?.context?.project?.title ?? "roteiro")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+  return `${base || "roteiro"}.md`;
+}
+
+async function createMarkdownArtifact(request, services, result) {
+  const bytes = Buffer.from(result, "utf8");
+  const id = `claude-markdown-${createHash("sha256")
+    .update(
+      `${request?.executionId || "execution"}:${request?.blockId || "block"}:${request?.attempt || 1}`,
+    )
+    .digest("hex")
+    .slice(0, 16)}`;
+  const name = safeMarkdownName(request);
+  await writeFile(services.getOutputPath(name), bytes);
+  return {
+    file: { id, name, mimeType: "text/markdown", size: bytes.length, url: `artifact://${id}` },
+    artifact: {
+      id,
+      name,
+      mimeType: "text/markdown",
+      size: bytes.length,
+      source: { kind: "path", path: name },
+    },
+  };
+}
+
+function expandCapabilityTemplate(template, replacements, request) {
+  let output = String(template ?? "");
+  for (const [token, value] of Object.entries(replacements)) {
+    output = replaceAllLiteral(output, token, typeof value === "string" ? value : serialize(value));
+  }
+  return ensureBlockInstruction(expandTemplate(output, request), template, request);
+}
+
+function buildSearchPrompt(request) {
+  const prompt = buildInstructionPrompt(request);
+  if (!prompt) throw codedError("INVALID_INPUT", "A consulta de pesquisa ficou vazia.");
+  return prompt;
+}
+
+function buildChoosePrompt(request) {
+  const collection = request?.context?.selectedCollection;
+  if (!collection || !Array.isArray(collection.items) || !collection.items.length) {
+    throw codedError(
+      "INVALID_INPUT",
+      "O bloco Escolher precisa receber uma coleção estratégica com itens.",
+    );
+  }
+  return buildInstructionPrompt(request, [
+    `ITENS DISPONÍVEIS:\n${serialize(collection.items)}`,
+    'Responda somente JSON válido: {"selectedItemId":"ID_EXATO_DO_ITEM"}.',
+  ]);
+}
+
+function validationMode(request) {
+  return ["approval", "select_one", "select_many"].includes(request?.validation?.mode)
+    ? request.validation.mode
+    : "approval";
+}
+
+function validationOutputInstruction(mode) {
+  if (mode === "select_one") {
+    return 'Responda somente com JSON válido: {"selectedIndex": NUMERO_1_BASED, "feedback": "justificativa curta"}.';
+  }
+  if (mode === "select_many") {
+    return 'Responda somente com JSON válido: {"selectedIndices": [NUMEROS_1_BASED], "feedback": "justificativa curta"}.';
+  }
+  return 'Responda somente com JSON válido: {"decision": "approved" ou "rejected", "feedback": "justificativa objetiva"}.';
+}
+
+function buildValidationPrompt(request) {
+  const mode = validationMode(request);
+  return buildInstructionPrompt(request, [validationOutputInstruction(mode)]);
+}
+
+function buildImageAnalysisPrompt(request) {
+  return buildInstructionPrompt(request);
+}
+
+function buildDocumentAnalysisPrompt(request) {
+  return buildInstructionPrompt(request);
+}
+
+function isStoredFile(value) {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    typeof value.id === "string" &&
+    typeof value.url === "string",
+  );
+}
+
+function collectStoredFiles(value, output = []) {
+  if (isStoredFile(value)) output.push(value);
+  else if (Array.isArray(value)) for (const item of value) collectStoredFiles(item, output);
+  else if (value && typeof value === "object")
+    for (const item of Object.values(value)) collectStoredFiles(item, output);
+  return output;
+}
+
+function attachmentInputs(request) {
+  const capabilityId = String(request?.capabilityId ?? "");
+  if (capabilityId === "analyze-images-in-browser") return request?.inputs?.images;
+  if (capabilityId === "analyze-documents-in-browser") return request?.inputs?.documents;
+  if (capabilityId === "validate-content-in-browser") return request?.inputs?.content;
+  if (capabilityId === "generate-text-in-browser") return request?.inputs?.attachments;
+  return undefined;
+}
+
+async function resolveAttachments(request, services) {
+  const files = collectStoredFiles(attachmentInputs(request));
+  const unique = [...new Map(files.map((file) => [file.id, file])).values()];
+  if (unique.length > MAX_ATTACHMENTS)
+    throw codedError(
+      "INVALID_INPUT",
+      `O Claude aceita no máximo ${MAX_ATTACHMENTS} anexos por conversa.`,
+    );
+  const capabilityId = String(request?.capabilityId ?? "");
+  if (
+    ["analyze-images-in-browser", "analyze-documents-in-browser"].includes(capabilityId) &&
+    !unique.length
+  ) {
+    throw codedError("INVALID_INPUT", "Nenhum arquivo autorizado foi recebido para análise.");
+  }
+  const resolved = [];
+  for (const file of unique) {
+    let path = await services.resolveInputFile(file);
+    let name = file.name || basename(path);
+    let extension = extname(name || path).toLowerCase();
+    if (!SUPPORTED_UPLOAD_EXTENSIONS.has(extension)) {
+      throw codedError(
+        "INVALID_INPUT",
+        `Formato não suportado pelo Claude: ${extension || "sem extensão"}.`,
+      );
+    }
+    if (capabilityId === "analyze-images-in-browser" && !IMAGE_EXTENSIONS.has(extension)) {
+      throw codedError(
+        "INVALID_INPUT",
+        `O recurso de visão aceita apenas imagens JPEG, PNG, GIF ou WebP: ${file.name}.`,
+      );
+    }
+    if (capabilityId === "analyze-documents-in-browser" && !DOCUMENT_EXTENSIONS.has(extension)) {
+      throw codedError(
+        "INVALID_INPUT",
+        `O recurso de documentos não aceita o formato de ${file.name}.`,
+      );
+    }
+    if (extension === ".md") {
+      const base = basename(name, extension)
+        .replace(/[^a-zA-Z0-9._-]+/g, "-")
+        .slice(0, 100);
+      name = `${base || "contexto"}.txt`;
+      const normalizedPath = services.getOutputPath(name);
+      await writeFile(normalizedPath, await readFile(path));
+      path = normalizedPath;
+      extension = ".txt";
+    }
+    const info = await stat(path);
+    if (!info.isFile())
+      throw codedError("INVALID_INPUT", `O anexo autorizado não é um arquivo: ${file.name}.`);
+    if (info.size > MAX_ATTACHMENT_BYTES)
+      throw codedError("INVALID_INPUT", `O anexo ${file.name} ultrapassa 500 MB.`);
+    resolved.push({ path, name, size: info.size });
+  }
+  return resolved;
+}
+
+function stripCodeFence(text) {
+  return String(text ?? "")
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "");
+}
+
+function parseJsonObject(text) {
+  const stripped = stripCodeFence(text);
+  try {
+    const parsed = JSON.parse(stripped);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : undefined;
+  } catch {
+    const match = stripped.match(/\{[\s\S]*\}/);
+    if (!match) return undefined;
+    try {
+      const parsed = JSON.parse(match[0]);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+}
+
+function parseSelectedItemId(text, request) {
+  const items = request?.context?.selectedCollection?.items ?? [];
+  const parsed = parseJsonObject(text);
+  const candidate = String(parsed?.selectedItemId ?? stripCodeFence(text))
+    .replace(/^['"]|['"]$/g, "")
+    .trim();
+  if (!items.some((item) => item.id === candidate)) {
+    throw codedError(
+      "OUTPUT_VALIDATION_FAILED",
+      "O Claude não devolveu o ID exato de um item permitido.",
+      true,
+    );
+  }
+  return candidate;
+}
+
+function selectionCandidates(value) {
+  if (Array.isArray(value)) return value;
+  return value === undefined || value === null ? [] : [value];
+}
+
+function parseValidationValues(text, request) {
+  const mode = validationMode(request);
+  const parsed = parseJsonObject(text) ?? {};
+  const feedback = String(parsed.feedback ?? "").trim();
+  if (mode === "approval") {
+    const raw = String(parsed.decision ?? text).toLowerCase();
+    const decision = /reprov|reject/.test(raw)
+      ? "rejected"
+      : /aprov|approve/.test(raw)
+        ? "approved"
+        : undefined;
+    if (!decision)
+      throw codedError(
+        "OUTPUT_VALIDATION_FAILED",
+        "O Claude não devolveu approved ou rejected.",
+        true,
+      );
+    return { decision, ...(feedback ? { feedback } : {}) };
+  }
+
+  const candidates = selectionCandidates(request?.inputs?.content);
+  if (!candidates.length)
+    throw codedError("INVALID_INPUT", "Não há opções para validar/selecionar.");
+  if (mode === "select_one") {
+    const index = Number(parsed.selectedIndex) - 1;
+    if (!Number.isInteger(index) || index < 0 || index >= candidates.length) {
+      throw codedError(
+        "OUTPUT_VALIDATION_FAILED",
+        "O Claude devolveu um índice de seleção inválido.",
+        true,
+      );
+    }
+    return { selected_value: candidates[index], ...(feedback ? { feedback } : {}) };
+  }
+  const indices = Array.isArray(parsed.selectedIndices)
+    ? parsed.selectedIndices.map((item) => Number(item) - 1)
+    : [];
+  if (
+    !indices.length ||
+    indices.some((index) => !Number.isInteger(index) || index < 0 || index >= candidates.length)
+  ) {
+    throw codedError(
+      "OUTPUT_VALIDATION_FAILED",
+      "O Claude devolveu índices de seleção inválidos.",
+      true,
+    );
+  }
+  return {
+    selected_values: [...new Set(indices)].map((index) => candidates[index]),
+    ...(feedback ? { feedback } : {}),
+  };
+}
+
+function textAsList(text) {
+  const lines = String(text ?? "")
+    .split("\n")
+    .map((line) => line.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, "").trim())
+    .filter(Boolean);
+  return lines.length > 1 ? lines : [String(text ?? "").trim()].filter(Boolean);
+}
+
+function recordFromSearch(field, text, sources) {
+  return Object.fromEntries(
+    (field?.recordFields ?? []).map((recordField) => {
+      const isSource = /source|fonte|url|link/i.test(`${recordField.key} ${recordField.label}`);
+      let value;
+      if (recordField.type === "list" || recordField.type === "multiselect")
+        value = isSource ? sources : textAsList(text);
+      else if (recordField.type === "url") value = sources[0] ?? "https://claude.ai";
+      else if (recordField.type === "boolean") value = true;
+      else if (recordField.type === "number") value = 1;
+      else value = isSource ? sources.join("\n") : text;
+      return [recordField.key, value];
+    }),
+  );
+}
+
+function searchResponseValues(text, sources, request) {
+  const fields = Array.isArray(request?.outputContract) ? request.outputContract : [];
+  const values = {};
+  for (const field of fields) {
+    const isSource = /source|fonte|url|link/i.test(`${field.key} ${field.label}`);
+    if (isSource) {
+      values[field.portKey] = field.type === "url" ? (sources[0] ?? "https://claude.ai") : sources;
+    } else if (field.type === "list" || field.type === "multiselect") {
+      values[field.portKey] = textAsList(text);
+    } else if (field.type === "records") {
+      values[field.portKey] = [recordFromSearch(field, text, sources)];
+    } else {
+      values[field.portKey] = text;
+    }
+  }
+  return values;
+}
+
+function generationResponseValues(result, responses, request) {
+  const values = {};
+  for (const field of request?.outputContract ?? []) {
+    values[field.portKey] =
+      field?.key === "parts" ? responses.map((response) => response.text) : result;
+  }
+  return values;
+}
+
+function cleanGeneratedText(input) {
+  let text = String(input ?? "");
+  if (text.includes("`") && /const |new Paragraph|sections_text/.test(text)) {
+    const sections = [...text.matchAll(/`([^`]{200,})`/gs)].map((match) => match[1]);
+    if (sections.length)
+      text = sections
+        .join("\n\n")
+        .replaceAll("\\n", "\n")
+        .replaceAll("\\t", "")
+        .replaceAll("\\'", "'")
+        .replaceAll('\\"', '"');
+  }
+  return text
+    .replace(/<antArtifact[^>]*>.*?<\/antArtifact>/gis, "")
+    .replace(/<\/?antArtifact[^>]*>/gi, "")
+    .replace(/^\{["'](?:description|command|filepaths|path|file_text).*?\}$/gim, "")
+    .replace(/^\[\{["']type["'].*?\}\]$/gim, "")
+    .replace(/```[\s\S]*?```/g, "")
+    .replace(/^#+\s+.*$/gm, "")
+    .replace(/^(const |let |var |import |require\(|npm |pip |python |node |cd ).*$/gm, "")
+    .replace(/^.*\b(function|async|await|return|console\.log)\b.*$/gm, "")
+    .replace(/^\s*["'][a-zA-Z_]+["']\s*:\s*.*$/gm, "")
+    .replace(/^\s*"(?:uuid|type)":\s*".*".*$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function defaultProfilesBasePath() {
+  return join(homedir(), ".contentflow", "claude-browser-profiles");
+}
+
+function normalizeAccountProfile(value) {
+  const name = String(value ?? "default").trim() || "default";
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$/.test(name)) {
+    throw codedError(
+      "INVALID_CONFIGURATION",
+      "Perfil da conta Claude deve ter 1 a 48 caracteres e usar apenas letras, números, _ ou -.",
+    );
+  }
+  return name;
+}
+
+function profilePathFor(settings, profileName) {
+  const legacy = settings?.profilePath?.trim?.();
+  if (legacy && profileName === "default") return legacy;
+  const base = settings?.profilesBasePath?.trim?.() || defaultProfilesBasePath();
+  return join(base, profileName);
+}
+function runtimeProfilePath(settings, profileName, services) {
+  if (settings?.profilePath?.trim?.() || settings?.profilesBasePath?.trim?.()) {
+    return profilePathFor(settings, profileName);
+  }
+  return services.getWorkspacePath(profileName);
+}
+function profileMarkerPath(path) {
+  return join(path, ".contentflow-profile-ready.json");
+}
+async function profileIsPrepared(path, name) {
+  try {
+    const marker = JSON.parse(await readFile(profileMarkerPath(path), "utf8"));
+    return (
+      marker?.provider === CLAUDE_HOST && marker?.profile === name && marker?.bridgeProtocol === 2
+    );
+  } catch {
+    return false;
+  }
+}
+async function markProfilePrepared(path, name) {
+  await writeFile(
+    profileMarkerPath(path),
+    JSON.stringify({
+      provider: CLAUDE_HOST,
+      profile: name,
+      bridgeProtocol: 2,
+      preparedAt: new Date().toISOString(),
+    }),
+    "utf8",
+  );
+}
+
+function profilePort(basePort, profileName) {
+  if (profileName === "default") return basePort;
+  let hash = 2166136261;
+  for (const char of profileName) {
+    hash ^= char.codePointAt(0);
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  return basePort + (hash % Math.min(1200, 65535 - basePort));
+}
+
+function assertDedicatedProfilePath(path, allowExistingChromeProfile = false) {
+  if (allowExistingChromeProfile) return;
+  const normalized = String(path).replaceAll("\\", "/").toLowerCase().replace(/\/+$/, "");
+  if (
+    normalized.endsWith("/google/chrome/user data") ||
+    normalized.endsWith("/google/chrome/default") ||
+    normalized.includes("/google/chrome/user data/default")
+  ) {
+    throw codedError(
+      "INVALID_CONFIGURATION",
+      "Use um perfil Chrome dedicado ao plugin, não o perfil pessoal padrão.",
+    );
+  }
+}
+
+function dedupeStrings(values) {
+  return [
+    ...new Set(
+      values
+        .filter(Boolean)
+        .map((value) => String(value).trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
+function requireCoreBrowserSession(coreSession) {
+  if (
+    !coreSession ||
+    !Number.isInteger(coreSession.port) ||
+    typeof coreSession.webSocketDebuggerUrl !== "string" ||
+    !coreSession.webSocketDebuggerUrl
+  ) {
+    throw codedError(
+      "INVALID_CONFIGURATION",
+      "O ContentFlow não forneceu a sessão de navegador reservada para este perfil.",
+    );
+  }
+  return coreSession;
+}
+
+async function launchOrReuseChrome({ coreSession }) {
+  const session = requireCoreBrowserSession(coreSession);
+  return {
+    version: { webSocketDebuggerUrl: session.webSocketDebuggerUrl },
+    child: null,
+    reused: true,
+    startedByCore: true,
+    startedByPlugin: false,
+  };
+}
+
+async function closeBrowserGracefully(client) {
+  client?.close();
+}
+
+class CdpClient {
+  constructor(wsUrl, trace) {
+    this.wsUrl = wsUrl;
+    this.trace = trace;
+    this.ws = null;
+    this.nextId = 1;
+    this.pending = new Map();
+  }
+
+  async connect(signal) {
+    if (typeof WebSocket !== "function")
+      throw codedError("UPSTREAM_UNAVAILABLE", "Runtime Node sem WebSocket global para CDP.");
+    this.ws = new WebSocket(this.wsUrl);
+    await new Promise((resolve, reject) => {
+      const onAbort = () => reject(codedError("CANCELLED", "Execução cancelada."));
+      signal?.addEventListener("abort", onAbort, { once: true });
+      this.ws.addEventListener(
+        "open",
+        () => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve();
+        },
+        { once: true },
+      );
+      this.ws.addEventListener(
+        "error",
+        () => reject(codedError("UPSTREAM_UNAVAILABLE", "Não foi possível conectar ao Chrome.")),
+        { once: true },
+      );
+    });
+    this.ws.addEventListener("message", (event) => this.onMessage(event));
+    this.ws.addEventListener("close", () =>
+      this.rejectAll(codedError("UPSTREAM_UNAVAILABLE", "Conexão com o Chrome encerrada.")),
+    );
+    return this;
+  }
+
+  onMessage(event) {
+    let message;
+    try {
+      message = JSON.parse(String(event.data));
+    } catch {
+      return;
+    }
+    if (!message.id) return;
+    const pending = this.pending.get(message.id);
+    if (!pending) return;
+    this.pending.delete(message.id);
+    if (message.error)
+      pending.reject(
+        codedError("UPSTREAM_UNAVAILABLE", `CDP ${pending.method}: ${message.error.message}`),
+      );
+    else pending.resolve(message.result ?? {});
+  }
+
+  rejectAll(error) {
+    for (const pending of this.pending.values()) pending.reject(error);
+    this.pending.clear();
+  }
+
+  send(method, params = {}, sessionId) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN)
+      return Promise.reject(codedError("UPSTREAM_UNAVAILABLE", "CDP não conectado."));
+    const id = this.nextId++;
+    const payload = { id, method, params };
+    if (sessionId) payload.sessionId = sessionId;
+    if (method === "Input.insertText") {
+      const digest = createHash("sha256")
+        .update(String(params.text ?? ""))
+        .digest("hex")
+        .slice(0, 12);
+      this.trace?.(
+        `CDP Input.insertText: length=${String(params.text ?? "").length}; sha256=${digest}`,
+      );
+    }
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject, method });
+      this.ws.send(JSON.stringify(payload));
+    });
+  }
+
+  close() {
+    try {
+      this.ws?.close();
+    } catch {
+      /* best effort */
+    }
+  }
+}
+
+async function evaluate(client, sessionId, expression) {
+  const response = await client.send(
+    "Runtime.evaluate",
+    { expression, returnByValue: true, awaitPromise: true, userGesture: true },
+    sessionId,
+  );
+  if (response.exceptionDetails) {
+    const description =
+      response.exceptionDetails?.exception?.description ||
+      response.exceptionDetails?.text ||
+      "Erro na página do Claude.";
+    throw codedError("OUTPUT_VALIDATION_FAILED", description);
+  }
+  return response.result?.value;
+}
+
+function responsePhase({ hasNewResponse, generating, stablePolls }) {
+  if (!hasNewResponse) return "awaiting_response";
+  if (generating) return "streaming";
+  if (stablePolls < 2) return "stabilizing";
+  return "completed";
+}
+
+async function waitForDomMutation(client, sessionId, waitMs, signal) {
+  if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+  const timeoutMs = clampInteger(waitMs, 1_000, 100, 5_000);
+  try {
+    await evaluate(
+      client,
+      sessionId,
+      `(() => new Promise(resolve => { const root=document.documentElement; if(!root){resolve('no-root');return} let settled=false; const finish=reason=>{if(settled)return;settled=true;observer.disconnect();clearTimeout(timer);resolve(reason)}; const observer=new MutationObserver(()=>finish('mutation')); observer.observe(root,{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['aria-busy','aria-disabled','data-testid']}); const timer=setTimeout(()=>finish('watchdog'),${timeoutMs}); }))()`,
+    );
+  } catch {
+    await sleep(Math.min(timeoutMs, 250), signal);
+  }
+}
+
+function normalizeEditorText(value) {
+  return String(value ?? "")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+async function attachClaudePage(client, signal, activate = false, forceNew = false) {
+  const { targetInfos = [] } = await client.send("Target.getTargets");
+  let target = forceNew
+    ? targetInfos.find(item => item.type === "page" && (() => { try { const url = new URL(item.url); return url.hostname === CLAUDE_HOST && url.hash === "#contentflow-ready-claude"; } catch { return false; } })())
+    : targetInfos.find((item) => item.type === "page" && String(item.url).includes(CLAUDE_HOST));
+  let createdTarget = false;
+  if (!target) {
+    const created = await client.send("Target.createTarget", {
+      url: CLAUDE_NEW_URL,
+      background: !activate,
+    });
+    target = { targetId: created.targetId, url: CLAUDE_NEW_URL };
+    createdTarget = true;
+  }
+  const { sessionId } = await client.send("Target.attachToTarget", {
+    targetId: target.targetId,
+    flatten: true,
+  });
+  if (activate) await client.send("Target.activateTarget", { targetId: target.targetId });
+  await client.send("Page.enable", {}, sessionId);
+  await client.send("Runtime.enable", {}, sessionId);
+  if (activate) await client.send("Page.bringToFront", {}, sessionId).catch(() => undefined);
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+    try {
+      const state = await evaluate(
+        client,
+        sessionId,
+        "({readyState:document.readyState,url:location.href})",
+      );
+      if (["interactive", "complete"].includes(state?.readyState)) break;
+    } catch {
+      /* navegação ainda trocando o contexto */
+    }
+    await sleep(350, signal);
+  }
+  return { sessionId, targetId: target.targetId, created: createdTarget };
+}
+
+async function openNewConversation(client, sessionId, signal) {
+  if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+  await client.send("Page.navigate", { url: CLAUDE_NEW_URL }, sessionId);
+}
+
+export function validateConversationUrl(id) {
+  let url;
+  try {
+    url = new URL(id);
+  } catch {
+    throw codedError("INVALID_INPUT", "A referência da conversa do Claude é inválida.");
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.hostname !== CLAUDE_HOST ||
+    !url.pathname.startsWith("/chat/")
+  )
+    throw codedError("INVALID_INPUT", "A referência não pertence a uma conversa do Claude.");
+  return url.href;
+}
+
+async function prepareConversation(client, sessionId, conversation, waitMs, signal) {
+  let reused = conversation?.mode === "reuse";
+  if (reused) {
+    await client.send(
+      "Page.navigate",
+      { url: validateConversationUrl(conversation.id) },
+      sessionId,
+    );
+  } else {
+    await openNewConversation(client, sessionId, signal);
+  }
+  try {
+    await waitForPrompt(client, sessionId, waitMs, signal);
+    if (reused) validateConversationUrl(await evaluate(client, sessionId, "location.href"));
+  } catch (error) {
+    if (!reused || !conversation?.fallbackContext) throw error;
+    await openNewConversation(client, sessionId, signal);
+    await waitForPrompt(client, sessionId, waitMs, signal);
+    reused = false;
+  }
+  return reused;
+}
+
+export function partsForConversation(parts, conversation, reused) {
+  const continuation = String(conversation?.continuationMessage ?? "").trim();
+  const fallbackContext = String(conversation?.fallbackContext ?? "").trim();
+  if (reused && continuation) return [continuation];
+  if (!reused && fallbackContext) {
+    const requestText = continuation || parts.join("\n\n");
+    return [`${fallbackContext}\n\nNOVA SOLICITAÇÃO:\n${requestText}`];
+  }
+  return parts;
+}
+
+async function currentConversationUrl(client, sessionId) {
+  return validateConversationUrl(await evaluate(client, sessionId, "location.href"));
+}
+
+const PAGE_HELPERS = String.raw`
+function cfVisible(el) {
+  if (!el || !(el instanceof Element)) return false;
+  const style = getComputedStyle(el);
+  if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+  const r = el.getBoundingClientRect();
+  return r.width > 8 && r.height > 8 && r.bottom > 0 && r.right > 0;
+}
+function cfText(el) {
+  return [el?.innerText, el?.textContent, el?.getAttribute?.('aria-label'), el?.getAttribute?.('placeholder'), el?.getAttribute?.('data-testid')]
+    .filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+}
+function cfPrompt() {
+  const selectors = [
+    'textarea[placeholder*="prompt" i]',
+    '[contenteditable="true"][role="textbox"]',
+    '[contenteditable="true"][aria-label*="prompt" i]',
+    '[contenteditable="true"]',
+    '[role="textbox"]'
+  ];
+  for (const selector of selectors) {
+    const candidates = [...document.querySelectorAll(selector)].filter(cfVisible);
+    const preferred = candidates.find(el => /prompt|help you|como posso|write/i.test(cfText(el)));
+    if (preferred) return preferred;
+    if (candidates.length === 1) return candidates[0];
+  }
+  return null;
+}
+function cfAssistantNodes() {
+  const selectors = [
+    '.standard-markdown',
+    '[data-is-streaming] .standard-markdown',
+    '.font-claude-response',
+    '[data-message-author-role="assistant"]',
+    '[data-testid*="assistant" i]'
+  ];
+  for (const selector of selectors) {
+    const nodes = [...document.querySelectorAll(selector)].filter(cfVisible);
+    if (nodes.length) return nodes;
+  }
+  return [];
+}
+function cfResponseState() {
+  const nodes = cfAssistantNodes();
+  const entries = nodes.map(el => ({
+    text: (el.innerText || el.textContent || '').trim(),
+    links: [...el.querySelectorAll('a[href]')].map(link => ({
+      href: link.href,
+      label: (link.innerText || link.textContent || '').replace(/\s+/g, ' ').trim()
+    })).filter(link => /^https:\/\//i.test(link.href))
+  })).filter(entry => entry.text);
+  const texts = entries.map(entry => entry.text);
+  const stop = [...document.querySelectorAll('button')].some(el => cfVisible(el) && /stop|parar|interromper/i.test(cfText(el)));
+  const body = document.body?.innerText || '';
+  const completedActionCount = [...document.querySelectorAll('button')].filter(el => cfVisible(el) && /copy|copiar|copie/i.test(el.getAttribute('aria-label') || el.getAttribute('title') || '')).length;
+  return { texts, entries, stop, completedActionCount, url: location.href, bodyHint: body.slice(0, 5000) };
+}
+`;
+
+async function pageState(client, sessionId) {
+  return await evaluate(
+    client,
+    sessionId,
+    `(() => { ${PAGE_HELPERS}; const prompt=cfPrompt(); const body=document.body?.innerText||''; return { prompt:!!prompt, url:location.href, login:/log in|sign up|continue with google|entrar|criar conta/i.test(body), captcha:/captcha|verify you are human|verifique se você é humano/i.test(body), bodyHint:body.slice(0,3000) }; })()`,
+  );
+}
+
+async function waitForPrompt(client, sessionId, waitMs, signal) {
+  const deadline = Date.now() + waitMs;
+  let last;
+  while (Date.now() < deadline) {
+    if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+    last = await pageState(client, sessionId);
+    if (last?.url?.startsWith(`https://${CLAUDE_HOST}/`) && last?.prompt && !last?.login)
+      return last;
+    await sleep(750, signal);
+  }
+  if (last?.captcha)
+    throw codedError(
+      "AUTHENTICATION_FAILED",
+      "O Claude aguarda verificação/CAPTCHA. Conclua manualmente no Chrome dedicado e execute novamente.",
+      true,
+    );
+  if (last?.login)
+    throw codedError(
+      "AUTHENTICATION_FAILED",
+      "Faça login no Claude na janela do Chrome dedicado e execute novamente.",
+      true,
+    );
+  throw codedError(
+    "OUTPUT_VALIDATION_FAILED",
+    "Não encontrei a caixa de mensagem do Claude. Conclua login, onboarding ou reautenticação na janela aberta.",
+    true,
+  );
+}
+
+async function attachFiles(client, sessionId, attachments, signal) {
+  if (!attachments.length) return;
+  const baselinePreviewCount = await evaluate(
+    client,
+    sessionId,
+    `(() => [...document.querySelectorAll('img')].filter(el => { const r=el.getBoundingClientRect(); return r.width>40 && r.height>40; }).length)()`,
+  );
+  await client.send("DOM.enable", {}, sessionId);
+  const { root } = await client.send("DOM.getDocument", { depth: 1, pierce: true }, sessionId);
+  const { nodeIds = [] } = await client.send(
+    "DOM.querySelectorAll",
+    { nodeId: root.nodeId, selector: 'input[type="file"]' },
+    sessionId,
+  );
+  if (!nodeIds.length) {
+    throw codedError(
+      "OUTPUT_VALIDATION_FAILED",
+      "O seletor de arquivos do Claude não foi encontrado.",
+      true,
+    );
+  }
+  await client.send(
+    "DOM.setFileInputFiles",
+    { files: attachments.map((attachment) => attachment.path), nodeId: nodeIds.at(-1) },
+    sessionId,
+  );
+  const expected = attachments.map((attachment) => attachment.name.toLowerCase());
+  const expectedExtensions = attachments
+    .map((attachment) => extname(attachment.name).toLowerCase().replace(/^\./, ""))
+    .filter(Boolean);
+  const deadline = Date.now() + 120_000;
+  while (Date.now() < deadline) {
+    if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+    const state = await evaluate(
+      client,
+      sessionId,
+      `(() => { ${PAGE_HELPERS}; const body=(document.body?.innerText||'').toLowerCase(); const previewCount=[...document.querySelectorAll('img')].filter(el => { const r=el.getBoundingClientRect(); return r.width>40 && r.height>40; }).length; return {body, prompt:!!cfPrompt(), previewCount}; })()`,
+    );
+    if (attachmentUploadIsReady(state, expected, expectedExtensions, baselinePreviewCount)) return;
+    if (
+      /upload failed|falha.*upload|arquivo.*grande|file.*large/i.test(String(state?.body ?? ""))
+    ) {
+      throw codedError(
+        "INVALID_INPUT",
+        "O Claude recusou um dos anexos. Verifique formato, tamanho e limites da conta.",
+      );
+    }
+    await sleep(500, signal);
+  }
+  throw codedError(
+    "TIMEOUT",
+    "Os anexos não ficaram prontos no Claude dentro de 120 segundos.",
+    true,
+  );
+}
+
+function attachmentUploadIsReady(state, expectedNames, expectedExtensions, baselinePreviewCount) {
+  if (!state?.prompt) return false;
+  const body = String(state.body ?? "").toLowerCase();
+  return (
+    expectedNames.every((name) => body.includes(name)) ||
+    Number(state.previewCount) > Number(baselinePreviewCount) ||
+    (expectedExtensions.length > 0 &&
+      expectedExtensions.every((extension) => body.includes(extension)))
+  );
+}
+
+async function setPrompt(bridge, prompt, operationKey) {
+  await bridge.dispatch(
+    "setText",
+    {
+      selectors: [
+        'textarea[placeholder*="prompt" i]',
+        '[contenteditable="true"][role="textbox"]',
+        '[contenteditable="true"][aria-label*="prompt" i]',
+        '[contenteditable="true"]',
+        '[role="textbox"]',
+      ],
+      text: prompt,
+    },
+    operationKey,
+  );
+}
+
+async function clickSend(bridge, operationKey, signal) {
+  let clickError;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      await bridge.dispatch(
+        "click",
+        { selectors: ["button"], textIncludes: ["send message", "enviar mensagem", "send"] },
+        `${operationKey}:${attempt}`,
+      );
+      clickError = undefined;
+      break;
+    } catch (error) {
+      clickError = error;
+      if (error?.code !== "OUTPUT_VALIDATION_FAILED" || attempt === 19) throw error;
+      await sleep(250, signal);
+    }
+  }
+  if (clickError) throw clickError;
+}
+
+async function responseState(client, sessionId) {
+  return await evaluate(
+    client,
+    sessionId,
+    `(() => { ${PAGE_HELPERS}; return cfResponseState(); })()`,
+  );
+}
+
+async function waitForResponse(client, sessionId, baselineCount, timeoutMs, signal, baselineCompletedActionCount = Infinity) {
+  const deadline = Date.now() + timeoutMs;
+  let previous = "";
+  let stablePolls = 0;
+  let newest = "";
+  while (Date.now() < deadline) {
+    if (signal?.aborted) throw codedError("CANCELLED", "Execução cancelada.");
+    const state = await responseState(client, sessionId);
+    const texts = Array.isArray(state?.texts) ? state.texts : [];
+    newest = texts.length > baselineCount ? texts.at(-1) : (texts.at(-1) ?? "");
+    if (newest && newest === previous) stablePolls += 1;
+    else stablePolls = 0;
+    previous = newest;
+    const phase = responsePhase({
+      hasNewResponse: Boolean(newest),
+      generating: Boolean(state?.stop),
+      stablePolls,
+    });
+    const strongCompletion = texts.length > baselineCount && newest && !state.stop && state.completedActionCount > baselineCompletedActionCount;
+    if (strongCompletion || phase === "completed") {
+      await sleep(strongCompletion ? 500 : 5_000, signal);
+      const confirmedState = await responseState(client, sessionId);
+      const confirmedTexts = Array.isArray(confirmedState?.texts) ? confirmedState.texts : [];
+      const confirmedNewest =
+        confirmedTexts.length > baselineCount
+          ? confirmedTexts.at(-1)
+          : (confirmedTexts.at(-1) ?? "");
+      if (confirmedTexts.length > baselineCount && confirmedNewest === newest && !confirmedState?.stop &&
+          (!strongCompletion || confirmedState.completedActionCount > baselineCompletedActionCount)) {
+        const entry = Array.isArray(confirmedState?.entries)
+          ? confirmedState.entries.at(-1)
+          : undefined;
+        return {
+          text: confirmedNewest.trim(),
+          links: Array.isArray(entry?.links) ? entry.links : [],
+        };
+      }
+      previous = confirmedNewest;
+      stablePolls = 0;
+      continue;
+    }
+    const hint = String(state?.bodyHint ?? "");
+    if (/usage limit|rate limit|limite de uso|try again later/i.test(hint)) {
+      throw codedError(
+        "RATE_LIMIT",
+        "O Claude informou limite temporário de uso. Aguarde antes de tentar novamente.",
+        true,
+      );
+    }
+    if (/captcha|verify you are human|verifique se você é humano/i.test(hint)) {
+      throw codedError(
+        "AUTHENTICATION_FAILED",
+        "O Claude exige verificação manual na janela do Chrome.",
+        true,
+      );
+    }
+    await waitForDomMutation(client, sessionId, 1_000, signal);
+  }
+  throw codedError(
+    "TIMEOUT",
+    "O Claude não concluiu a resposta dentro do tempo configurado.",
+    true,
+  );
+}
+
+async function generatePart(client, sessionId, bridge, prompt, settings, signal, operationKey) {
+  const before = await responseState(client, sessionId);
+  const baselineCount = Array.isArray(before?.texts) ? before.texts.length : 0;
+  await setPrompt(bridge, prompt, `prompt:${operationKey}`);
+  await clickSend(bridge, `send:${operationKey}`, signal);
+  const timeoutSeconds = clampInteger(settings?.responseTimeoutSeconds, 600, 30, 900);
+  return await waitForResponse(client, sessionId, baselineCount, timeoutSeconds * 1000, signal, before.completedActionCount);
+}
+
+async function configureProfile(request, services) {
+  const settings = request?.settings ?? {};
+  let profileName, profilePath, port;
+  try {
+    profileName = normalizeAccountProfile(request?.configuration?.accountProfile);
+    profilePath = runtimeProfilePath(settings, profileName, services);
+    port = profilePort(
+      clampInteger(settings.remoteDebuggingPort, DEFAULT_PORT, 1024, 64000),
+      profileName,
+    );
+    assertDedicatedProfilePath(profilePath, settings.allowExistingChromeProfile === true);
+  } catch (error) {
+    return resultError(
+      error?.code || "INVALID_CONFIGURATION",
+      error?.message || "Perfil inválido.",
+    );
+  }
+  if (request?.invocation?.action === "status") {
+    return {
+      status: "success",
+      values: { ready: await profileIsPrepared(profilePath, profileName) },
+    };
+  }
+  if (request?.invocation?.action !== "prepare") {
+    return resultError("INVALID_CONFIGURATION", "Ação de configuração de perfil inválida.");
+  }
+
+  let client, bridge;
+  try {
+    const launched = await launchOrReuseChrome({
+      profilePath,
+      port,
+      startMinimized: false,
+      keepBrowserOpen: false,
+      signal: services.signal,
+      coreSession: settings.__contentFlowBrowserSession,
+    });
+    client = await new CdpClient(launched.version.webSocketDebuggerUrl).connect(services.signal);
+    const { sessionId } = await attachClaudePage(client, services.signal, true);
+    await openNewConversation(client, sessionId, services.signal);
+    await waitForPrompt(client, sessionId, PROFILE_SETUP_WAIT_MS, services.signal);
+    bridge = await attachContentFlowBridge({
+      client,
+      pageSessionId: sessionId,
+      pluginId: PLUGIN_ID,
+      profileId: profileName,
+      request,
+      signal: services.signal,
+      allowedOrigins: ["https://claude.ai"],
+      waitMs: PROFILE_SETUP_WAIT_MS,
+    });
+    await markProfilePrepared(profilePath, profileName);
+    return {
+      status: "success",
+      values: { ready: true, message: `Perfil ${profileName} validado no Claude.` },
+    };
+  } catch (error) {
+    return resultError(
+      error?.code || "AUTHENTICATION_FAILED",
+      error?.message || "Não foi possível validar o login do Claude.",
+      Boolean(error?.retryable),
+    );
+  } finally {
+    await bridge?.dispose();
+    await closeBrowserGracefully(client);
+  }
+}
+
+async function executeHandler(request, services) {
+  if (request?.invocation?.mode === "configure") return await configureProfile(request, services);
+  const settings = request?.settings ?? {};
+  const capabilityId = String(request?.capabilityId ?? "generate-text-in-browser");
+  const startMinimized =
+    typeof request?.configuration?.startMinimized === "boolean"
+      ? request.configuration.startMinimized
+      : settings.startMinimized !== false;
+  const mockResponse = String(settings?.diagnosticMockResponse ?? "").trim();
+  if (mockResponse) {
+    try {
+      if (capabilityId === "choose-library-item-in-browser") {
+        return {
+          status: "success",
+          values: { result: parseSelectedItemId(mockResponse, request) },
+        };
+      }
+      if (capabilityId === "validate-content-in-browser") {
+        return { status: "success", values: parseValidationValues(mockResponse, request) };
+      }
+      if (capabilityId === "generate-text-in-browser") {
+        const result = cleanGeneratedText(mockResponse);
+        validateGeneratedLength(result, targetCharacterPlan(request));
+        const values = generationResponseValues(result, [{ text: result }], request);
+        if (markdownArtifactRequested(request)) {
+          const generated = await createMarkdownArtifact(request, services, result);
+          values.document = generated.file;
+          return { status: "success", values, artifacts: [generated.artifact] };
+        }
+        return { status: "success", values };
+      }
+      return {
+        status: "success",
+        values:
+          capabilityId === "search-web-in-browser"
+            ? searchResponseValues(mockResponse, [], request)
+            : { result: mockResponse },
+      };
+    } catch (error) {
+      return resultError(
+        error?.code || "OUTPUT_VALIDATION_FAILED",
+        error?.message || "Resposta simulada inválida.",
+        false,
+      );
+    }
+  }
+
+  let parts;
+  let characterPlan;
+  try {
+    if (capabilityId === "generate-text-in-browser") {
+      parts = buildParts(request);
+      characterPlan = targetCharacterPlan(request);
+    } else if (capabilityId === "search-web-in-browser") parts = [buildSearchPrompt(request)];
+    else if (capabilityId === "choose-library-item-in-browser")
+      parts = [buildChoosePrompt(request)];
+    else if (capabilityId === "validate-content-in-browser")
+      parts = [buildValidationPrompt(request)];
+    else if (capabilityId === "analyze-images-in-browser")
+      parts = [buildImageAnalysisPrompt(request)];
+    else if (capabilityId === "analyze-documents-in-browser")
+      parts = [buildDocumentAnalysisPrompt(request)];
+    else throw codedError("INVALID_CONFIGURATION", `Capability desconhecida: ${capabilityId}.`);
+  } catch (error) {
+    return resultError(
+      error?.code || "INVALID_CONFIGURATION",
+      error?.message || "Configuração inválida.",
+      false,
+    );
+  }
+
+  const configuration = request?.configuration ?? {};
+  let profileName;
+  let profilePath;
+  let port;
+  try {
+    profileName = normalizeAccountProfile(configuration.accountProfile);
+    profilePath = runtimeProfilePath(settings, profileName, services);
+    const basePort = clampInteger(settings.remoteDebuggingPort, DEFAULT_PORT, 1024, 64000);
+    port = profilePort(basePort, profileName);
+  } catch (error) {
+    return resultError(
+      error?.code || "INVALID_CONFIGURATION",
+      error?.message || "Perfil da conta inválido.",
+      false,
+    );
+  }
+  const traceEnabled = settings.diagnosticTrace === true;
+  const trace = (message) => {
+    if (traceEnabled) process.stderr.write(`[Claude Browser] ${message}\n`);
+  };
+  const step = (message) => process.stderr.write(`[Claude Browser] ${message}\n`);
+  const retryAttempts = 0;
+  const delayBetweenPartsMs = 0;
+  const minCharacters = 1;
+  let client;
+  let bridge;
+  let taskTargetId;
+  let closeTaskTarget = false;
+
+  try {
+    let attachments = await resolveAttachments(request, services);
+    assertDedicatedProfilePath(profilePath, settings.allowExistingChromeProfile === true);
+    if (!(await profileIsPrepared(profilePath, profileName))) {
+      throw codedError(
+        "AUTHENTICATION_FAILED",
+        `O perfil ${profileName} ainda não foi salvo. Abra a configuração do Método e use Salvar perfil antes de executar.`,
+      );
+    }
+    step(`Preparando perfil ${profileName} para ${parts.length} etapa(s).`);
+    const keepBrowserOpen = settings.keepBrowserOpen !== false;
+    const launched = await launchOrReuseChrome({
+      profilePath,
+      port,
+      startMinimized,
+      keepBrowserOpen,
+      signal: services.signal,
+      coreSession: settings.__contentFlowBrowserSession,
+    });
+    client = await new CdpClient(launched.version.webSocketDebuggerUrl, trace).connect(
+      services.signal,
+    );
+    const taskPage = await attachClaudePage(
+      client,
+      services.signal,
+      false,
+      launched.startedByPlugin === false,
+    );
+    const { sessionId } = taskPage;
+    taskTargetId = taskPage.targetId;
+    closeTaskTarget = true;
+    const interactiveWaitSeconds = clampInteger(settings.interactiveWaitSeconds, 600, 30, 900);
+    const reusedConversation = await prepareConversation(
+      client,
+      sessionId,
+      request.conversation,
+      interactiveWaitSeconds * 1000,
+      services.signal,
+    );
+    parts = partsForConversation(parts, request.conversation, reusedConversation);
+    if (reusedConversation && request.conversation?.continuationMessage) attachments = [];
+    bridge = await attachContentFlowBridge({
+      client,
+      pageSessionId: sessionId,
+      pluginId: PLUGIN_ID,
+      profileId: profileName,
+      request,
+      signal: services.signal,
+      allowedOrigins: ["https://claude.ai"],
+    });
+    if (attachments.length) {
+      step(`Enviando ${attachments.length} anexo(s) autorizado(s) ao Claude.`);
+      await attachFiles(client, sessionId, attachments, services.signal);
+      step("Anexos prontos para análise.");
+    }
+    const responses = [];
+    for (let index = 0; index < parts.length; index += 1) {
+      let lastError;
+      for (let attempt = 0; attempt <= retryAttempts; attempt += 1) {
+        try {
+          step(
+            `Executando etapa ${index + 1}/${parts.length}, tentativa ${attempt + 1}/${retryAttempts + 1}.`,
+          );
+          const response = await generatePart(
+            client,
+            sessionId,
+            bridge,
+            promptWithCharacterBudget(parts[index], characterPlan, responses, index, parts.length),
+            settings,
+            services.signal,
+            `${index}:${attempt}`,
+          );
+          responses.push(response);
+          lastError = undefined;
+          break;
+        } catch (error) {
+          lastError = error;
+          if (
+            !error?.retryable ||
+            attempt >= retryAttempts ||
+            ["AUTHENTICATION_FAILED", "RATE_LIMIT"].includes(error?.code)
+          )
+            break;
+          await sleep(2000 * (attempt + 1), services.signal);
+        }
+      }
+      if (lastError) throw lastError;
+      if (capabilityId === "generate-text-in-browser") {
+        const partialText = cleanCombinedResponses(responses);
+        await services.publishPartial?.({
+          values: { result: partialText, parts: responses.map((response) => response.text) },
+          progress: (index + 1) / parts.length,
+          message: `Resposta ${index + 1} de ${parts.length} capturada.`,
+        });
+      }
+      if (index < parts.length - 1) await sleep(delayBetweenPartsMs, services.signal);
+    }
+
+    if (capabilityId === "generate-text-in-browser" && characterPlan) {
+      const maxRepairPrompts = clampInteger(configuration.maxLengthRepairPrompts, 2, 0, 5);
+      for (let repair = 0; repair < maxRepairPrompts; repair += 1) {
+        const current = cleanCombinedResponses(responses);
+        if (current.length >= characterPlan.minimum) break;
+        step(
+          `Ajustando tamanho: ${current.length}/${characterPlan.target} caracteres (complemento ${repair + 1}/${maxRepairPrompts}).`,
+        );
+        responses.push(
+          await generatePart(
+            client,
+            sessionId,
+            bridge,
+            lengthRepairPrompt(characterPlan, current.length),
+            settings,
+            services.signal,
+            `repair:${repair}`,
+          ),
+        );
+        const repairedText = cleanCombinedResponses(responses);
+        await services.publishPartial?.({
+          values: { result: repairedText, parts: responses.map((response) => response.text) },
+          message: `Complemento ${repair + 1} capturado.`,
+        });
+      }
+    }
+
+    const combined = responses.map((response) => response.text).join("\n\n");
+    let artifacts;
+    let values;
+    if (capabilityId === "search-web-in-browser") {
+      const maxSources = 10;
+      const sources = [
+        ...new Set(responses.flatMap((response) => response.links ?? []).map((link) => link.href)),
+      ].slice(0, maxSources);
+      values = searchResponseValues(combined.trim(), sources, request);
+    } else if (capabilityId === "choose-library-item-in-browser") {
+      values = { result: parseSelectedItemId(combined, request) };
+    } else if (capabilityId === "validate-content-in-browser") {
+      values = parseValidationValues(combined, request);
+    } else {
+      const result = cleanCombinedResponses(responses);
+      if (!result)
+        throw codedError(
+          "OUTPUT_VALIDATION_FAILED",
+          "A resposta do Claude ficou vazia após a limpeza.",
+          true,
+        );
+      if (result.length < minCharacters) {
+        throw codedError(
+          "OUTPUT_VALIDATION_FAILED",
+          `O texto gerado tem ${result.length} caracteres; o mínimo configurado é ${minCharacters}.`,
+          true,
+        );
+      }
+      validateGeneratedLength(result, characterPlan);
+      values = generationResponseValues(result, responses, request);
+      if (markdownArtifactRequested(request)) {
+        const generated = await createMarkdownArtifact(request, services, result);
+        values.document = generated.file;
+        artifacts = [generated.artifact];
+      }
+      await services.publishPartial?.({
+        values,
+        ...(artifacts ? { artifacts } : {}),
+        progress: 1,
+        message: artifacts ? "Texto e documento capturados." : "Texto capturado.",
+      });
+    }
+    const outputCharacters =
+      capabilityId === "generate-text-in-browser"
+        ? String(values.result ?? "").length
+        : combined.length;
+    const conversationId = await currentConversationUrl(client, sessionId);
+    step(`Concluído: ${outputCharacters} caracteres em ${responses.length} resposta(s).`);
+    await evaluate(client, sessionId, `(() => { const url = new URL(location.href); url.hash = "contentflow-ready-claude"; history.replaceState(history.state, "", url); return true; })()`);
+    closeTaskTarget = false;
+    return {
+      status: "success",
+      values,
+      ...(artifacts ? { artifacts } : {}),
+      conversation: { id: conversationId },
+      usage: {
+        provider: "Anthropic / Claude web",
+        outputUnits: outputCharacters,
+        unit: "characters",
+      },
+    };
+  } catch (error) {
+    if (services.signal?.aborted || error?.code === "CANCELLED")
+      return resultError("CANCELLED", "Execução cancelada.", false);
+    return resultError(
+      error?.code || "UPSTREAM_UNAVAILABLE",
+      error?.message || "Falha na automação do Claude.",
+      Boolean(error?.retryable),
+    );
+  } finally {
+    await bridge?.dispose();
+    if (closeTaskTarget && taskTargetId)
+      try {
+        await client?.send("Target.closeTarget", { targetId: taskTargetId });
+      } catch {}
+    client?.close();
+  }
+}
+
+export async function execute(request, services) {
+  const bridgeDiagnosticsState = await createBridgeDiagnostics(request, services);
+  const response = await executeHandler(
+    { ...request, __bridgeDiagnosticsState: bridgeDiagnosticsState },
+    services,
+  );
+  return { ...response, bridgeDiagnostics: bridgeDiagnosticsState.bridgeDiagnostics };
+}
+
+export const __test = {
+  buildParts,
+  buildChoosePrompt,
+  buildSearchPrompt,
+  buildValidationPrompt,
+  buildImageAnalysisPrompt,
+  buildDocumentAnalysisPrompt,
+  collectStoredFiles,
+  cleanGeneratedText,
+  expandTemplate,
+  expandOutlinePrompt,
+  generationResponseValues,
+  cleanCombinedResponses,
+  createMarkdownArtifact,
+  lengthRepairPrompt,
+  markdownArtifactRequested,
+  normalizeAccountProfile,
+  outlineItems,
+  parseSelectedItemId,
+  parseValidationValues,
+  profileIsPrepared,
+  markProfilePrepared,
+  profilePathFor,
+  runtimeProfilePath,
+  profilePort,
+  closeBrowserGracefully,
+  searchResponseValues,
+  targetCharacterPlan,
+  promptWithCharacterBudget,
+  validateGeneratedLength,
+  serializeInputs,
+  summarizeBlock,
+  responsePhase,
+  supportedUploadExtensions: SUPPORTED_UPLOAD_EXTENSIONS,
+  attachmentUploadIsReady,
+};
