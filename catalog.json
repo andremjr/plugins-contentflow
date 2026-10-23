@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-10-03T18:52:33.189Z",
+  "generatedAt": "2026-10-23T22:56:26.902Z",
   "plugins": [
     {
       "id": "com.andremjr.assemblyai-srt",
@@ -221,14 +221,14 @@
     {
       "id": "official-ffmpeg-image-sequence-video",
       "name": "Vídeo por Sequência de Imagens (FFmpeg)",
-      "version": "2.0.1",
+      "version": "2.1.0",
       "apiVersion": "2",
       "minCoreVersion": "1.3.3",
-      "description": "Monta um vídeo MP4 local com imagens ordenadas, sincronizadas pela duração do áudio ou pelos intervalos de um SRT.",
-      "downloadUrl": "https://github.com/andremjr/plugins-contentflow/releases/download/bootstrap-1.3.3/ContentFlow-Plugin-ffmpeg-image-sequence-video.zip",
+      "description": "Monta vídeos MP4 locais com imagens ordenadas, cortes sincronizados por SRT e movimentos Ken Burns opcionais.",
+      "downloadUrl": "https://github.com/andremjr/plugins-contentflow/releases/download/ffmpeg-image-sequence-video-v2.1.0/ContentFlow-Plugin-ffmpeg-image-sequence-video.zip",
       "asset": "ContentFlow-Plugin-ffmpeg-image-sequence-video.zip",
-      "sha256": "a063eb8b1979a19c3badc5ac914682832ad565be7278bcbd4b56d1b6096e8e06",
-      "size": 30337439
+      "sha256": "c905b827583f30503c57509c0baf88643a6ddea81b24d2933c690b8e93ff9fd4",
+      "size": 30340701
     },
     {
       "id": "official-openai-gpt",
