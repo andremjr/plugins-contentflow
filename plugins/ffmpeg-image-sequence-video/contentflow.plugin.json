@@ -3,8 +3,8 @@
   "apiVersion": "2",
   "id": "official-ffmpeg-image-sequence-video",
   "name": "Vídeo por Sequência de Imagens (FFmpeg)",
-  "version": "2.0.1",
-  "description": "Monta um vídeo MP4 local com imagens ordenadas, sincronizadas pela duração do áudio ou pelos intervalos de um SRT.",
+  "version": "2.1.0",
+  "description": "Monta vídeos MP4 locais com imagens ordenadas, cortes sincronizados por SRT e movimentos Ken Burns opcionais.",
   "author": "ContentFlow",
   "license": "MIT",
   "branding": {
@@ -260,6 +260,422 @@
           "video"
         ]
       }
+    },
+    {
+      "id": "compose-image-sequence-from-srt",
+      "name": "Editar sequência por SRT com Ken Burns",
+      "description": "Monta um vídeo a partir de imagens ordenadas, usa o SRT como linha do tempo e aplica movimentos de câmera variados sem exigir áudio.",
+      "operator": "Código",
+      "blockTypes": [
+        "CRIAR"
+      ],
+      "processTypes": [
+        "editing"
+      ],
+      "inputPorts": [
+        {
+          "key": "images",
+          "label": "Imagens ordenadas",
+          "description": "Imagens exibidas na ordem recebida e distribuídas pelas fronteiras dos cues do SRT.",
+          "required": true,
+          "presentation": {
+            "renderer": "image-gallery"
+          },
+          "shape": {
+            "kind": "content",
+            "family": "image",
+            "cardinality": "many",
+            "representation": "artifact",
+            "formats": {
+              "mimeTypes": [
+                "image/jpeg",
+                "image/png",
+                "image/webp"
+              ]
+            }
+          }
+        },
+        {
+          "key": "subtitles",
+          "label": "Linha do tempo SRT",
+          "description": "Arquivo SRT obrigatório. O último cue define a duração quando não há áudio.",
+          "required": true,
+          "presentation": {
+            "renderer": "file-list"
+          },
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "one",
+            "representation": "artifact",
+            "formats": {
+              "mimeTypes": [
+                "application/x-subrip",
+                "text/plain",
+                "text/srt",
+                "text/x-srt"
+              ]
+            }
+          }
+        },
+        {
+          "key": "audio",
+          "label": "Áudio opcional",
+          "description": "Faixa de áudio opcional. Quando fornecida, sua duração é validada contra a linha do tempo do SRT.",
+          "required": false,
+          "presentation": {
+            "renderer": "audio-player"
+          },
+          "shape": {
+            "kind": "content",
+            "family": "audio",
+            "cardinality": "one",
+            "representation": "artifact",
+            "formats": {
+              "mimeTypes": [
+                "audio/aac",
+                "audio/flac",
+                "audio/mp4",
+                "audio/mpeg",
+                "audio/ogg",
+                "audio/opus",
+                "audio/wav",
+                "audio/webm",
+                "audio/x-m4a"
+              ]
+            }
+          }
+        }
+      ],
+      "outputPorts": [
+        {
+          "key": "video",
+          "label": "Vídeo editado",
+          "description": "Vídeo MP4 H.264 com cortes pelo SRT e movimentos Ken Burns.",
+          "required": true,
+          "presentation": {
+            "renderer": "video-player"
+          },
+          "shape": {
+            "kind": "content",
+            "family": "video",
+            "cardinality": "one",
+            "representation": "artifact",
+            "formats": {
+              "mimeTypes": [
+                "video/mp4"
+              ]
+            }
+          }
+        }
+      ],
+      "execution": {
+        "mode": "immediate",
+        "defaultTimeoutMs": 600000,
+        "supportsCancellation": false,
+        "maxConcurrency": 1
+      },
+      "sideEffects": [
+        "local_artifact",
+        "subprocess"
+      ],
+      "cost": {
+        "model": "free",
+        "estimateSupported": false
+      },
+      "dataPolicy": {
+        "sendsDataToThirdParties": false
+      },
+      "blockConfigSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "motionStyle": {
+            "type": "string",
+            "title": "Movimento de câmera",
+            "description": "Varia entre zoom e panorâmicas de forma determinística para que retries preservem o resultado.",
+            "oneOf": [
+              { "const": "none", "title": "Sem movimento" },
+              { "const": "subtle", "title": "Sutil" },
+              { "const": "balanced", "title": "Equilibrado" },
+              { "const": "dynamic", "title": "Dinâmico" }
+            ],
+            "default": "balanced",
+            "ui": {
+              "section": "primary",
+              "order": 1,
+              "width": "full"
+            }
+          },
+          "width": {
+            "type": "integer",
+            "title": "Largura",
+            "minimum": 320,
+            "maximum": 3840,
+            "default": 1920,
+            "ui": {
+              "section": "primary",
+              "order": 2,
+              "width": "half"
+            }
+          },
+          "height": {
+            "type": "integer",
+            "title": "Altura",
+            "minimum": 180,
+            "maximum": 2160,
+            "default": 1080,
+            "ui": {
+              "section": "primary",
+              "order": 3,
+              "width": "half"
+            }
+          },
+          "fps": {
+            "type": "integer",
+            "title": "Quadros por segundo",
+            "enum": [
+              24,
+              25,
+              30,
+              50,
+              60
+            ],
+            "default": 30,
+            "ui": {
+              "section": "primary",
+              "order": 4,
+              "width": "half"
+            }
+          },
+          "imageFit": {
+            "type": "string",
+            "title": "Enquadramento",
+            "oneOf": [
+              { "const": "cover", "title": "Preencher e cortar" },
+              { "const": "contain", "title": "Conter com fundo" }
+            ],
+            "default": "cover",
+            "ui": {
+              "section": "primary",
+              "order": 5,
+              "width": "half"
+            }
+          },
+          "backgroundColor": {
+            "type": "string",
+            "title": "Cor de fundo",
+            "pattern": "^#[0-9A-Fa-f]{6}$",
+            "default": "#000000",
+            "ui": {
+              "section": "advanced",
+              "order": 6,
+              "width": "half"
+            }
+          },
+          "videoQuality": {
+            "type": "integer",
+            "title": "Qualidade H.264 (CRF)",
+            "description": "Valores menores geram mais qualidade e arquivos maiores.",
+            "minimum": 16,
+            "maximum": 30,
+            "default": 20,
+            "ui": {
+              "section": "advanced",
+              "order": 7,
+              "width": "half"
+            }
+          },
+          "motionSeed": {
+            "type": "integer",
+            "title": "Semente dos movimentos",
+            "description": "Altere para obter outra sequência de movimentos mantendo o resultado reproduzível.",
+            "minimum": 0,
+            "maximum": 999999,
+            "default": 1,
+            "ui": {
+              "section": "advanced",
+              "order": 8,
+              "width": "half"
+            }
+          }
+        },
+        "required": [
+          "motionStyle",
+          "width",
+          "height",
+          "fps",
+          "imageFit",
+          "backgroundColor",
+          "videoQuality",
+          "motionSeed"
+        ]
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "video": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "mimeType": {
+                "const": "video/mp4"
+              },
+              "size": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "url": {
+                "type": "string",
+                "pattern": "^artifact://"
+              }
+            },
+            "required": [
+              "id",
+              "name",
+              "mimeType",
+              "size",
+              "url"
+            ]
+          }
+        },
+        "required": [
+          "video"
+        ]
+      }
     }
-  ]
+  ],
+  "localizations": {
+    "en": {
+      "description": "Builds local MP4 videos from ordered images with SRT-synchronized cuts and optional Ken Burns motion.",
+      "capabilities": {
+        "compose-image-sequence-from-srt": {
+          "name": "Edit SRT-timed sequence with Ken Burns",
+          "description": "Builds a video from ordered images, uses SRT as the timeline, and applies varied camera motion without requiring audio.",
+          "inputPorts": {
+            "images": {
+              "label": "Ordered images",
+              "description": "Images shown in input order and distributed across SRT cue boundaries."
+            },
+            "subtitles": {
+              "label": "SRT timeline",
+              "description": "Required SRT file. The final cue determines duration when audio is absent."
+            },
+            "audio": {
+              "label": "Optional audio",
+              "description": "Optional audio track. When provided, its duration is validated against the SRT timeline."
+            }
+          },
+          "outputPorts": {
+            "video": {
+              "label": "Edited video",
+              "description": "H.264 MP4 video with SRT cuts and Ken Burns motion."
+            }
+          },
+          "blockConfigSchema": {
+            "properties": {
+              "motionStyle": {
+                "title": "Camera motion",
+                "description": "Varies zoom and pans deterministically so retries preserve the result.",
+                "options": [
+                  { "value": "none", "label": "None" },
+                  { "value": "subtle", "label": "Subtle" },
+                  { "value": "balanced", "label": "Balanced" },
+                  { "value": "dynamic", "label": "Dynamic" }
+                ]
+              },
+              "width": { "title": "Width" },
+              "height": { "title": "Height" },
+              "fps": { "title": "Frames per second" },
+              "imageFit": {
+                "title": "Image fit",
+                "options": [
+                  { "value": "cover", "label": "Cover" },
+                  { "value": "contain", "label": "Contain" }
+                ]
+              },
+              "backgroundColor": { "title": "Background color" },
+              "videoQuality": {
+                "title": "H.264 quality (CRF)",
+                "description": "Lower values produce higher quality and larger files."
+              },
+              "motionSeed": {
+                "title": "Motion seed",
+                "description": "Change it to produce another motion sequence while keeping results reproducible."
+              }
+            }
+          }
+        }
+      }
+    },
+    "es": {
+      "description": "Crea videos MP4 locales con imágenes ordenadas, cortes sincronizados por SRT y movimientos Ken Burns opcionales.",
+      "capabilities": {
+        "compose-image-sequence-from-srt": {
+          "name": "Editar secuencia por SRT con Ken Burns",
+          "description": "Crea un video a partir de imágenes ordenadas, usa el SRT como línea de tiempo y aplica movimientos de cámara variados sin exigir audio.",
+          "inputPorts": {
+            "images": {
+              "label": "Imágenes ordenadas",
+              "description": "Imágenes mostradas en el orden recibido y distribuidas por los límites de los cues del SRT."
+            },
+            "subtitles": {
+              "label": "Línea de tiempo SRT",
+              "description": "Archivo SRT obligatorio. El último cue define la duración cuando no hay audio."
+            },
+            "audio": {
+              "label": "Audio opcional",
+              "description": "Pista de audio opcional. Cuando se proporciona, su duración se valida contra la línea de tiempo del SRT."
+            }
+          },
+          "outputPorts": {
+            "video": {
+              "label": "Video editado",
+              "description": "Video MP4 H.264 con cortes por SRT y movimientos Ken Burns."
+            }
+          },
+          "blockConfigSchema": {
+            "properties": {
+              "motionStyle": {
+                "title": "Movimiento de cámara",
+                "description": "Varía zoom y panorámicas de forma determinista para que los reintentos preserven el resultado.",
+                "options": [
+                  { "value": "none", "label": "Ninguno" },
+                  { "value": "subtle", "label": "Sutil" },
+                  { "value": "balanced", "label": "Equilibrado" },
+                  { "value": "dynamic", "label": "Dinámico" }
+                ]
+              },
+              "width": { "title": "Ancho" },
+              "height": { "title": "Alto" },
+              "fps": { "title": "Fotogramas por segundo" },
+              "imageFit": {
+                "title": "Encuadre",
+                "options": [
+                  { "value": "cover", "label": "Cubrir" },
+                  { "value": "contain", "label": "Contener" }
+                ]
+              },
+              "backgroundColor": { "title": "Color de fondo" },
+              "videoQuality": {
+                "title": "Calidad H.264 (CRF)",
+                "description": "Los valores menores producen más calidad y archivos más grandes."
+              },
+              "motionSeed": {
+                "title": "Semilla de los movimientos",
+                "description": "Cámbiela para obtener otra secuencia de movimientos manteniendo el resultado reproducible."
+              }
+            }
+          }
+        }
+      }
+    }
+  }
 }

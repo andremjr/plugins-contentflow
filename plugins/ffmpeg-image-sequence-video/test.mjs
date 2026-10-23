@@ -246,6 +246,45 @@ test("sincroniza a duração de cada imagem pelos cues do SRT", async () => {
   assert.ok(third.blue > third.red + 100 && third.blue > third.green + 100);
 });
 
+test("monta vídeo sem áudio usando o SRT como linha do tempo e aplica Ken Burns", async () => {
+  const input = await request();
+  const subtitle = await stat(fixtures.subtitles);
+  input.capabilityId = "compose-image-sequence-from-srt";
+  input.configuration = {
+    width: 320,
+    height: 180,
+    fps: 24,
+    imageFit: "cover",
+    backgroundColor: "#000000",
+    videoQuality: 24,
+    motionStyle: "balanced",
+    motionSeed: 17,
+  };
+  delete input.inputs.audio;
+  input.inputs.subtitles = storedFile(
+    "subtitles",
+    fixtures.subtitles,
+    "application/x-subrip",
+    subtitle.size,
+  );
+  const service = await services("srt-no-audio");
+  const response = await execute(input, service);
+
+  assert.equal(response.status, "success");
+  assert.match(response.logs[0], /movimentos balanced/);
+  const output = service.getOutputPath("video-final.mp4");
+  const duration = await probeDuration(output);
+  assert.ok(duration >= 2.95 && duration <= 3.05, `duração inesperada: ${duration}`);
+  const [first, second, third] = await Promise.all([
+    pixelAt(output, 0.25),
+    pixelAt(output, 1.25),
+    pixelAt(output, 2.5),
+  ]);
+  assert.ok(first.red > first.green + 100 && first.red > first.blue + 100);
+  assert.ok(second.green > second.red + 100 && second.green > second.blue + 100);
+  assert.ok(third.blue > third.red + 100 && third.blue > third.green + 100);
+});
+
 test("rejeita lista vazia, MIME incorreto e configuração desconhecida", async (t) => {
   await t.test("lista vazia", async () => {
     const input = await request();
@@ -302,4 +341,32 @@ test("as funções puras calculam duração e filtro determinísticos", () => {
   });
   assert.match(timedFilter, /stop_duration=0\.500000/);
   assert.match(timedFilter, /stop_duration=1\.500000/);
+
+  const motionConfiguration = {
+    width: 320,
+    height: 180,
+    fps: 24,
+    imageFit: "cover",
+    backgroundColor: "#000000",
+    motionStyle: "balanced",
+    motionSeed: 9,
+  };
+  assert.deepEqual(
+    internals.motionForIndex(3, motionConfiguration),
+    internals.motionForIndex(3, motionConfiguration),
+  );
+  const firstSequence = Array.from({ length: 16 }, (_, index) =>
+    internals.motionForIndex(index, motionConfiguration),
+  );
+  const repeatedSequence = Array.from({ length: 16 }, (_, index) =>
+    internals.motionForIndex(index, motionConfiguration),
+  );
+  assert.deepEqual(firstSequence, repeatedSequence);
+  assert.equal(firstSequence[0].amount, 0.13);
+  assert.ok(new Set(firstSequence.map((motion) => motion.pattern)).size >= 4);
+  const motionFilter = internals.buildFilter(2, [1.25, 1.75], motionConfiguration);
+  assert.match(motionFilter, /zoompan=/);
+  assert.match(motionFilter, /scale=w=640:h=360/);
+  assert.match(motionFilter, /flags=lanczos/);
+  assert.match(motionFilter, /concat=n=2:v=1:a=0/);
 });

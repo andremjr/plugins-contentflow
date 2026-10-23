@@ -5,7 +5,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PLUGIN_ROOT = path.dirname(fileURLToPath(import.meta.url));
-const CAPABILITY_ID = "compose-image-sequence-with-audio";
+const LEGACY_CAPABILITY_ID = "compose-image-sequence-with-audio";
+const SRT_CAPABILITY_ID = "compose-image-sequence-from-srt";
 const ARTIFACT_ID = "final-video";
 const OUTPUT_NAME = "video-final.mp4";
 const MAX_INPUT_BYTES = 4 * 1024 * 1024 * 1024;
@@ -16,14 +17,24 @@ const MAX_DURATION_SECONDS = 6 * 60 * 60;
 const PROCESS_LOG_LIMIT = 2_000_000;
 const EXECUTION_BUDGET_MS = 590_000;
 
-const DEFAULTS = Object.freeze({
+const SHARED_DEFAULTS = Object.freeze({
   width: 1920,
   height: 1080,
   fps: 30,
   imageFit: "cover",
   backgroundColor: "#000000",
   videoQuality: 20,
+});
+
+const LEGACY_DEFAULTS = Object.freeze({
+  ...SHARED_DEFAULTS,
   timingMode: "equal",
+});
+
+const SRT_DEFAULTS = Object.freeze({
+  ...SHARED_DEFAULTS,
+  motionStyle: "balanced",
+  motionSeed: 1,
 });
 
 const IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/webp"]);
@@ -82,29 +93,30 @@ function requireInteger(value, key, minimum, maximum) {
   return value;
 }
 
-function validateConfiguration(configuration) {
+function validateConfiguration(configuration, capabilityId = LEGACY_CAPABILITY_ID) {
   const value = configuration ?? {};
   if (!isPlainObject(value)) {
     throw new PluginFailure("INVALID_CONFIGURATION", "A configuração precisa ser um objeto.");
   }
-  const unknown = Object.keys(value).find((key) => !Object.hasOwn(DEFAULTS, key));
+  const defaults = capabilityId === SRT_CAPABILITY_ID ? SRT_DEFAULTS : LEGACY_DEFAULTS;
+  const unknown = Object.keys(value).find((key) => !Object.hasOwn(defaults, key));
   if (unknown) {
     throw new PluginFailure(
       "INVALID_CONFIGURATION",
       `O parâmetro ${unknown} não é reconhecido por esta versão do plugin.`,
     );
   }
-  const width = requireInteger(value.width ?? DEFAULTS.width, "width", 320, 3840);
-  const height = requireInteger(value.height ?? DEFAULTS.height, "height", 180, 2160);
-  const fps = value.fps ?? DEFAULTS.fps;
+  const width = requireInteger(value.width ?? defaults.width, "width", 320, 3840);
+  const height = requireInteger(value.height ?? defaults.height, "height", 180, 2160);
+  const fps = value.fps ?? defaults.fps;
   if (![24, 25, 30, 50, 60].includes(fps)) {
     throw new PluginFailure("INVALID_CONFIGURATION", "O parâmetro fps não é suportado.");
   }
-  const imageFit = value.imageFit ?? DEFAULTS.imageFit;
+  const imageFit = value.imageFit ?? defaults.imageFit;
   if (!new Set(["cover", "contain"]).has(imageFit)) {
     throw new PluginFailure("INVALID_CONFIGURATION", "O parâmetro imageFit não é suportado.");
   }
-  const backgroundColor = value.backgroundColor ?? DEFAULTS.backgroundColor;
+  const backgroundColor = value.backgroundColor ?? defaults.backgroundColor;
   if (typeof backgroundColor !== "string" || !/^#[0-9A-Fa-f]{6}$/.test(backgroundColor)) {
     throw new PluginFailure(
       "INVALID_CONFIGURATION",
@@ -112,7 +124,7 @@ function validateConfiguration(configuration) {
     );
   }
   const videoQuality = requireInteger(
-    value.videoQuality ?? DEFAULTS.videoQuality,
+    value.videoQuality ?? defaults.videoQuality,
     "videoQuality",
     16,
     30,
@@ -123,7 +135,30 @@ function validateConfiguration(configuration) {
       "Largura e altura precisam ser números pares para gerar H.264 yuv420p.",
     );
   }
-  const timingMode = value.timingMode ?? DEFAULTS.timingMode;
+  if (capabilityId === SRT_CAPABILITY_ID) {
+    const motionStyle = value.motionStyle ?? SRT_DEFAULTS.motionStyle;
+    if (!new Set(["none", "subtle", "balanced", "dynamic"]).has(motionStyle)) {
+      throw new PluginFailure("INVALID_CONFIGURATION", "O parâmetro motionStyle não é suportado.");
+    }
+    const motionSeed = requireInteger(
+      value.motionSeed ?? SRT_DEFAULTS.motionSeed,
+      "motionSeed",
+      0,
+      999999,
+    );
+    return {
+      width,
+      height,
+      fps,
+      imageFit,
+      backgroundColor,
+      videoQuality,
+      motionStyle,
+      motionSeed,
+    };
+  }
+
+  const timingMode = value.timingMode ?? LEGACY_DEFAULTS.timingMode;
   if (!new Set(["equal", "srt"]).has(timingMode)) {
     throw new PluginFailure("INVALID_CONFIGURATION", "O parâmetro timingMode não é suportado.");
   }
@@ -169,7 +204,7 @@ function validateStoredFile(value, kind, index) {
   return { ...value, mimeType };
 }
 
-function validateInputs(inputs) {
+function validateInputs(inputs, capabilityId = LEGACY_CAPABILITY_ID) {
   const rawImages = Array.isArray(inputs?.images)
     ? inputs.images
     : [inputs?.images].filter(Boolean);
@@ -185,10 +220,22 @@ function validateInputs(inputs) {
   if (rawSubtitles.length > 1) {
     throw new PluginFailure("INVALID_INPUT", "A entrada subtitles aceita somente um arquivo SRT.");
   }
+  const audio = inputs?.audio
+    ? validateStoredFile(inputs.audio, "audio", 0)
+    : undefined;
+  const subtitles = rawSubtitles.length
+    ? validateStoredFile(rawSubtitles[0], "subtitle", 0)
+    : undefined;
+  if (capabilityId === LEGACY_CAPABILITY_ID && !audio) {
+    throw new PluginFailure("INVALID_INPUT", "O áudio é obrigatório para esta capability.");
+  }
+  if (capabilityId === SRT_CAPABILITY_ID && !subtitles) {
+    throw new PluginFailure("INVALID_INPUT", "O SRT é obrigatório para esta capability.");
+  }
   return {
     images: rawImages.map((image, index) => validateStoredFile(image, "image", index)),
-    audio: validateStoredFile(inputs?.audio, "audio", 0),
-    subtitles: rawSubtitles.length ? validateStoredFile(rawSubtitles[0], "subtitle", 0) : undefined,
+    audio,
+    subtitles,
   };
 }
 
@@ -364,13 +411,86 @@ function remainingBudget(deadline) {
   return Math.max(1, deadline - Date.now());
 }
 
-function fitFilter(configuration) {
+function fitFilter(configuration, scaleFactor = 1) {
   const { width, height, imageFit, backgroundColor } = configuration;
+  const targetWidth = width * scaleFactor;
+  const targetHeight = height * scaleFactor;
   if (imageFit === "contain") {
     const color = `0x${backgroundColor.slice(1)}`;
-    return `scale=w=${width}:h=${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=${color}`;
+    return `scale=w=${targetWidth}:h=${targetHeight}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:color=${color}`;
   }
-  return `scale=w=${width}:h=${height}:force_original_aspect_ratio=increase,crop=${width}:${height}`;
+  return `scale=w=${targetWidth}:h=${targetHeight}:force_original_aspect_ratio=increase:flags=lanczos,crop=${targetWidth}:${targetHeight}`;
+}
+
+function seededUnit(seed, index) {
+  let value = (seed + Math.imul(index + 1, 0x9e3779b1)) >>> 0;
+  value ^= value >>> 16;
+  value = Math.imul(value, 0x21f0aaad);
+  value ^= value >>> 15;
+  value = Math.imul(value, 0x735a2d97);
+  value ^= value >>> 15;
+  return (value >>> 0) / 4294967296;
+}
+
+const MOTION_PATTERNS = Object.freeze([
+  "zoom_in",
+  "zoom_out",
+  "pan_left_to_right",
+  "pan_right_to_left",
+  "pan_top_to_bottom",
+  "pan_bottom_to_top",
+  "pan_diagonal_down",
+  "pan_diagonal_up",
+]);
+
+// zoompan quantizes its crop origin to the input pixel grid. Rendering against
+// a 2x working canvas makes each step half a final pixel without adding a
+// frame-by-frame OpenCV/Python pipeline.
+const MOTION_SUPERSAMPLE = 2;
+
+function motionForIndex(index, configuration) {
+  if (!configuration.motionStyle || configuration.motionStyle === "none") return undefined;
+  const amount =
+    configuration.motionStyle === "subtle"
+      ? 0.06
+      : configuration.motionStyle === "dynamic"
+        ? 0.16
+        : 0.13;
+  const random = seededUnit(configuration.motionSeed ?? SRT_DEFAULTS.motionSeed, index);
+  return {
+    pattern: MOTION_PATTERNS[Math.floor(random * MOTION_PATTERNS.length)],
+    amount,
+  };
+}
+
+function zoomPanFilter(duration, configuration, motion) {
+  const frames = Math.max(2, Math.round(duration * configuration.fps));
+  const lastFrame = Math.max(1, frames - 1);
+  const amount = motion.amount.toFixed(6);
+  const zoom = `(1+${amount})`;
+  const progress = `(on/${lastFrame})`;
+  const remaining = `(1-on/${lastFrame})`;
+  const centerX = `(iw-iw/zoom)/2`;
+  const centerY = `(ih-ih/zoom)/2`;
+  let z = zoom;
+  let x = centerX;
+  let y = centerY;
+
+  if (motion.pattern === "zoom_in") z = `1+${amount}*${progress}`;
+  else if (motion.pattern === "zoom_out") z = `1+${amount}*${remaining}`;
+  else if (motion.pattern === "pan_left_to_right") x = `(iw-iw/zoom)*${progress}`;
+  else if (motion.pattern === "pan_right_to_left") x = `(iw-iw/zoom)*${remaining}`;
+  else if (motion.pattern === "pan_top_to_bottom") y = `(ih-ih/zoom)*${progress}`;
+  else if (motion.pattern === "pan_bottom_to_top") y = `(ih-ih/zoom)*${remaining}`;
+  else if (motion.pattern === "pan_diagonal_down") {
+    x = `(iw-iw/zoom)*${progress}`;
+    y = `(ih-ih/zoom)*${progress}`;
+  } else if (motion.pattern === "pan_diagonal_up") {
+    x = `(iw-iw/zoom)*${remaining}`;
+    y = `(ih-ih/zoom)*${progress}`;
+  }
+
+  return `zoompan=z='${z}':x='${x}':y='${y}':d=${frames}:s=${configuration.width}x${configuration.height}:fps=${configuration.fps}`;
 }
 
 function buildFilter(imagesCount, segmentDurations, configuration) {
@@ -380,7 +500,12 @@ function buildFilter(imagesCount, segmentDurations, configuration) {
   if (durations.length !== imagesCount) throw new Error("Durações incompatíveis com as imagens.");
   const imageFilters = Array.from({ length: imagesCount }, (_, index) => {
     const duration = durations[index].toFixed(6);
-    return `[${index}:v:0]${fitFilter(configuration)},setsar=1,format=yuv420p,tpad=stop_mode=clone:stop_duration=${duration},fps=${configuration.fps},trim=duration=${duration},setpts=PTS-STARTPTS[v${index}]`;
+    const motion = motionForIndex(index, configuration);
+    const timeline = motion
+      ? `${zoomPanFilter(durations[index], configuration, motion)},trim=duration=${duration}`
+      : `tpad=stop_mode=clone:stop_duration=${duration},fps=${configuration.fps},trim=duration=${duration}`;
+    const workingScale = motion ? MOTION_SUPERSAMPLE : 1;
+    return `[${index}:v:0]${fitFilter(configuration, workingScale)},setsar=1,${timeline},format=yuv420p,setpts=PTS-STARTPTS[v${index}]`;
   });
   const inputs = Array.from({ length: imagesCount }, (_, index) => `[v${index}]`).join("");
   return [...imageFilters, `${inputs}concat=n=${imagesCount}:v=1:a=0[outv]`].join(";");
@@ -417,7 +542,7 @@ export async function execute(request, services) {
         "Esta capability é imediata e aceita somente invocation.mode=start.",
       );
     }
-    if (request.capabilityId !== CAPABILITY_ID) {
+    if (![LEGACY_CAPABILITY_ID, SRT_CAPABILITY_ID].includes(request.capabilityId)) {
       throw new PluginFailure(
         "INVALID_INPUT",
         "A capability solicitada não pertence a este plugin.",
@@ -427,9 +552,13 @@ export async function execute(request, services) {
       throw new PluginFailure("CANCELLED", "A montagem do vídeo foi cancelada.");
     }
     validateSettings(request.settings);
-    const configuration = validateConfiguration(request.configuration);
-    const { images, audio, subtitles } = validateInputs(request.inputs);
-    if (configuration.timingMode === "srt" && !subtitles) {
+    const configuration = validateConfiguration(request.configuration, request.capabilityId);
+    const { images, audio, subtitles } = validateInputs(request.inputs, request.capabilityId);
+    if (
+      request.capabilityId === LEGACY_CAPABILITY_ID &&
+      configuration.timingMode === "srt" &&
+      !subtitles
+    ) {
       throw new PluginFailure(
         "INVALID_INPUT",
         "A entrada subtitles é obrigatória quando timingMode=srt.",
@@ -437,10 +566,10 @@ export async function execute(request, services) {
     }
     const resolvedImages = [];
     for (const image of images) resolvedImages.push(await services.resolveInputFile(image));
-    const audioPath = await services.resolveInputFile(audio);
+    const audioPath = audio ? await services.resolveInputFile(audio) : undefined;
     const subtitlePath = subtitles ? await services.resolveInputFile(subtitles) : undefined;
     for (let index = 0; index < resolvedImages.length; index += 1) {
-      if (path.resolve(resolvedImages[index]) !== path.resolve(audioPath)) continue;
+      if (!audioPath || path.resolve(resolvedImages[index]) !== path.resolve(audioPath)) continue;
       const stagedPath = services.getOutputPath(`image-input-${index}.bin`);
       await copyFile(resolvedImages[index], stagedPath);
       resolvedImages[index] = stagedPath;
@@ -449,29 +578,35 @@ export async function execute(request, services) {
     const ffmpeg = await resolveFfmpegExecutable();
     const deadline = Date.now() + EXECUTION_BUDGET_MS;
 
-    const probe = await runFfmpeg(
-      ffmpeg,
-      [
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-nostdin",
-        "-protocol_whitelist",
-        "file,pipe,crypto",
-        "-i",
-        audioPath,
-        "-map",
-        "0:a:0",
-        "-progress",
-        "pipe:3",
-        "-nostats",
-        "-f",
-        "null",
-        "-",
-      ],
-      { signal: services.signal, timeoutMs: remainingBudget(deadline), stage: "probe" },
-    );
-    const durationSeconds = parseProgressDuration(probe.progress);
+    let durationSeconds;
+    if (audioPath) {
+      const probe = await runFfmpeg(
+        ffmpeg,
+        [
+          "-hide_banner",
+          "-loglevel",
+          "error",
+          "-nostdin",
+          "-protocol_whitelist",
+          "file,pipe,crypto",
+          "-i",
+          audioPath,
+          "-map",
+          "0:a:0",
+          "-progress",
+          "pipe:3",
+          "-nostats",
+          "-f",
+          "null",
+          "-",
+        ],
+        { signal: services.signal, timeoutMs: remainingBudget(deadline), stage: "probe" },
+      );
+      durationSeconds = parseProgressDuration(probe.progress);
+    }
+    let cues;
+    if (subtitles) cues = parseSrt(await readFile(subtitlePath, "utf8"));
+    if (!audioPath) durationSeconds = cues?.at(-1)?.end;
     if (
       durationSeconds === undefined ||
       durationSeconds <= 0 ||
@@ -479,14 +614,14 @@ export async function execute(request, services) {
     ) {
       throw new PluginFailure(
         "INVALID_INPUT",
-        "A duração do áudio precisa ser detectável, maior que zero e de até 6 horas.",
+        audioPath
+          ? "A duração do áudio precisa ser detectável, maior que zero e de até 6 horas."
+          : "A duração final do SRT precisa ser maior que zero e de até 6 horas.",
       );
     }
 
-    let cues;
     let segmentDurations;
-    if (configuration.timingMode === "srt") {
-      cues = parseSrt(await readFile(subtitlePath, "utf8"));
+    if (request.capabilityId === SRT_CAPABILITY_ID || configuration.timingMode === "srt") {
       segmentDurations = imageDurationsFromCues(cues, resolvedImages.length, durationSeconds);
     } else {
       segmentDurations = Array.from(
@@ -499,17 +634,14 @@ export async function execute(request, services) {
     for (const imagePath of resolvedImages) {
       args.push("-protocol_whitelist", "file,pipe,crypto", "-i", imagePath);
     }
+    if (audioPath) {
+      args.push("-protocol_whitelist", "file,pipe,crypto", "-i", audioPath);
+    }
     args.push(
-      "-protocol_whitelist",
-      "file,pipe,crypto",
-      "-i",
-      audioPath,
       "-filter_complex",
       buildFilter(resolvedImages.length, segmentDurations, configuration),
       "-map",
       "[outv]",
-      "-map",
-      `${resolvedImages.length}:a:0`,
       "-t",
       durationSeconds.toFixed(6),
       "-c:v",
@@ -524,26 +656,35 @@ export async function execute(request, services) {
       "yuv420p",
       "-r",
       String(configuration.fps),
-      "-c:a",
-      "aac",
-      "-b:a",
-      "192k",
-      "-ar",
-      "48000",
-      "-ac",
-      "2",
       "-map_metadata",
       "-1",
       "-map_chapters",
       "-1",
       "-movflags",
       "+faststart",
-      "-shortest",
       "-progress",
       "pipe:3",
       "-nostats",
       outputPath,
     );
+    if (audioPath) {
+      const outputIndex = args.length - 1;
+      args.splice(
+        outputIndex,
+        0,
+        "-map",
+        `${resolvedImages.length}:a:0`,
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        "-shortest",
+      );
+    }
     await runFfmpeg(ffmpeg, args, {
       signal: services.signal,
       timeoutMs: remainingBudget(deadline),
@@ -567,8 +708,8 @@ export async function execute(request, services) {
       values: { video: { ...artifact, url: `artifact://${ARTIFACT_ID}` } },
       artifacts: [{ ...artifact, source: { kind: "path", path: OUTPUT_NAME } }],
       logs: [
-        configuration.timingMode === "srt"
-          ? `${images.length} imagem(ns) sincronizada(s) em ${durationSeconds.toFixed(2)} s usando ${cues.length} cue(s) do SRT.`
+        request.capabilityId === SRT_CAPABILITY_ID || configuration.timingMode === "srt"
+          ? `${images.length} imagem(ns) sincronizada(s) em ${durationSeconds.toFixed(2)} s usando ${cues.length} cue(s) do SRT${request.capabilityId === SRT_CAPABILITY_ID ? ` e movimentos ${configuration.motionStyle}` : ""}.`
           : `${images.length} imagem(ns) distribuída(s) em ${durationSeconds.toFixed(2)} s (${segmentDurations[0].toFixed(2)} s por imagem).`,
       ],
     };
@@ -592,6 +733,7 @@ export async function execute(request, services) {
 export const internals = {
   buildFilter,
   imageDurationsFromCues,
+  motionForIndex,
   parseProgressDuration,
   parseSrt,
   parseSrtTimestamp,

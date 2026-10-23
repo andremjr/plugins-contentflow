@@ -1,6 +1,6 @@
 # Vídeo por Sequência de Imagens (FFmpeg)
 
-Plugin independente Plugin API v2 para o processo universal **Edição**. Recebe imagens na ordem definida pelo Método e uma faixa de áudio; mede a duração real do áudio e gera um MP4 H.264 com áudio AAC. As imagens podem ocupar partes iguais ou seguir os intervalos de um arquivo SRT.
+Plugin independente Plugin API v2 para o processo universal **Edição**. Recebe imagens na ordem definida pelo Método e gera um MP4 H.264. A capability original usa uma faixa de áudio como duração total; a capability de edição por SRT também funciona sem áudio e aplica movimentos Ken Burns variados em uma única renderização do FFmpeg.
 
 ## Capability
 
@@ -12,7 +12,19 @@ Plugin independente Plugin API v2 para o processo universal **Edição**. Recebe
 - entrada opcional `subtitles`: um arquivo SRT; em `timingMode: "srt"`, a troca das imagens acompanha o final dos cues
 - saída `video`: MP4 H.264 (`yuv420p`) com áudio AAC
 
-O padrão é 1920×1080, 30 fps, enquadramento `cover`, CRF 20 e distribuição `equal`. Em `contain`, o plugin preserva toda a imagem e preenche o restante com a cor configurada. No modo `srt`, deve existir ao menos um cue por imagem; se houver mais cues que imagens, o plugin os agrupa preservando toda a linha do tempo.
+### Edição por SRT com Ken Burns
+
+- `compose-image-sequence-from-srt`
+- entrada `images`: imagens ordenadas JPEG, PNG ou WebP
+- entrada `subtitles`: um arquivo SRT obrigatório; o último cue define a duração sem áudio
+- entrada opcional `audio`: quando presente, fornece a faixa final e sua duração é validada contra o SRT
+- saída `video`: MP4 H.264, com áudio AAC somente quando fornecido
+
+Os movimentos disponíveis incluem zoom in, zoom out e panorâmicas horizontais, verticais e diagonais. A escolha varia por imagem com uma semente determinística: retries com os mesmos inputs e configuração preservam o resultado. O FFmpeg monta todos os segmentos em um único grafo e codifica o MP4 uma vez, sem gravar clipes intermediários. Para evitar o aspecto de movimento em degraus do `zoompan`, o plugin usa supersampling 2× com interpolação Lanczos antes de reduzir para a resolução final; isso dá precisão de meio pixel sem adicionar OpenCV ao runtime.
+
+O preset `balanced` usa amplitude de 13%, entre `subtle` (6%) e `dynamic` (16%).
+
+O padrão é 1920×1080, 30 fps, enquadramento `cover` e CRF 20. A capability original usa distribuição `equal`; a nova capability usa movimento `balanced` e semente `1`. Em `contain`, o plugin preserva toda a imagem e preenche o restante com a cor configurada. No modo SRT, deve existir ao menos um cue por imagem; se houver mais cues que imagens, o plugin os agrupa preservando toda a linha do tempo.
 
 ## Execução e segurança
 
