@@ -1,0 +1,370 @@
+{
+  "$schema": "https://raw.githubusercontent.com/andremjr/contentflow/main/docs/ecosystem/schemas/contentflow-plugin-v2.schema.json",
+  "apiVersion": "2",
+  "id": "com.contentflow.visual-storyboard-planner",
+  "name": "Planejador Visual de Storyboard",
+  "version": "0.2.0",
+  "description": "Valida planos semânticos de cenas e materializa quadros de storyboard na galeria nativa do ContentFlow.",
+  "author": "André Marinho Jr.",
+  "license": "MIT",
+  "repository": "https://github.com/andremjr/plugins-contentflow",
+  "runtime": {
+    "kind": "node",
+    "version": ">=26 <27",
+    "module": "esm"
+  },
+  "minCoreVersion": "1.3.3",
+  "entrypoint": "handler.mjs",
+  "permissions": [
+    "filesystem:write"
+  ],
+  "capabilities": [
+    {
+      "id": "render-visual-storyboard",
+      "name": "Renderizar planejamento visual",
+      "description": "Transforma cada cena estruturada por um Bloco anterior em um quadro visual de storyboard.",
+      "operator": "Código",
+      "instructionUsage": "not_applicable",
+      "blockTypes": [
+        "CRIAR"
+      ],
+      "processTypes": [
+        "assets",
+        "editing"
+      ],
+      "itemActions": [
+        {
+          "action": "download"
+        }
+      ],
+      "inputPorts": [
+        {
+          "key": "scene_plans",
+          "label": "Planos semânticos das cenas",
+          "description": "Uma lista ordenada de objetos JSON, um por cena, criada por um Bloco anterior de IA ou Humano.",
+          "required": true,
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "many",
+            "representation": "inline"
+          }
+        }
+      ],
+      "outputPorts": [
+        {
+          "key": "storyboard_frames",
+          "label": "Quadros do storyboard",
+          "description": "Um quadro SVG por cena, exibido e preservado como imagem na galeria nativa.",
+          "required": true,
+          "presentation": {
+            "renderer": "image-gallery"
+          },
+          "shape": {
+            "kind": "content",
+            "family": "image",
+            "cardinality": "many",
+            "representation": "artifact",
+            "formats": {
+              "mimeTypes": [
+                "image/svg+xml"
+              ],
+              "extensions": [
+                ".svg"
+              ]
+            }
+          }
+        },
+        {
+          "key": "normalized_scenes",
+          "label": "Planos normalizados",
+          "description": "JSON canônico das cenas validadas para plugins posteriores de geração, stock e edição.",
+          "required": true,
+          "presentation": {
+            "renderer": "text-long"
+          },
+          "shape": {
+            "kind": "content",
+            "family": "text",
+            "cardinality": "many",
+            "representation": "inline"
+          }
+        }
+      ],
+      "execution": {
+        "mode": "immediate",
+        "defaultTimeoutMs": 600000,
+        "supportsCancellation": true,
+        "maxConcurrency": 4,
+        "itemOrchestration": {
+          "inputPort": "scene_plans",
+          "outputPort": "storyboard_frames",
+          "mode": "sequential",
+          "strategies": [
+            "per_item"
+          ],
+          "preferredStrategy": "per_item",
+          "profileParallelism": {
+            "supported": false
+          }
+        }
+      },
+      "sideEffects": [
+        "local_artifact"
+      ],
+      "cost": {
+        "model": "free",
+        "estimateSupported": true
+      },
+      "dataPolicy": {
+        "sendsDataToThirdParties": false
+      },
+      "blockConfigSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "frameFormat": {
+            "type": "string",
+            "title": "Formato do quadro planejado",
+            "description": "Define a proporção da área visual desenhada dentro de cada card.",
+            "oneOf": [
+              {
+                "const": "landscape",
+                "title": "Horizontal 16:9"
+              },
+              {
+                "const": "portrait",
+                "title": "Vertical 9:16"
+              },
+              {
+                "const": "square",
+                "title": "Quadrado 1:1"
+              }
+            ],
+            "default": "landscape",
+            "ui": {
+              "section": "primary",
+              "order": 1,
+              "width": "full"
+            }
+          },
+          "theme": {
+            "type": "string",
+            "title": "Aparência do storyboard",
+            "oneOf": [
+              {
+                "const": "dark",
+                "title": "Escuro"
+              },
+              {
+                "const": "light",
+                "title": "Claro"
+              },
+              {
+                "const": "blueprint",
+                "title": "Planta técnica"
+              }
+            ],
+            "default": "dark",
+            "ui": {
+              "section": "primary",
+              "order": 2,
+              "width": "half"
+            }
+          },
+          "showLayerGuides": {
+            "type": "boolean",
+            "title": "Mostrar guias e posições das camadas",
+            "default": true,
+            "ui": {
+              "section": "primary",
+              "order": 3,
+              "width": "half"
+            }
+          },
+          "showMotionDetails": {
+            "type": "boolean",
+            "title": "Mostrar entradas, saídas e movimentos",
+            "default": true,
+            "ui": {
+              "section": "primary",
+              "order": 4,
+              "width": "full"
+            }
+          },
+          "maxVisibleLayers": {
+            "type": "integer",
+            "title": "Máximo de camadas na legenda",
+            "description": "As demais camadas continuam no JSON normalizado, mesmo quando não aparecem na legenda lateral.",
+            "minimum": 1,
+            "maximum": 12,
+            "default": 6,
+            "ui": {
+              "section": "advanced",
+              "order": 5,
+              "width": "half"
+            }
+          }
+        },
+        "required": [
+          "frameFormat",
+          "theme",
+          "showLayerGuides",
+          "showMotionDetails",
+          "maxVisibleLayers"
+        ]
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "storyboard_frames": {
+            "oneOf": [
+              {
+                "type": "object"
+              },
+              {
+                "type": "array",
+                "minItems": 1
+              }
+            ]
+          },
+          "normalized_scenes": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string"
+                }
+              }
+            ]
+          }
+        },
+        "required": [
+          "storyboard_frames",
+          "normalized_scenes"
+        ]
+      }
+    }
+  ],
+  "localizations": {
+    "en": {
+      "description": "Validates semantic scene plans and materializes storyboard frames in ContentFlow's native gallery.",
+      "capabilities": {
+        "render-visual-storyboard": {
+          "name": "Render visual storyboard",
+          "description": "Transforms each scene structured by a previous Block into a visual storyboard frame.",
+          "inputPorts": {
+            "scene_plans": {
+              "label": "Semantic scene plans",
+              "description": "An ordered list of JSON objects, one per scene, created by a previous AI or Human Block."
+            }
+          },
+          "outputPorts": {
+            "storyboard_frames": {
+              "label": "Storyboard frames",
+              "description": "One SVG frame per scene, displayed and preserved as an image in the native gallery."
+            },
+            "normalized_scenes": {
+              "label": "Normalized plans",
+              "description": "Canonical JSON for validated scenes, ready for later generation, stock, and editing plugins."
+            }
+          },
+          "itemActions": {
+            "download": {
+              "label": "Download frame"
+            }
+          },
+          "blockConfigSchema": {
+            "properties": {
+              "frameFormat": {
+                "title": "Planned frame format",
+                "description": "Sets the aspect ratio of the visual area drawn inside each card.",
+                "options": [
+                  { "value": "landscape", "label": "Landscape 16:9" },
+                  { "value": "portrait", "label": "Portrait 9:16" },
+                  { "value": "square", "label": "Square 1:1" }
+                ]
+              },
+              "theme": {
+                "title": "Storyboard appearance",
+                "options": [
+                  { "value": "dark", "label": "Dark" },
+                  { "value": "light", "label": "Light" },
+                  { "value": "blueprint", "label": "Blueprint" }
+                ]
+              },
+              "showLayerGuides": { "title": "Show layer guides and positions" },
+              "showMotionDetails": { "title": "Show entrances, exits, and motion" },
+              "maxVisibleLayers": {
+                "title": "Maximum layers in legend",
+                "description": "Remaining layers stay in normalized JSON even when omitted from the side legend."
+              }
+            }
+          }
+        }
+      }
+    },
+    "es": {
+      "description": "Valida planes semánticos de escenas y materializa cuadros de storyboard en la galería nativa de ContentFlow.",
+      "capabilities": {
+        "render-visual-storyboard": {
+          "name": "Renderizar planificación visual",
+          "description": "Transforma cada escena estructurada por un Bloque anterior en un cuadro visual de storyboard.",
+          "inputPorts": {
+            "scene_plans": {
+              "label": "Planes semánticos de las escenas",
+              "description": "Una lista ordenada de objetos JSON, uno por escena, creada por un Bloque anterior de IA o Humano."
+            }
+          },
+          "outputPorts": {
+            "storyboard_frames": {
+              "label": "Cuadros del storyboard",
+              "description": "Un cuadro SVG por escena, mostrado y conservado como imagen en la galería nativa."
+            },
+            "normalized_scenes": {
+              "label": "Planes normalizados",
+              "description": "JSON canónico de las escenas validadas para plugins posteriores de generación, stock y edición."
+            }
+          },
+          "itemActions": {
+            "download": {
+              "label": "Descargar cuadro"
+            }
+          },
+          "blockConfigSchema": {
+            "properties": {
+              "frameFormat": {
+                "title": "Formato del cuadro planificado",
+                "description": "Define la proporción del área visual dibujada dentro de cada card.",
+                "options": [
+                  { "value": "landscape", "label": "Horizontal 16:9" },
+                  { "value": "portrait", "label": "Vertical 9:16" },
+                  { "value": "square", "label": "Cuadrado 1:1" }
+                ]
+              },
+              "theme": {
+                "title": "Apariencia del storyboard",
+                "options": [
+                  { "value": "dark", "label": "Oscuro" },
+                  { "value": "light", "label": "Claro" },
+                  { "value": "blueprint", "label": "Plano técnico" }
+                ]
+              },
+              "showLayerGuides": { "title": "Mostrar guías y posiciones de las capas" },
+              "showMotionDetails": { "title": "Mostrar entradas, salidas y movimientos" },
+              "maxVisibleLayers": {
+                "title": "Máximo de capas en la leyenda",
+                "description": "Las demás capas permanecen en el JSON normalizado aunque no aparezcan en la leyenda lateral."
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

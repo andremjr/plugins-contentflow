@@ -17,6 +17,8 @@ Instalação por pasta também é possível: obtenha o ZIP da release correspond
 
 Executáveis e runtimes de terceiros são distribuídos nos ZIPs das releases; seus avisos, licenças e instruções de preparação permanecem nas fontes. Ao desenvolver a partir de um clone, prepare as dependências conforme o README do plugin, ou extraia o pacote da mesma versão antes de alterar suas fontes.
 
+As fontes de `visual-storyboard-planner`, `storyboard-animation-composer`, `storyboard-preview` e `storyboard-video-renderer` estão disponíveis para desenvolvimento. A presença de uma pasta em `plugins/` não a inclui no catálogo: a instalação pelo aplicativo exige pacote de release publicado e entrada com URL, tamanho e SHA-256 confirmados em `catalog.json`.
+
 ## Publicar uma atualização individual
 
 1. Altere somente o plugin desejado e incremente seu `version` no manifesto e no package.json. Portas incompatíveis exigem nova major; `apiVersion` é independente dessa versão.

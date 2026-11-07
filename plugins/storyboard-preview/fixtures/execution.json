@@ -1,0 +1,22 @@
+{
+  "executionId": "storyboard-preview-fixture",
+  "traceId": "storyboard-preview-fixture-trace",
+  "blockId": "storyboard-preview-fixture-block",
+  "capabilityId": "preview-storyboard",
+  "attempt": 1,
+  "invocation": { "mode": "start" },
+  "configuration": {},
+  "settings": {},
+  "inputs": {
+    "plans": ["{\"id\":\"scene-001\",\"title\":\"Abertura\",\"narration\":{\"text\":\"Uma história real.\",\"startMs\":0,\"endMs\":3000}}"],
+    "animations": ["{\"version\":1,\"sceneId\":\"scene-001\",\"background\":\"#17202B\",\"camera\":\"push-in\",\"elements\":[{\"type\":\"rect\",\"x\":10,\"y\":10,\"width\":30,\"height\":20,\"fill\":\"#E9E3D3\",\"atMs\":0,\"durationMs\":400,\"enter\":\"fade\",\"motion\":\"still\"},{\"type\":\"text\",\"x\":20,\"y\":50,\"text\":\"DADO\",\"fill\":\"#E9E3D3\",\"atMs\":500,\"durationMs\":400,\"enter\":\"rise\",\"motion\":\"still\"}]}"],
+    "audio": { "id": "audio-001", "name": "narration.mp3", "mimeType": "audio/mpeg", "size": 1000, "url": "/api/files/narration.mp3" }
+  },
+  "inputContract": [
+    { "id": "plans", "portKey": "plans", "label": "Planos normalizados", "shape": { "kind": "content", "family": "text", "cardinality": "many", "representation": "inline" } },
+    { "id": "animations", "portKey": "animations", "label": "Composições animadas", "shape": { "kind": "content", "family": "text", "cardinality": "many", "representation": "inline" } },
+    { "id": "audio", "portKey": "audio", "label": "Narração", "shape": { "kind": "content", "family": "audio", "cardinality": "one", "representation": "artifact", "formats": { "mimeTypes": ["audio/mpeg"] } } }
+  ],
+  "outputContract": [{ "portKey": "preview", "label": "Prévia animada", "key": "preview", "required": true, "presentation": { "renderer": "storyboard-player" }, "shape": { "kind": "content", "family": "text", "cardinality": "one", "representation": "inline" } }],
+  "context": { "locale": "pt-BR", "timeZone": "America/Sao_Paulo", "channel": { "id": "fixture-channel", "name": "Canal fictício", "language": "pt-BR", "niche": "Documentário" }, "project": { "id": "fixture-project", "title": "Projeto de storyboard" }, "processType": "editing", "block": { "type": "CRIAR", "name": "Montar prévia animada", "instructions": "Sincronize as cenas com a narração." }, "previousProcessOutputs": [], "previousBlockOutputs": [] }
+}

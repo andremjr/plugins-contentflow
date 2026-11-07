@@ -1,0 +1,98 @@
+{
+  "executionId": "visual-storyboard-fixture",
+  "traceId": "visual-storyboard-fixture-trace",
+  "blockId": "visual-storyboard-fixture-block",
+  "capabilityId": "render-visual-storyboard",
+  "attempt": 1,
+  "invocation": {
+    "mode": "start"
+  },
+  "configuration": {
+    "frameFormat": "landscape",
+    "theme": "dark",
+    "showLayerGuides": true,
+    "showMotionDetails": true,
+    "maxVisibleLayers": 6
+  },
+  "settings": {},
+  "inputs": {
+    "scene_plans": [
+      "{\"schemaVersion\":\"1\",\"id\":\"scene-001\",\"title\":\"A confiança quebrada\",\"narration\":{\"text\":\"Desde aquele dia, Marina nunca mais confiou em ninguém.\",\"startMs\":0,\"endMs\":4800},\"relationship\":{\"type\":\"figurative\",\"explanation\":\"A quebra emocional é representada por um coração fragmentado.\"},\"visual\":{\"description\":\"Marina em primeiro plano enquanto um coração de vidro se rompe atrás dela.\",\"assetType\":\"motion_graphic\",\"prompt\":\"cinematic woman foreground, glass heart breaking in slow motion\",\"searchTerms\":[\"broken glass heart\",\"woman distrust\"]},\"layers\":[{\"id\":\"background\",\"type\":\"background\",\"label\":\"Ambiente escuro\",\"x\":0,\"y\":0,\"width\":100,\"height\":100,\"zIndex\":0,\"opacity\":1,\"entry\":{\"type\":\"cut\",\"atMs\":0}},{\"id\":\"marina\",\"type\":\"avatar\",\"label\":\"Marina\",\"x\":8,\"y\":16,\"width\":42,\"height\":78,\"zIndex\":10,\"opacity\":1,\"entry\":{\"type\":\"fade\",\"atMs\":0,\"durationMs\":350},\"motion\":\"slow push-in\"},{\"id\":\"heart\",\"type\":\"graphic\",\"label\":\"Coração quebrado\",\"x\":56,\"y\":24,\"width\":30,\"height\":42,\"zIndex\":20,\"opacity\":0.9,\"entry\":{\"type\":\"scale\",\"atMs\":900,\"durationMs\":250},\"exit\":{\"type\":\"shatter\",\"atMs\":3600,\"durationMs\":700},\"motion\":\"fragmentação progressiva\"}]}"
+    ]
+  },
+  "inputContract": [
+    {
+      "id": "scene-plans",
+      "portKey": "scene_plans",
+      "label": "Planos semânticos das cenas",
+      "shape": {
+        "kind": "content",
+        "family": "text",
+        "cardinality": "many",
+        "representation": "inline"
+      }
+    }
+  ],
+  "outputContract": [
+    {
+      "portKey": "storyboard_frames",
+      "label": "Quadros do storyboard",
+      "key": "storyboard_frames",
+      "required": true,
+      "presentation": {
+        "renderer": "image-gallery"
+      },
+      "shape": {
+        "kind": "content",
+        "family": "image",
+        "cardinality": "many",
+        "representation": "artifact",
+        "formats": {
+          "mimeTypes": [
+            "image/svg+xml"
+          ],
+          "extensions": [
+            ".svg"
+          ]
+        }
+      }
+    },
+    {
+      "portKey": "normalized_scenes",
+      "label": "Planos normalizados",
+      "key": "normalized_scenes",
+      "required": true,
+      "presentation": {
+        "renderer": "text-long"
+      },
+      "shape": {
+        "kind": "content",
+        "family": "text",
+        "cardinality": "many",
+        "representation": "inline"
+      }
+    }
+  ],
+  "context": {
+    "locale": "pt-BR",
+    "timeZone": "America/Sao_Paulo",
+    "channel": {
+      "id": "fixture-channel",
+      "name": "Canal fictício",
+      "language": "pt-BR",
+      "niche": "Documentário"
+    },
+    "project": {
+      "id": "fixture-project",
+      "title": "Projeto de storyboard"
+    },
+    "processType": "assets",
+    "block": {
+      "type": "CRIAR",
+      "name": "Renderizar storyboard",
+      "instructions": "Renderize os planos sem alterar suas decisões editoriais."
+    },
+    "previousProcessOutputs": [],
+    "previousBlockOutputs": []
+  }
+}

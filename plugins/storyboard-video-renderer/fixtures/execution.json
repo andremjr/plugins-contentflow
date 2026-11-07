@@ -1,0 +1,20 @@
+{
+  "executionId": "storyboard-render-fixture-execution",
+  "traceId": "storyboard-render-fixture-trace",
+  "blockId": "storyboard-render-fixture-block",
+  "capabilityId": "render-storyboard-video",
+  "attempt": 1,
+  "invocation": { "mode": "start" },
+  "configuration": { "width": 320, "height": 180, "fps": 24, "encoder": "software", "bitrateMbps": 2, "burnSubtitles": false },
+  "settings": {},
+  "inputs": {
+    "preview": "{\"version\":2,\"audioUrl\":\"/api/files/fixture.mp3\",\"scenes\":[{\"id\":\"scene-001\",\"title\":\"Teste\",\"startMs\":0,\"endMs\":1000,\"narration\":\"Teste\",\"background\":\"#17202B\",\"backgroundAccent\":\"#263340\",\"texture\":\"grid\",\"camera\":\"push-in\",\"elements\":[{\"type\":\"symbol\",\"symbol\":\"document\",\"label\":\"PROVA\",\"x\":10,\"y\":15,\"width\":30,\"height\":50,\"rx\":0,\"ry\":0,\"x1\":0,\"y1\":0,\"x2\":0,\"y2\":0,\"fill\":\"#E9E3D3\",\"stroke\":\"#17202B\",\"strokeWidth\":2,\"opacity\":1,\"fontSize\":6,\"atMs\":0,\"durationMs\":200,\"enter\":\"rise\",\"motion\":\"float\"},{\"type\":\"text\",\"text\":\"EVIDÊNCIA\",\"x\":50,\"y\":30,\"width\":0,\"height\":0,\"rx\":0,\"ry\":0,\"x1\":0,\"y1\":0,\"x2\":0,\"y2\":0,\"fill\":\"#E9E3D3\",\"stroke\":\"none\",\"strokeWidth\":0,\"opacity\":1,\"fontSize\":7,\"atMs\":100,\"durationMs\":200,\"enter\":\"fade\",\"motion\":\"still\"}]}]}",
+    "audio": { "id": "fixture-audio", "name": "fixture.mp3", "mimeType": "audio/mpeg", "size": 100, "url": "/api/files/fixture-input.txt" }
+  },
+  "inputContract": [
+    { "id": "preview", "portKey": "preview", "label": "Prévia animada", "shape": { "kind": "content", "family": "text", "cardinality": "one", "representation": "inline" } },
+    { "id": "audio", "portKey": "audio", "label": "Narração", "shape": { "kind": "content", "family": "audio", "cardinality": "one", "representation": "artifact", "formats": { "mimeTypes": ["audio/mpeg"] } } }
+  ],
+  "outputContract": [{ "portKey": "video", "label": "Vídeo renderizado", "key": "video", "required": true, "shape": { "kind": "content", "family": "video", "cardinality": "one", "representation": "artifact", "formats": { "mimeTypes": ["video/mp4"] } } }],
+  "context": { "locale": "pt-BR", "timeZone": "America/Sao_Paulo", "channel": { "id": "fixture-channel", "name": "Canal fictício", "language": "PT-BR", "niche": "Testes" }, "project": { "id": "fixture-project", "title": "Projeto fictício" }, "processType": "editing", "block": { "type": "CRIAR", "name": "Renderizar storyboard", "instructions": "Renderize o vídeo." }, "previousProcessOutputs": [], "previousBlockOutputs": [] }
+}

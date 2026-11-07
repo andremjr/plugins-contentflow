@@ -1,0 +1,14 @@
+{
+  "executionId": "storyboard-composer-fixture",
+  "traceId": "storyboard-composer-fixture-trace",
+  "blockId": "storyboard-composer-fixture-block",
+  "capabilityId": "compose-animated-scenes",
+  "attempt": 1,
+  "invocation": { "mode": "start" },
+  "configuration": {},
+  "settings": {},
+  "inputs": { "plans": ["{\"id\":\"scene-001\",\"title\":\"Abertura\",\"relationship\":{\"type\":\"direct_literal\"},\"narration\":{\"text\":\"Uma história real.\",\"startMs\":0,\"endMs\":3000},\"visual\":{\"sketch\":{\"background\":\"#17202B\",\"shapes\":[{\"type\":\"rect\",\"x\":10,\"y\":20,\"width\":45,\"height\":50,\"fill\":\"#E9E3D3\"},{\"type\":\"line\",\"x1\":50,\"y1\":25,\"x2\":80,\"y2\":65,\"stroke\":\"#C44B4B\",\"strokeWidth\":2}]}}}" ] },
+  "inputContract": [{ "id": "plans", "portKey": "plans", "label": "Planos normalizados", "shape": { "kind": "content", "family": "text", "cardinality": "many", "representation": "inline" } }],
+  "outputContract": [{ "portKey": "animations", "label": "Composições animadas", "key": "animations", "required": true, "presentation": { "renderer": "list" }, "shape": { "kind": "content", "family": "text", "cardinality": "many", "representation": "inline" } }],
+  "context": { "locale": "pt-BR", "timeZone": "America/Sao_Paulo", "channel": { "id": "fixture-channel", "name": "Canal fictício", "language": "pt-BR", "niche": "Documentário" }, "project": { "id": "fixture-project", "title": "Projeto de storyboard" }, "processType": "editing", "block": { "type": "CRIAR", "name": "Compor cenas animadas", "instructions": "Converta o plano em cena visual." }, "previousProcessOutputs": [], "previousBlockOutputs": [] }
+}
